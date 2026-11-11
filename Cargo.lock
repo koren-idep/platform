@@ -33,9 +33,20 @@ dependencies = [
  "koren-commands",
  "koren-core",
  "koren-documents",
+ "koren-projects",
  "koren-protocol",
+ "koren-tasks",
  "koren-workspace",
  "serde_json",
+]
+
+[[package]]
+name = "koren-projects"
+version = "0.1.0"
+dependencies = [
+ "koren-core",
+ "koren-tasks",
+ "koren-workspace",
 ]
 
 [[package]]
@@ -44,6 +55,13 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "koren-tasks"
+version = "0.1.0"
+dependencies = [
+ "koren-core",
 ]
 
 [[package]]

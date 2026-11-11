@@ -10,7 +10,9 @@ ALLOWED_INTERNAL_DEPS = {
     "koren-commands": {"koren-core", "koren-protocol"},
     "koren-workspace": {"koren-core"},
     "koren-documents": {"koren-core", "koren-protocol", "koren-workspace"},
-    "koren-headless": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents"},
+    "koren-projects": {"koren-core", "koren-workspace", "koren-tasks"},
+    "koren-tasks": {"koren-core"},
+    "koren-headless": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks"},
 }
 BACKEND_PACKAGES = set(ALLOWED_INTERNAL_DEPS) - {"koren-headless"}
 FORBIDDEN_BACKEND_DEPS = {

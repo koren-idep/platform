@@ -53,6 +53,41 @@ pub enum PlatformEvent {
         /// Buffer revision whose save encountered the conflict.
         revision: u64,
     },
+    /// A logical project was registered.
+    ProjectRegistered {
+        /// Manager-local project identifier.
+        project_id: u64,
+    },
+    /// A logical project was removed.
+    ProjectRemoved {
+        /// Manager-local project identifier.
+        project_id: u64,
+    },
+    /// A task process started.
+    TaskStarted {
+        /// Manager-local run identifier.
+        run_id: u64,
+    },
+    /// New process output was captured.
+    TaskOutputAvailable {
+        /// Manager-local run identifier.
+        run_id: u64,
+    },
+    /// A task completed successfully or unsuccessfully.
+    TaskFinished {
+        /// Manager-local run identifier.
+        run_id: u64,
+    },
+    /// A task was cancelled.
+    TaskCancelled {
+        /// Manager-local run identifier.
+        run_id: u64,
+    },
+    /// A task failed to start or encountered an execution error.
+    TaskFailed {
+        /// Manager-local run identifier.
+        run_id: u64,
+    },
 }
 
 /// In-process FIFO event queue owned and drained by a platform service consumer.
