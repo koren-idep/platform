@@ -1,30 +1,63 @@
-//! Explicit, local filesystem access for one open workspace directory.
+//! Demand-driven workspace navigation with explicit relative path boundaries.
 
+use koren_core::{EventQueue, PlatformEvent};
 use std::{
+    ffi::OsString,
     fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
+    time::SystemTime,
 };
 
-/// Classification of a top-level directory entry. Symlinks are reported but never followed.
+/// Classification of a directory entry. Symlinks are surfaced but never traversed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryKind {
     /// A regular file.
     File,
     /// A directory.
     Directory,
-    /// A symbolic link, which is not followed.
+    /// A symbolic link, which cannot be traversed by workspace-relative operations.
     Symlink,
     /// A filesystem object other than a file, directory, or symlink.
     Other,
 }
 
-/// Name and kind of a top-level workspace entry.
+/// Metadata for one entry in a workspace directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceEntry {
-    /// Top-level entry name, without the workspace root prefix.
-    pub name: String,
+    /// Top-level entry name, preserving non-UTF-8 names on supported filesystems.
+    pub name: OsString,
+    /// Path relative to the workspace root.
+    pub path: PathBuf,
     /// Entry kind determined without following links.
     pub kind: EntryKind,
+    /// File length in bytes; directory lengths are filesystem-specific.
+    pub size_bytes: u64,
+    /// Modification time when the filesystem provides it.
+    pub modified: Option<SystemTime>,
+}
+
+/// Root information for the currently open workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceMetadata {
+    /// Canonical absolute workspace root.
+    pub root: PathBuf,
+    /// Last path component of the root.
+    pub name: OsString,
+}
+
+/// Limits for demand-driven directory enumeration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkspaceOptions {
+    /// Maximum entries returned by a single directory listing.
+    pub max_entries_per_directory: usize,
+}
+
+impl Default for WorkspaceOptions {
+    fn default() -> Self {
+        Self {
+            max_entries_per_directory: 10_000,
+        }
+    }
 }
 
 /// Structured workspace operation failures.
@@ -32,12 +65,29 @@ pub struct WorkspaceEntry {
 pub enum WorkspaceError {
     /// No workspace is currently open.
     NotOpen,
-    /// The requested root does not exist.
+    /// A workspace is already open in this manager.
+    AlreadyOpen,
+    /// The requested root or relative path does not exist.
     NotFound(PathBuf),
     /// The root path itself is a symbolic link.
     RootIsSymlink(PathBuf),
-    /// The root exists but is not a directory.
+    /// A symbolic link occurs in a workspace-relative path.
+    SymlinkNotAllowed(PathBuf),
+    /// The root or requested navigation target is not a directory.
     NotDirectory(PathBuf),
+    /// A document target is not a regular file.
+    NotFile(PathBuf),
+    /// A workspace-relative path is absolute or attempts to escape the root.
+    InvalidRelativePath(PathBuf),
+    /// Directory has more entries than the configured per-listing limit.
+    DirectoryLimitExceeded {
+        /// Relative path of the directory that exceeded the limit.
+        path: PathBuf,
+        /// Configured maximum number of entries.
+        limit: usize,
+    },
+    /// A directory listing limit of zero is invalid.
+    InvalidLimit,
     /// An operating system filesystem operation failed.
     Io {
         /// Name of the failed filesystem operation.
@@ -53,13 +103,29 @@ impl std::fmt::Display for WorkspaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotOpen => f.write_str("no workspace is open"),
+            Self::AlreadyOpen => f.write_str("a workspace is already open"),
             Self::NotFound(path) => write!(f, "workspace path '{}' does not exist", path.display()),
             Self::RootIsSymlink(path) => {
                 write!(f, "workspace root '{}' is a symbolic link", path.display())
             }
-            Self::NotDirectory(path) => {
-                write!(f, "workspace root '{}' is not a directory", path.display())
-            }
+            Self::SymlinkNotAllowed(path) => write!(
+                f,
+                "workspace path '{}' crosses a symbolic link",
+                path.display()
+            ),
+            Self::NotDirectory(path) => write!(f, "'{}' is not a directory", path.display()),
+            Self::NotFile(path) => write!(f, "'{}' is not a regular file", path.display()),
+            Self::InvalidRelativePath(path) => write!(
+                f,
+                "'{}' is not a safe workspace-relative path",
+                path.display()
+            ),
+            Self::DirectoryLimitExceeded { path, limit } => write!(
+                f,
+                "directory '{}' exceeds the entry limit of {limit}",
+                path.display()
+            ),
+            Self::InvalidLimit => f.write_str("directory entry limit must be greater than zero"),
             Self::Io {
                 operation,
                 path,
@@ -78,26 +144,60 @@ impl std::error::Error for WorkspaceError {
     }
 }
 
-/// Holds the currently open workspace, if any.
-#[derive(Debug, Default)]
+/// Owns one open workspace, navigation limits, and queued workspace events.
+#[derive(Debug)]
 pub struct WorkspaceManager {
     root: Option<PathBuf>,
+    options: WorkspaceOptions,
+    events: EventQueue,
+}
+
+impl Default for WorkspaceManager {
+    fn default() -> Self {
+        Self {
+            root: None,
+            options: WorkspaceOptions::default(),
+            events: EventQueue::new(),
+        }
+    }
 }
 
 impl WorkspaceManager {
-    /// Creates a manager with no open workspace.
+    /// Creates a manager with default navigation limits.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Opens a local directory. The root itself cannot be a symlink; child symlinks are listed but not followed.
+    /// Creates a manager with custom navigation limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::InvalidLimit`] when the entry limit is zero.
+    pub fn with_options(options: WorkspaceOptions) -> Result<Self, WorkspaceError> {
+        if options.max_entries_per_directory == 0 {
+            return Err(WorkspaceError::InvalidLimit);
+        }
+        Ok(Self {
+            options,
+            ..Self::default()
+        })
+    }
+
+    /// Opens a local directory without scanning its contents. The root itself cannot be a symlink.
+    ///
+    /// Relative paths are resolved against the process working directory. This
+    /// performs a point-in-time symlink check; it is not a security sandbox
+    /// against concurrent hostile filesystem modifications.
     ///
     /// # Errors
     ///
     /// Returns a structured error for a missing path, symlink root, non-directory,
-    /// or failed filesystem operation.
+    /// an already-open manager, or failed filesystem operation.
     pub fn open(&mut self, path: impl AsRef<Path>) -> Result<(), WorkspaceError> {
+        if self.root.is_some() {
+            return Err(WorkspaceError::AlreadyOpen);
+        }
         let requested = path.as_ref();
         let candidate = if requested.is_absolute() {
             requested.to_path_buf()
@@ -134,7 +234,9 @@ impl WorkspaceManager {
             path: candidate,
             source,
         })?;
-        self.root = Some(canonical);
+        let root = canonical;
+        self.root = Some(root.clone());
+        self.events.push(PlatformEvent::WorkspaceOpened { root });
         Ok(())
     }
 
@@ -147,27 +249,65 @@ impl WorkspaceManager {
         self.root.as_deref().ok_or(WorkspaceError::NotOpen)
     }
 
-    /// Enumerates top-level entries, sorting by name and not following symlinks.
+    /// Returns root metadata for an open workspace.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceError::NotOpen`] if no workspace is open, or
-    /// [`WorkspaceError::Io`] if the directory cannot be read.
-    pub fn entries(&self) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
+    /// Returns [`WorkspaceError::NotOpen`] if no workspace is open.
+    pub fn metadata(&self) -> Result<WorkspaceMetadata, WorkspaceError> {
         let root = self.root()?;
-        let read_dir = fs::read_dir(root).map_err(|source| WorkspaceError::Io {
+        let name = root.file_name().unwrap_or(root.as_os_str()).to_os_string();
+        Ok(WorkspaceMetadata {
+            root: root.to_path_buf(),
+            name,
+        })
+    }
+
+    /// Enumerates the workspace root in deterministic name order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no workspace is open, the entry limit is exceeded,
+    /// or the directory cannot be read.
+    pub fn entries(&self) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
+        self.list_dir(Path::new("."))
+    }
+
+    /// Enumerates one directory relative to the workspace root, without recursion.
+    ///
+    /// The path may contain `.` components, but absolute paths and parent
+    /// components are rejected. Symlinks are listed as entries and never
+    /// traversed. Enumeration reads at most the configured limit plus one item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or missing paths, symbolic link traversal,
+    /// a non-directory target, an exceeded listing limit, or filesystem errors.
+    pub fn list_dir(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
+        let relative = normalize_relative(relative.as_ref())?;
+        let directory = self.resolve_relative(&relative, true)?;
+        let read_dir = fs::read_dir(&directory).map_err(|source| WorkspaceError::Io {
             operation: "read directory",
-            path: root.into(),
+            path: directory.clone(),
             source,
         })?;
         let mut entries = Vec::new();
         for item in read_dir {
+            if entries.len() == self.options.max_entries_per_directory {
+                return Err(WorkspaceError::DirectoryLimitExceeded {
+                    path: relative.clone(),
+                    limit: self.options.max_entries_per_directory,
+                });
+            }
             let item = item.map_err(|source| WorkspaceError::Io {
-                operation: "read entry",
-                path: root.into(),
+                operation: "read directory entry",
+                path: directory.clone(),
                 source,
             })?;
-            let name = item.file_name().to_string_lossy().into_owned();
+            let name = item.file_name();
             let path = item.path();
             let metadata = fs::symlink_metadata(&path).map_err(|source| WorkspaceError::Io {
                 operation: "inspect entry",
@@ -184,10 +324,54 @@ impl WorkspaceManager {
             } else {
                 EntryKind::Other
             };
-            entries.push(WorkspaceEntry { name, kind });
+            let relative_path = if relative.as_os_str().is_empty() {
+                PathBuf::from(&name)
+            } else {
+                relative.join(&name)
+            };
+            entries.push(WorkspaceEntry {
+                name,
+                path: relative_path,
+                kind,
+                size_bytes: metadata.len(),
+                modified: metadata.modified().ok(),
+            });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
+    }
+
+    /// Resolves an existing regular file while enforcing the workspace-relative path policy.
+    ///
+    /// No symlink component is traversed. Canonical containment is checked as
+    /// an additional guard, but filesystem races still require separate policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid, missing, symlinked, out-of-root, or
+    /// non-file paths, and for filesystem errors.
+    pub fn resolve_file(&self, relative: impl AsRef<Path>) -> Result<PathBuf, WorkspaceError> {
+        let relative = normalize_relative(relative.as_ref())?;
+        let path = self.resolve_relative(&relative, false)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| map_path_error(error, &path))?;
+        if !metadata.is_file() {
+            return Err(WorkspaceError::NotFile(path));
+        }
+        let canonical = fs::canonicalize(&path).map_err(|source| WorkspaceError::Io {
+            operation: "resolve file",
+            path: path.clone(),
+            source,
+        })?;
+        let root = self.root()?;
+        if !canonical.starts_with(root) {
+            return Err(WorkspaceError::InvalidRelativePath(relative));
+        }
+        Ok(canonical)
+    }
+
+    /// Drains workspace lifecycle events in FIFO order.
+    pub fn drain_events(&mut self) -> Vec<PlatformEvent> {
+        self.events.drain()
     }
 
     /// Closes the current workspace. Closing while already closed is an error.
@@ -196,7 +380,62 @@ impl WorkspaceManager {
     ///
     /// Returns [`WorkspaceError::NotOpen`] when already closed.
     pub fn close(&mut self) -> Result<(), WorkspaceError> {
-        self.root.take().map(|_| ()).ok_or(WorkspaceError::NotOpen)
+        let root = self.root.take().ok_or(WorkspaceError::NotOpen)?;
+        self.events.push(PlatformEvent::WorkspaceClosed { root });
+        Ok(())
+    }
+
+    fn resolve_relative(
+        &self,
+        relative: &Path,
+        directory: bool,
+    ) -> Result<PathBuf, WorkspaceError> {
+        let root = self.root()?;
+        let mut candidate = root.to_path_buf();
+        let components = relative.components().collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            let Component::Normal(value) = component else {
+                return Err(WorkspaceError::InvalidRelativePath(relative.to_path_buf()));
+            };
+            candidate.push(value);
+            let metadata = fs::symlink_metadata(&candidate)
+                .map_err(|error| map_path_error(error, &candidate))?;
+            if metadata.file_type().is_symlink() {
+                return Err(WorkspaceError::SymlinkNotAllowed(candidate));
+            }
+            let is_final = index + 1 == components.len();
+            if !is_final && !metadata.is_dir() {
+                return Err(WorkspaceError::NotDirectory(candidate));
+            }
+            if is_final && directory && !metadata.is_dir() {
+                return Err(WorkspaceError::NotDirectory(candidate));
+            }
+        }
+        Ok(candidate)
+    }
+}
+
+fn normalize_relative(path: &Path) -> Result<PathBuf, WorkspaceError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            _ => return Err(WorkspaceError::InvalidRelativePath(path.to_path_buf())),
+        }
+    }
+    Ok(normalized)
+}
+
+fn map_path_error(error: io::Error, path: &Path) -> WorkspaceError {
+    if error.kind() == io::ErrorKind::NotFound {
+        WorkspaceError::NotFound(path.to_path_buf())
+    } else {
+        WorkspaceError::Io {
+            operation: "inspect",
+            path: path.to_path_buf(),
+            source: error,
+        }
     }
 }
 
@@ -212,7 +451,7 @@ mod tests {
     impl TempDir {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "koren-test-{}-{}",
+                "koren-workspace-test-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -230,60 +469,132 @@ mod tests {
     }
 
     #[test]
-    fn opens_lists_and_closes_workspace() {
+    fn opens_lazily_lists_deterministically_and_closes() {
         let temp = TempDir::new();
-        fs::write(temp.0.join("z.txt"), "ok").unwrap();
+        fs::write(temp.0.join("z file.txt"), "ok").unwrap();
         fs::create_dir(temp.0.join("a-dir")).unwrap();
         let mut manager = WorkspaceManager::new();
         manager.open(&temp.0).unwrap();
-        assert_eq!(manager.root().unwrap(), fs::canonicalize(&temp.0).unwrap());
+        assert!(matches!(
+            manager.open(&temp.0),
+            Err(WorkspaceError::AlreadyOpen)
+        ));
+        assert_eq!(
+            manager.metadata().unwrap().root,
+            fs::canonicalize(&temp.0).unwrap()
+        );
         let entries = manager.entries().unwrap();
         assert_eq!(
-            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
-            ["a-dir", "z.txt"]
+            entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
+            [OsString::from("a-dir"), OsString::from("z file.txt")]
         );
         assert_eq!(entries[0].kind, EntryKind::Directory);
         assert_eq!(entries[1].kind, EntryKind::File);
         manager.close().unwrap();
         assert!(matches!(manager.entries(), Err(WorkspaceError::NotOpen)));
+        assert!(matches!(manager.close(), Err(WorkspaceError::NotOpen)));
+        assert_eq!(
+            manager.drain_events(),
+            vec![
+                PlatformEvent::WorkspaceOpened {
+                    root: fs::canonicalize(&temp.0).unwrap()
+                },
+                PlatformEvent::WorkspaceClosed {
+                    root: fs::canonicalize(&temp.0).unwrap()
+                },
+            ]
+        );
     }
 
     #[test]
-    fn rejects_missing_file_and_symlink_roots() {
+    fn nested_navigation_handles_unicode_and_relative_boundaries() {
         let temp = TempDir::new();
+        fs::create_dir(temp.0.join("資料")).unwrap();
+        fs::write(temp.0.join("資料/hello world.rs"), "fn main() {}").unwrap();
         let mut manager = WorkspaceManager::new();
+        manager.open(&temp.0).unwrap();
+        let nested = manager.list_dir("資料").unwrap();
+        assert_eq!(nested[0].path, PathBuf::from("資料/hello world.rs"));
+        assert!(manager.resolve_file("資料/hello world.rs").is_ok());
         assert!(matches!(
-            manager.open(temp.0.join("missing")),
+            manager.list_dir("../"),
+            Err(WorkspaceError::InvalidRelativePath(_))
+        ));
+        assert!(matches!(
+            manager.list_dir(temp.0.join("資料")),
+            Err(WorkspaceError::InvalidRelativePath(_))
+        ));
+        assert!(matches!(
+            manager.resolve_file("missing.txt"),
             Err(WorkspaceError::NotFound(_))
         ));
-        let file = temp.0.join("file");
-        fs::write(&file, "x").unwrap();
-        assert!(matches!(
-            manager.open(&file),
-            Err(WorkspaceError::NotDirectory(_))
-        ));
+    }
+
+    #[test]
+    fn symbolic_links_are_listed_but_not_traversed() {
         #[cfg(unix)]
         {
-            let link = temp.0.join("link");
-            std::os::unix::fs::symlink(&temp.0, &link).unwrap();
+            let temp = TempDir::new();
+            let outside = TempDir::new();
+            fs::create_dir(temp.0.join("nested")).unwrap();
+            fs::write(outside.0.join("private.txt"), "private").unwrap();
+            std::os::unix::fs::symlink(&outside.0, temp.0.join("link")).unwrap();
+            let mut manager = WorkspaceManager::new();
+            manager.open(&temp.0).unwrap();
+            assert!(
+                manager
+                    .entries()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.name == "link" && e.kind == EntryKind::Symlink)
+            );
             assert!(matches!(
-                manager.open(&link),
+                manager.list_dir("link"),
+                Err(WorkspaceError::SymlinkNotAllowed(_))
+            ));
+            assert!(matches!(
+                manager.resolve_file("link/private.txt"),
+                Err(WorkspaceError::SymlinkNotAllowed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_a_symbolic_link_as_workspace_root() {
+        #[cfg(unix)]
+        {
+            let temp = TempDir::new();
+            let target = temp.0.join("target");
+            fs::create_dir(&target).unwrap();
+            let link = temp.0.join("root-link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let mut manager = WorkspaceManager::new();
+            assert!(matches!(
+                manager.open(link),
                 Err(WorkspaceError::RootIsSymlink(_))
             ));
         }
     }
 
     #[test]
-    fn reports_child_symlinks_without_following_them() {
-        #[cfg(unix)]
-        {
-            let temp = TempDir::new();
-            let target = temp.0.join("target");
-            fs::create_dir(&target).unwrap();
-            std::os::unix::fs::symlink(&target, temp.0.join("linked")).unwrap();
-            let mut manager = WorkspaceManager::new();
-            manager.open(&temp.0).unwrap();
-            assert_eq!(manager.entries().unwrap()[0].kind, EntryKind::Symlink);
-        }
+    fn listing_limit_is_configurable_and_explicit() {
+        let temp = TempDir::new();
+        fs::write(temp.0.join("a"), "").unwrap();
+        fs::write(temp.0.join("b"), "").unwrap();
+        let options = WorkspaceOptions {
+            max_entries_per_directory: 1,
+        };
+        let mut manager = WorkspaceManager::with_options(options).unwrap();
+        manager.open(&temp.0).unwrap();
+        assert!(matches!(
+            manager.entries(),
+            Err(WorkspaceError::DirectoryLimitExceeded { limit: 1, .. })
+        ));
+        assert!(matches!(
+            WorkspaceManager::with_options(WorkspaceOptions {
+                max_entries_per_directory: 0
+            }),
+            Err(WorkspaceError::InvalidLimit)
+        ));
     }
 }

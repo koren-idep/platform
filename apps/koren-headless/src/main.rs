@@ -95,7 +95,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 println!("root: {root}");
                 println!("entries: {}", entries.len());
                 for entry in entries {
-                    println!("{}\t{:?}", entry.name, entry.kind);
+                    println!("{}\t{:?}", entry.name.to_string_lossy(), entry.kind);
                 }
             }
             Ok(())

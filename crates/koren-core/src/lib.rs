@@ -1,5 +1,88 @@
 //! Small, frontend-independent lifecycle primitives for Koren Platform.
 
+use std::collections::VecDeque;
+use std::path::PathBuf;
+
+/// Ordered notification emitted by a platform service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlatformEvent {
+    /// A workspace became available.
+    WorkspaceOpened {
+        /// Canonical root path of the workspace.
+        root: PathBuf,
+    },
+    /// A workspace was closed.
+    WorkspaceClosed {
+        /// Canonical root path that was closed.
+        root: PathBuf,
+    },
+    /// A document buffer was created.
+    DocumentOpened {
+        /// Stable identifier within its document manager.
+        document_id: u64,
+        /// Workspace root, or `None` for an untitled document.
+        workspace_root: Option<PathBuf>,
+        /// Workspace relative path, or `None` for an untitled document.
+        path: Option<PathBuf>,
+        /// Initial buffer revision.
+        revision: u64,
+    },
+    /// A document buffer changed.
+    DocumentChanged {
+        /// Stable identifier within its document manager.
+        document_id: u64,
+        /// Revision after the change.
+        revision: u64,
+    },
+    /// A document was saved successfully.
+    DocumentSaved {
+        /// Stable identifier within its document manager.
+        document_id: u64,
+        /// Saved revision.
+        revision: u64,
+    },
+    /// A document was closed.
+    DocumentClosed {
+        /// Stable identifier within its document manager.
+        document_id: u64,
+    },
+    /// A save detected that its backing file changed externally.
+    SaveConflictDetected {
+        /// Stable identifier within its document manager.
+        document_id: u64,
+        /// Buffer revision whose save encountered the conflict.
+        revision: u64,
+    },
+}
+
+/// In-process FIFO event queue owned and drained by a platform service consumer.
+///
+/// Events are delivered synchronously in insertion order when drained. They are
+/// not persisted or broadcast to listeners; the owner is responsible for
+/// draining the queue and deciding how to distribute notifications.
+#[derive(Debug, Default)]
+pub struct EventQueue {
+    events: VecDeque<PlatformEvent>,
+}
+
+impl EventQueue {
+    /// Creates an empty event queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds an event to the end of the queue.
+    pub fn push(&mut self, event: PlatformEvent) {
+        self.events.push_back(event);
+    }
+
+    /// Removes all queued events in their original order.
+    pub fn drain(&mut self) -> Vec<PlatformEvent> {
+        self.events.drain(..).collect()
+    }
+}
+
 /// Current lifecycle phase of a [`Platform`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleState {
@@ -117,6 +200,31 @@ impl Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_queue_drains_in_fifo_order() {
+        let mut events = EventQueue::new();
+        events.push(PlatformEvent::WorkspaceOpened {
+            root: PathBuf::from("/workspace"),
+        });
+        events.push(PlatformEvent::DocumentChanged {
+            document_id: 3,
+            revision: 4,
+        });
+        assert_eq!(
+            events.drain(),
+            vec![
+                PlatformEvent::WorkspaceOpened {
+                    root: PathBuf::from("/workspace")
+                },
+                PlatformEvent::DocumentChanged {
+                    document_id: 3,
+                    revision: 4
+                }
+            ]
+        );
+        assert_eq!(events.drain(), Vec::<PlatformEvent>::new());
+    }
 
     #[test]
     fn lifecycle_transitions_are_explicit_and_terminal() {
