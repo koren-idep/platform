@@ -8,6 +8,7 @@ members = [
     "crates/koren-documents",
     "crates/koren-projects",
     "crates/koren-tasks",
+    "crates/koren-cargo",
     "apps/koren-headless",
 ]
 
@@ -21,6 +22,8 @@ repository = "https://github.com/koren-idep/platform"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+glob = "0.3"
+toml = "0.8"
 ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
 koren-core = { path = "crates/koren-core" }
 koren-protocol = { path = "crates/koren-protocol" }
@@ -29,6 +32,7 @@ koren-workspace = { path = "crates/koren-workspace" }
 koren-documents = { path = "crates/koren-documents" }
 koren-projects = { path = "crates/koren-projects" }
 koren-tasks = { path = "crates/koren-tasks" }
+koren-cargo = { path = "crates/koren-cargo" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -135,6 +135,22 @@ pub trait ProjectProvider: Send + Sync {
         directory: &Path,
         entries: &[koren_workspace::WorkspaceEntry],
     ) -> Option<ProjectSpec>;
+    /// Returns project candidates for an explicit bounded scan.
+    ///
+    /// Providers that need cross-directory context, such as grouping workspace members, can
+    /// override this method. The default implementation calls [`Self::detect`] per directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when limits are invalid, traversal fails, or a provider candidate is
+    /// inconsistent with the inspected directory.
+    fn discover_candidates(
+        &self,
+        workspace: &WorkspaceManager,
+        limits: DiscoveryLimits,
+    ) -> Result<Vec<ProjectSpec>, ProjectError> {
+        collect_candidates(workspace, self, limits)
+    }
     /// Task capabilities provided by this project system. Empty means no build tasks are exposed.
     fn task_definitions(&self, _project: &ProjectInfo) -> Vec<TaskDefinition> {
         Vec::new()
@@ -269,7 +285,7 @@ impl ProjectManager {
         let provider = self.providers.get(id).ok_or_else(|| {
             ProjectError::Invalid(format!("provider '{}' is not registered", id.as_str()))
         })?;
-        let specs = collect_candidates(workspace, provider.as_ref(), limits)?;
+        let specs = provider.discover_candidates(workspace, limits)?;
         specs
             .into_iter()
             .map(|spec| self.register_discovered(workspace, spec))
@@ -390,7 +406,8 @@ impl ProjectManager {
         provider: &dyn ProjectProvider,
         limits: DiscoveryLimits,
     ) -> Result<Vec<ProjectId>, ProjectError> {
-        collect_candidates(workspace, provider, limits)?
+        provider
+            .discover_candidates(workspace, limits)?
             .into_iter()
             .map(|spec| self.register_discovered(workspace, spec))
             .collect()
@@ -442,9 +459,9 @@ fn push_project_event(events: &mut VecDeque<PlatformEvent>, event: PlatformEvent
     }
     events.push_back(event);
 }
-fn collect_candidates(
+fn collect_candidates<P: ProjectProvider + ?Sized>(
     workspace: &WorkspaceManager,
-    provider: &dyn ProjectProvider,
+    provider: &P,
     limits: DiscoveryLimits,
 ) -> Result<Vec<ProjectSpec>, ProjectError> {
     if limits.max_directories == 0 || limits.max_projects == 0 {
