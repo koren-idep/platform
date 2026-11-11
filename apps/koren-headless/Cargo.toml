@@ -1,0 +1,21 @@
+[package]
+name = "koren-headless"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless demonstration application for Koren IDE Platform"
+
+[dependencies]
+koren-core.workspace = true
+koren-protocol.workspace = true
+koren-commands.workspace = true
+koren-workspace.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "koren-headless"
+path = "src/main.rs"
+
+[lints]
+workspace = true

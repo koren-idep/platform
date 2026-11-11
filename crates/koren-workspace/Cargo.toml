@@ -1,0 +1,10 @@
+[package]
+name = "koren-workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Local workspace directory access for Koren IDE Platform"
+
+[lints]
+workspace = true
