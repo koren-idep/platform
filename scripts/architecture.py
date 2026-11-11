@@ -8,19 +8,22 @@ ALLOWED_INTERNAL_DEPS = {
     "koren-core": set(),
     "koren-protocol": set(),
     "koren-commands": {"koren-core", "koren-protocol"},
+    "koren-extensions": set(),
+    "koren-lsp": {"koren-documents", "koren-protocol"},
+    "koren-lua": {"koren-extensions", "koren-protocol"},
     "koren-workspace": {"koren-core"},
     "koren-documents": {"koren-core", "koren-protocol", "koren-workspace"},
     "koren-projects": {"koren-core", "koren-workspace", "koren-tasks"},
     "koren-tasks": {"koren-core"},
     "koren-cargo": {"koren-projects", "koren-tasks", "koren-workspace"},
     "koren-headless": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo"},
-    "koren-code": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo"},
+    "koren-code": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo", "koren-extensions", "koren-lua", "koren-lsp"},
 }
 BACKEND_PACKAGES = set(ALLOWED_INTERNAL_DEPS) - {"koren-headless", "koren-code"}
 FORBIDDEN_BACKEND_DEPS = {
     "tao", "wry", "tauri", "web-view", "webview", "gtk4", "egui", "iced",
     "web-sys", "wasm-bindgen", "js-sys", "deno_core", "boa_engine",
-    "javascriptcore-rs", "mlua", "wasmtime", "wasmer", "lsp-server",
+    "javascriptcore-rs", "wasmtime", "wasmer", "lsp-server",
     "tower-lsp", "lsp-types", "lsp_types", "dap", "acp", "mcp",
     "rust-analyzer", "ra_ap_syntax", "tree-sitter", "tree-sitter-rust",
     "syntect", "cargo_metadata", "rls",
@@ -42,6 +45,8 @@ def violations(metadata):
                 result.append(f"{source} -> {target}")
             if source in BACKEND_PACKAGES and target in FORBIDDEN_BACKEND_DEPS:
                 result.append(f"{source} -> forbidden dependency {target}")
+            if source in BACKEND_PACKAGES and target == "mlua" and source != "koren-lua":
+                result.append(f"{source} -> mlua is only allowed in koren-lua")
     return sorted(result)
 
 

@@ -1,0 +1,19 @@
+[package]
+name = "koren-lua"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Capability-limited Lua 5.4 extension runtime for Koren IDE Platform"
+
+[dependencies]
+koren-extensions.workspace = true
+koren-protocol.workspace = true
+mlua.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "phase6"
+harness = false

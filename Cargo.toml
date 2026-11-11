@@ -4,6 +4,9 @@ members = [
     "crates/koren-core",
     "crates/koren-protocol",
     "crates/koren-commands",
+    "crates/koren-extensions",
+    "crates/koren-lsp",
+    "crates/koren-lua",
     "crates/koren-workspace",
     "crates/koren-documents",
     "crates/koren-projects",
@@ -23,12 +26,17 @@ repository = "https://github.com/koren-idep/platform"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
+mlua = { version = "=0.11.6", features = ["lua54", "vendored", "send"] }
 glob = "0.3"
 toml = "0.8"
 ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
 koren-core = { path = "crates/koren-core" }
 koren-protocol = { path = "crates/koren-protocol" }
 koren-commands = { path = "crates/koren-commands" }
+koren-extensions = { path = "crates/koren-extensions" }
+koren-lsp = { path = "crates/koren-lsp" }
+koren-lua = { path = "crates/koren-lua" }
 koren-workspace = { path = "crates/koren-workspace" }
 koren-documents = { path = "crates/koren-documents" }
 koren-projects = { path = "crates/koren-projects" }
