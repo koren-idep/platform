@@ -6,8 +6,8 @@ export interface LayoutPreferences {
 }
 
 export const DEFAULT_LAYOUT: Readonly<LayoutPreferences> = {
-  explorerWidth: 232,
-  bottomHeight: 144,
+  explorerWidth: 276,
+  bottomHeight: 188,
   explorerCollapsed: false,
   bottomCollapsed: false,
 };
