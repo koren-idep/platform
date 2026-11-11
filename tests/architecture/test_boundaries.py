@@ -16,8 +16,9 @@ def test_positive_dependency_fixture():
     metadata = {"packages": [
         package("koren-core"), package("koren-protocol"),
         package("koren-commands", "koren-core"),
-        package("koren-workspace", "koren-core", "koren-protocol"),
-        package("koren-headless", "koren-core", "koren-protocol", "koren-commands", "koren-workspace"),
+        package("koren-workspace", "koren-core"),
+        package("koren-documents", "koren-core", "koren-protocol", "koren-workspace"),
+        package("koren-headless", "koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents"),
     ]}
     assert violations(metadata) == []
 
@@ -25,6 +26,11 @@ def test_positive_dependency_fixture():
 def test_negative_dependency_fixture_rejects_reverse_edge():
     metadata = {"packages": [package("koren-protocol", "koren-headless")]}
     assert violations(metadata) == ["koren-protocol -> koren-headless"]
+
+
+def test_negative_dependency_fixture_rejects_frontend_runtime_in_backend():
+    metadata = {"packages": [package("koren-documents", "wry")]}
+    assert violations(metadata) == ["koren-documents -> forbidden dependency wry"]
 
 
 def test_checker_fails_for_forbidden_metadata(tmp_path):

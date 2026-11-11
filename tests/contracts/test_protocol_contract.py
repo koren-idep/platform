@@ -10,14 +10,14 @@ def test_ping_json_matches_versioned_response_contract():
     result = subprocess.run([str(BIN), "command", "execute", "core.ping", "--json"], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     response = json.loads(result.stdout)
-    assert response == {"version": 1, "request_id": 2, "result": {"Ok": {"kind": "command_output", "value": "pong"}}}
+    assert response == {"version": 2, "request_id": 2, "result": {"Ok": {"kind": "command_output", "value": "pong"}}}
 
 
 def test_unknown_command_is_structured_and_nonzero():
     result = subprocess.run([str(BIN), "command", "execute", "missing.command", "--json"], capture_output=True, text=True)
     assert result.returncode != 0
     response = json.loads(result.stdout)
-    assert response["version"] == 1
+    assert response["version"] == 2
     assert response["result"]["Err"]["code"] == "not_found"
 
 

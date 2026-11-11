@@ -8,8 +8,18 @@ ALLOWED_INTERNAL_DEPS = {
     "koren-core": set(),
     "koren-protocol": set(),
     "koren-commands": {"koren-core", "koren-protocol"},
-    "koren-workspace": {"koren-core", "koren-protocol"},
-    "koren-headless": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace"},
+    "koren-workspace": {"koren-core"},
+    "koren-documents": {"koren-core", "koren-protocol", "koren-workspace"},
+    "koren-headless": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents"},
+}
+BACKEND_PACKAGES = set(ALLOWED_INTERNAL_DEPS) - {"koren-headless"}
+FORBIDDEN_BACKEND_DEPS = {
+    "tao", "wry", "tauri", "web-view", "webview", "gtk4", "egui", "iced",
+    "web-sys", "wasm-bindgen", "js-sys", "deno_core", "boa_engine",
+    "javascriptcore-rs", "mlua", "wasmtime", "wasmer", "lsp-server",
+    "tower-lsp", "lsp-types", "lsp_types", "dap", "acp", "mcp",
+    "rust-analyzer", "ra_ap_syntax", "tree-sitter", "tree-sitter-rust",
+    "syntect", "cargo_metadata", "rls",
 }
 
 
@@ -26,6 +36,8 @@ def violations(metadata):
             target = dependency["name"]
             if target in names and target not in allowed:
                 result.append(f"{source} -> {target}")
+            if source in BACKEND_PACKAGES and target in FORBIDDEN_BACKEND_DEPS:
+                result.append(f"{source} -> forbidden dependency {target}")
     return sorted(result)
 
 
