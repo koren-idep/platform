@@ -78,3 +78,27 @@ Source inspection confirmed the supervisor called `Child::try_wait` every 10 ms.
 | Output capture, 32 KiB stdout and stderr | 59,051.2 µs | 49,747.6 µs | Includes child startup and scheduling; variation is too large to attribute to copying |
 
 The completion change tracks the removed 10 ms polling floor. This is a single local run, not a cross-platform result. Output capture remains dominated by child startup, pipe scheduling, and fixture behavior; the benchmark does not isolate those costs or justify a claim about byte-copy performance. The 1 ms poll keeps bounded completion latency with a dedicated waiting thread, at the cost of more wakeups for long-running tasks.
+
+## Phase 6 extension and language-service measurements
+
+Run the reproducible local microbenchmarks with:
+
+```sh
+cargo bench --locked -p koren-lua --bench phase6
+cargo bench --locked -p koren-lsp --bench phase6
+```
+
+One run on 2026-11-11, Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, Intel Core i7-1068NG7 at 2.30 GHz (8 CPUs), Rust `1.99.1`, Python `3.14.8`, optimized Cargo bench profile:
+
+| Workload | Iterations | Mean | Minimum |
+|---|---:|---:|---:|
+| Empty extension-manager construction | 10,000 | 0.017 µs | 0.015 µs |
+| Lua VM initialize, activate one command, then deactivate | 500 | 60.958 µs | 43.190 µs |
+| Lua VM allocator bytes after activation | 1 | 19,443 bytes | — |
+| Python fixture process start/exit baseline | 20 | 12,113.9 µs | 11,428.2 µs |
+| Fake LSP process start, initialize, and shutdown | 20 | 75,985.0 µs | 72,841.1 µs |
+| Fake LSP hover request/response | 100 | 107.9 µs | 68.0 µs |
+| LSP document revision/change mapping | 10,000 | 0.317 µs | 0.259 µs |
+| Fake LSP diagnostic publication after didOpen | 20 | 140.1 µs | — |
+
+The LSP startup row includes the Python fixture process. The measured Python start/exit row is the external-process baseline; the difference is about 66.1 ms for LSP framing and initialization in this fixture. The Lua VM allocator figure is the VM's own allocated memory after activation, not total app RSS. These fixtures do not represent rust-analyzer or another production language server. The Phase 2 desktop smoke above is the only recorded process-tree RSS measurement; it was collected before Phase 6 and should be repeated on target hardware with an extension/server active. These microbenchmarks do not measure ordinary typing or save latency with a live production server.

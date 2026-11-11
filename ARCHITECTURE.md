@@ -8,11 +8,16 @@ The dependency graph points from consumers to the lower-level crates they use:
 koren-headless ──> koren-core, koren-protocol, koren-commands,
                    koren-workspace, koren-documents, koren-projects,
                    koren-tasks, koren-cargo
+koren-code ──────> platform crates plus koren-extensions, koren-lua,
+                   koren-lsp
 koren-documents ─> koren-core, koren-protocol, koren-workspace, ropey
 koren-projects ──> koren-core, koren-workspace, koren-tasks
 koren-tasks ─────> koren-core
 koren-cargo ─────> koren-projects, koren-tasks, koren-workspace,
                    serde, serde_json, toml, glob
+koren-extensions (no internal dependencies)
+koren-lsp ───────> koren-documents, koren-protocol
+koren-lua ───────> koren-extensions, koren-protocol, mlua (Lua 5.4)
 koren-workspace ─> koren-core
 koren-protocol  ─> serde
 
@@ -20,7 +25,7 @@ koren-core      (no internal crate dependencies)
 koren-commands  (no internal crate dependencies)
 ```
 
-Koren core owns lifecycle primitives and shared event vocabulary. Koren protocol owns typed versioned request/response contracts and JSON types. Koren commands owns command registration, enumeration, and invocation. Koren workspace opens one local root and provides bounded, demand-driven navigation. Koren documents manages revisioned text buffers and local file saves. Koren projects owns manager-local logical projects and explicit bounded discovery providers; provider discovery can override per-directory detection when it must group related manifests. Providers may expose generic task definitions. Koren tasks owns those definitions, host authorization checks, direct-process execution, bounded output, and run lifecycle. Koren cargo is an optional first-party Rust integration and is not a dependency of the generic project, task, workspace, or document crates. Koren headless wires the public APIs together.
+Koren core owns lifecycle primitives and shared event vocabulary. Koren protocol owns typed versioned request/response contracts and JSON types. Koren commands owns command registration, enumeration, and invocation. Koren workspace opens one local root and provides bounded, demand-driven navigation. Koren documents manages revisioned text buffers and local file saves. Koren projects owns manager-local logical projects and explicit bounded discovery providers; providers may expose generic task definitions. Koren tasks owns those definitions, host authorization checks, direct-process execution, bounded output, and run lifecycle. Koren cargo is an optional first-party Rust integration and is not a dependency of the generic project, task, workspace, or document crates. `koren-extensions` owns versioned manifests, lifecycle, and typed contribution registrations. `koren-lua` adapts Lua 5.4 callbacks to those shared contributions with a restricted standard-library set and VM limits. `koren-lsp` owns bounded JSON-RPC framing, direct stdio process configuration, typed language results, diagnostics, and revision/version synchronization. The desktop app composes these host-independent platform services.
 
 ## Project model and discovery
 
@@ -44,7 +49,7 @@ Registering a task grants no execution permission. A host supplies a TaskAuthori
 
 Protocol approval summaries include the executable, arguments, working directory, project, actor, and environment variable names, but never values. Rust hosts should keep environment values out of logs and presentation surfaces. Approvals are not sandboxing: a permitted Cargo build can execute project-controlled build scripts and programs. Workspace path checks do not constrain a running process.
 
-Cargo metadata architecture tests enforce internal dependency directions and reject frontend, language-specific, or agent-runtime dependencies in the backend crates.
+Cargo metadata architecture tests enforce internal dependency directions and reject frontend, language-specific, or agent-runtime dependencies in the backend crates. Only `koren-lua` may depend on `mlua`; generic crates do not depend on the desktop app.
 
 ## Workspace ownership and path policy
 
@@ -56,7 +61,7 @@ Workspace-relative operations reject absolute paths, parent traversal, and every
 
 `DocumentManager` owns independent in-memory documents. A document can be untitled or associated with one workspace file. Opening the same canonical file twice in one manager returns the same id, preventing competing writable buffers. Closing a dirty document requires explicit discard authorization.
 
-Text is stored in [Ropey](https://docs.rs/ropey/latest/ropey/), a UTF-8 rope whose edits use Unicode scalar indices. This avoids copying an entire large buffer for each small edit and avoids invalid UTF-8 boundaries. Ropey reports logarithmic worst-case edit/query operations, including long single-line files; this is a library complexity statement, not a Koren performance claim. The platform exposes zero-based UTF-16 line/column positions for editor and future LSP interoperability and converts them to Ropey scalar indices. A UTF-16 position inside a surrogate pair, out-of-range line/column, or position inside a line terminator is rejected. LF and CRLF remain byte-for-byte in the buffer; positions exclude those terminator characters.
+Text is stored in [Ropey](https://docs.rs/ropey/latest/ropey/), a UTF-8 rope whose edits use Unicode scalar indices. This avoids copying an entire large buffer for each small edit and avoids invalid UTF-8 boundaries. Ropey reports logarithmic worst-case edit/query operations, including long single-line files; this is a library complexity statement, not a Koren performance claim. The platform exposes zero-based UTF-16 line/column positions for editor and LSP interoperability and converts them to Ropey scalar indices. A UTF-16 position inside a surrogate pair, out-of-range line/column, or position inside a line terminator is rejected. LF and CRLF remain byte-for-byte in the buffer; positions exclude those terminator characters.
 
 Revisions begin at zero. An edit batch validates every range against the same revision, rejects overlap and equal-start ambiguity, then applies edits from the end toward the beginning. A non-empty successful batch advances one revision. Expected-revision mismatches fail explicitly. Dirty state is revision-based: it clears only after a successful save or explicit reload.
 
@@ -82,7 +87,7 @@ All platform crates remain frontend independent. Koren Code Editor is the langua
 
 The editor owns generic file navigation, document tabs, text editing, themes, task presentation, and approval dialogs. Language-specific editor contributions are registered through the frontend `LanguageIntegration` seam; Rust syntax support is one initial integration. Cargo project discovery and tasks come from the reusable `koren-cargo` platform provider. No Rust-only project navigation, settings, or editor assumptions belong in the universal shell. Task approval is a user decision, not a sandbox; the UI shows the exact executable, arguments, working directory, project, and environment variable names before approval.
 
-The product split is: **Koren IDE Platform**, the reusable language-neutral backend and extension framework; **Koren Code Editor**, the universal lightweight editor; and **Koren IDE**, a future Rust-specialized distribution using the same desktop shell and platform APIs. Advanced Rust diagnostics, inspections, semantic analysis, refactoring, and deeper compiler/rust-analyzer integration are outside Phase 5. Runtime extensions, LSP, DAP, and agent interfaces are future work; no runtime extension loader is implemented yet. Shared extension APIs are intended to serve both desktop products.
+The product split is: **Koren IDE Platform**, the reusable language-neutral backend and extension framework; **Koren Code Editor**, the universal lightweight editor; and **Koren IDE**, a future Rust-specialized distribution using the same desktop shell and platform APIs. Phase 6 adds local extension management and an LSP client integrated with document synchronization, diagnostics, hover, completion, and definition navigation. Advanced Rust diagnostics, inspections, semantic analysis, refactoring, DAP, and agent interfaces remain future work. Extensions share the same manifest, Lua, and LSP APIs across products. The desktop host currently performs LSP initialization on its platform worker with a five-second request timeout; an unresponsive server can delay queued host operations during startup. Language feature requests have a 150 ms bound.
 
 ## Performance
 

@@ -1,0 +1,21 @@
+schema_version = 1
+id = "org.koren.rust-analyzer"
+name = "Rust Analyzer Language Service"
+publisher = "Koren examples"
+version = "0.1.0"
+description = "Optional rust-analyzer configuration using the shared language-server API."
+entry_point = "main.lua"
+api_version = "1.0.0"
+capabilities = ["language_definitions", "language_server"]
+
+[[languages]]
+id = "rust"
+name = "Rust"
+extensions = ["rs"]
+
+[[language_servers]]
+id = "rust-analyzer"
+command = "rust-analyzer"
+languages = ["rust"]
+file_extensions = ["rs"]
+
