@@ -4,8 +4,8 @@ use koren_core::{Platform, PlatformEvent};
 use koren_documents::{DocumentId, DocumentManager};
 use koren_extensions::{CommandContext, ExtensionManager, ExtensionState, MenuLocation};
 use koren_lsp::{
-    DiagnosticSet, LspDocumentSync, LspServerManager, ServerAuthorizer, ServerConfig, ServerEvent,
-    ServerId, path_to_uri,
+    DiagnosticSet, LspActorEvent, LspDocumentSync, LspRequest, LspResponse, LspServerActors,
+    LspServerHandle, ServerAuthorizer, ServerConfig, ServerEvent, ServerId, path_to_uri,
 };
 use koren_lua::{LuaDocumentContext, LuaExtensionRuntime, LuaHostContext, LuaLimits};
 use koren_projects::{DiscoveryLimits, ProjectId, ProjectInfo, ProjectManager};
@@ -27,10 +27,52 @@ use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+const LANGUAGE_FEATURE_TIMEOUT: Duration = Duration::from_millis(150);
+const LANGUAGE_FEATURE_WORKERS: usize = 4;
+const LANGUAGE_FEATURE_QUEUE_CAPACITY: usize = 64;
+type FeatureWork = Box<dyn FnOnce() + Send + 'static>;
+
+struct LanguageFeaturePool {
+    sender: SyncSender<FeatureWork>,
+}
+
+impl LanguageFeaturePool {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<FeatureWork>(LANGUAGE_FEATURE_QUEUE_CAPACITY);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..LANGUAGE_FEATURE_WORKERS {
+            let receiver = receiver.clone();
+            let _ = thread::Builder::new()
+                .name(format!("koren-language-request-{index}"))
+                .spawn(move || {
+                    loop {
+                        let work = receiver.lock().ok().and_then(|rx| rx.recv().ok());
+                        match work {
+                            Some(work) => work(),
+                            None => break,
+                        }
+                    }
+                })
+                .expect("failed to start language feature worker");
+        }
+        Self { sender }
+    }
+
+    fn submit(&self, work: FeatureWork) -> Result<(), FeatureWork> {
+        self.sender.try_send(work).map_err(|error| match error {
+            TrySendError::Full(work) | TrySendError::Disconnected(work) => work,
+        })
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DesktopEvent {
@@ -70,6 +112,16 @@ pub(crate) fn spawn_backend() -> BackendSender {
     sender
 }
 
+#[cfg(test)]
+fn spawn_backend_with_state(state: DesktopBackend) -> BackendSender {
+    let (sender, receiver) = mpsc::channel();
+    let _worker = thread::Builder::new()
+        .name("koren-code-platform-test".into())
+        .spawn(move || backend_loop_with_state(receiver, state))
+        .expect("failed to start test platform worker");
+    sender
+}
+
 pub(crate) fn send_request(sender: &BackendSender, request: Request) -> Result<Response, String> {
     let (reply_tx, reply_rx) = mpsc::channel();
     sender
@@ -94,19 +146,26 @@ pub(crate) fn shutdown(sender: &BackendSender) {
 }
 
 fn backend_loop(receiver: Receiver<BackendCommand>) {
-    let mut state = match DesktopBackend::new() {
+    let state = match DesktopBackend::new() {
         Ok(state) => state,
         Err(error) => {
             eprintln!("failed to initialize Koren Code Editor platform: {error}");
             return;
         }
     };
+    backend_loop_with_state(receiver, state);
+}
+
+fn backend_loop_with_state(receiver: Receiver<BackendCommand>, mut state: DesktopBackend) {
+    let language_features = LanguageFeaturePool::new();
     let mut subscribers: Vec<Sender<Vec<DesktopEvent>>> = Vec::new();
     let mut ticks_without_events = 0u16;
     loop {
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(BackendCommand::Request(request, reply)) => {
-                let _ = reply.send(state.dispatch(*request));
+                if !state.defer_language_feature(&request, reply.clone(), &language_features) {
+                    let _ = reply.send(state.dispatch(*request));
+                }
             }
             Ok(BackendCommand::Subscribe(sender)) => {
                 if subscribers.len() < 8 {
@@ -156,11 +215,13 @@ struct DesktopBackend {
     extensions_discovered: bool,
     lua_runtimes: BTreeMap<String, LuaExtensionRuntime>,
     active_document: Option<DocumentId>,
-    language_servers: LspServerManager,
+    language_servers: LspServerActors,
     active_language_servers: BTreeMap<u64, ServerId>,
+    initialized_language_servers: BTreeSet<u64>,
     language_server_owners: BTreeMap<u64, (String, String)>,
     language_document_sync: BTreeMap<u64, LspDocumentSync>,
     open_documents: BTreeSet<DocumentId>,
+    document_cancellations: BTreeMap<DocumentId, Arc<AtomicBool>>,
     pending_language_servers: BTreeMap<u64, PendingLanguageServer>,
     next_language_server_approval: u64,
 }
@@ -216,11 +277,13 @@ impl DesktopBackend {
             extensions_discovered: false,
             lua_runtimes: BTreeMap::new(),
             active_document: None,
-            language_servers: LspServerManager::new(),
+            language_servers: LspServerActors::new(),
             active_language_servers: BTreeMap::new(),
+            initialized_language_servers: BTreeSet::new(),
             language_server_owners: BTreeMap::new(),
             language_document_sync: BTreeMap::new(),
             open_documents: BTreeSet::new(),
+            document_cancellations: BTreeMap::new(),
             pending_language_servers: BTreeMap::new(),
             next_language_server_approval: 0,
         })
@@ -242,6 +305,84 @@ impl DesktopBackend {
         let id = request.request_id;
         let result = validate_version(request.version).and_then(|()| self.method(request.method));
         Response::new(id, result)
+    }
+
+    fn defer_language_feature(
+        &self,
+        request: &Request,
+        reply: Sender<Response>,
+        pool: &LanguageFeaturePool,
+    ) -> bool {
+        let (kind, document_id, expected_revision, position) = match &request.method {
+            RequestMethod::LanguageHover {
+                document_id,
+                expected_revision,
+                position,
+            } => (
+                FeatureKind::Hover,
+                *document_id,
+                *expected_revision,
+                *position,
+            ),
+            RequestMethod::LanguageCompletion {
+                document_id,
+                expected_revision,
+                position,
+            } => (
+                FeatureKind::Completion,
+                *document_id,
+                *expected_revision,
+                *position,
+            ),
+            RequestMethod::LanguageDefinition {
+                document_id,
+                expected_revision,
+                position,
+            } => (
+                FeatureKind::Definition,
+                *document_id,
+                *expected_revision,
+                *position,
+            ),
+            _ => return false,
+        };
+        let request_id = request.request_id;
+        let result = validate_version(request.version)
+            .and_then(|()| self.language_targets(document_id, expected_revision));
+        let targets = match result {
+            Ok(targets) => targets,
+            Err(error) => {
+                let _ = reply.send(Response::new(request_id, Err(error)));
+                return true;
+            }
+        };
+        let cancelled = self
+            .document_cancellations
+            .get(&DocumentId(document_id))
+            .cloned()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        let worker_reply = reply.clone();
+        let work = Box::new(move || {
+            let result = run_language_feature(
+                kind,
+                document_id,
+                expected_revision,
+                position,
+                targets,
+                cancelled,
+            );
+            let _ = worker_reply.send(Response::new(request_id, result));
+        });
+        if pool.submit(work).is_err() {
+            let _ = reply.send(Response::new(
+                request_id,
+                Err(ProtocolError {
+                    code: ErrorCode::Internal,
+                    message: "language request workers are busy".into(),
+                }),
+            ));
+        }
+        true
     }
 
     fn method(&mut self, method: RequestMethod) -> Result<ResponseValue, ProtocolError> {
@@ -319,6 +460,7 @@ impl DesktopBackend {
                     .close_workspace(&root)
                     .map_err(lsp_error)?;
                 self.active_language_servers.clear();
+                self.initialized_language_servers.clear();
                 self.language_server_owners.clear();
                 self.language_document_sync.clear();
                 self.pending_language_servers
@@ -357,6 +499,9 @@ impl DesktopBackend {
                     .open_file(&self.workspace, path)
                     .map_err(document_error)?;
                 self.open_documents.insert(id);
+                self.document_cancellations
+                    .entry(id)
+                    .or_insert_with(|| Arc::new(AtomicBool::new(false)));
                 self.sync_document_open(id);
                 let info = self.documents.info(id).map_err(document_error)?;
                 Ok(ResponseValue::DocumentOpened {
@@ -446,6 +591,11 @@ impl DesktopBackend {
                 self.documents
                     .close(DocumentId(document_id), discard_unsaved_changes)
                     .map_err(document_error)?;
+                if let Some(cancelled) =
+                    self.document_cancellations.remove(&DocumentId(document_id))
+                {
+                    cancelled.store(true, Ordering::Release);
+                }
                 self.sync_document_close(DocumentId(document_id));
                 if self.active_document == Some(DocumentId(document_id)) {
                     self.active_document = None;
@@ -1019,12 +1169,13 @@ impl DesktopBackend {
                 .get_mut(&id)
                 .and_then(|sync| sync.close(document_id).ok());
             if let Some(notification) = notification {
-                if let Ok(server) = self.language_servers.server_mut(server_id) {
-                    let _ = server.send_sync_notification(&notification);
+                if let Ok(server) = self.language_servers.handle(server_id) {
+                    let _ = server.notify(notification);
                 }
             }
         }
         self.active_language_servers.remove(&id);
+        self.initialized_language_servers.remove(&id);
         self.language_server_owners.remove(&id);
         self.language_document_sync.remove(&id);
         self.language_servers
@@ -1036,7 +1187,7 @@ impl DesktopBackend {
         &self,
         document_id: u64,
         expected_revision: u64,
-    ) -> Result<Vec<(u64, ServerId, String, i32)>, ProtocolError> {
+    ) -> Result<Vec<(u64, LspServerHandle, String, i32)>, ProtocolError> {
         let document = DocumentId(document_id);
         let snapshot = self.documents.snapshot(document).map_err(document_error)?;
         if snapshot.info.revision != expected_revision {
@@ -1047,6 +1198,9 @@ impl DesktopBackend {
         }
         let mut targets = Vec::new();
         for (application_id, server_id) in &self.active_language_servers {
+            if !self.initialized_language_servers.contains(application_id) {
+                continue;
+            }
             let Some(sync) = self.language_document_sync.get(application_id) else {
                 continue;
             };
@@ -1056,7 +1210,9 @@ impl DesktopBackend {
                 continue;
             };
             if revision == expected_revision {
-                targets.push((*application_id, *server_id, uri.to_owned(), version));
+                if let Ok(server) = self.language_servers.handle(*server_id) {
+                    targets.push((*application_id, server, uri.to_owned(), version));
+                }
             }
         }
         Ok(targets)
@@ -1069,12 +1225,17 @@ impl DesktopBackend {
         position: koren_protocol::TextPosition,
     ) -> Result<ResponseValue, ProtocolError> {
         let targets = self.language_targets(document_id, expected_revision)?;
-        for (_, server_id, uri, version) in targets {
-            let Ok(server) = self.language_servers.server_mut(server_id) else {
-                continue;
+        for (_, server, uri, version) in targets {
+            let request = LspRequest::Hover {
+                uri,
+                version,
+                position,
+                timeout: LANGUAGE_FEATURE_TIMEOUT,
             };
-            match server.hover_with_timeout(&uri, version, position, Duration::from_millis(150)) {
-                Ok(result) if result.is_current(version) => {
+            match server.request(request).and_then(|ticket| {
+                ticket.recv_timeout(LANGUAGE_FEATURE_TIMEOUT + Duration::from_millis(20))
+            }) {
+                Ok(LspResponse::Hover(result)) if result.is_current(version) => {
                     let value = result.value;
                     return Ok(ResponseValue::LanguageHover {
                         document_revision: expected_revision,
@@ -1083,7 +1244,10 @@ impl DesktopBackend {
                     });
                 }
                 Err(koren_lsp::LspError::UnsupportedFeature(_))
-                | Err(koren_lsp::LspError::RequestTimeout(_)) => continue,
+                | Err(koren_lsp::LspError::RequestTimeout(_))
+                | Err(koren_lsp::LspError::RequestCancelled)
+                | Err(koren_lsp::LspError::RequestQueueFull)
+                | Err(koren_lsp::LspError::ServerNotReady(_)) => continue,
                 Err(error) => return Err(lsp_error(error)),
                 _ => continue,
             }
@@ -1102,17 +1266,17 @@ impl DesktopBackend {
         position: koren_protocol::TextPosition,
     ) -> Result<ResponseValue, ProtocolError> {
         let targets = self.language_targets(document_id, expected_revision)?;
-        for (_, server_id, uri, version) in targets {
-            let Ok(server) = self.language_servers.server_mut(server_id) else {
-                continue;
-            };
-            match server.completion_with_timeout(
-                &uri,
+        for (_, server, uri, version) in targets {
+            let request = LspRequest::Completion {
+                uri,
                 version,
                 position,
-                Duration::from_millis(150),
-            ) {
-                Ok(result) if result.is_current(version) => {
+                timeout: LANGUAGE_FEATURE_TIMEOUT,
+            };
+            match server.request(request).and_then(|ticket| {
+                ticket.recv_timeout(LANGUAGE_FEATURE_TIMEOUT + Duration::from_millis(20))
+            }) {
+                Ok(LspResponse::Completion(result)) if result.is_current(version) => {
                     return Ok(ResponseValue::LanguageCompletions {
                         document_revision: expected_revision,
                         items: result
@@ -1128,7 +1292,10 @@ impl DesktopBackend {
                     });
                 }
                 Err(koren_lsp::LspError::UnsupportedFeature(_))
-                | Err(koren_lsp::LspError::RequestTimeout(_)) => continue,
+                | Err(koren_lsp::LspError::RequestTimeout(_))
+                | Err(koren_lsp::LspError::RequestCancelled)
+                | Err(koren_lsp::LspError::RequestQueueFull)
+                | Err(koren_lsp::LspError::ServerNotReady(_)) => continue,
                 Err(error) => return Err(lsp_error(error)),
                 _ => continue,
             }
@@ -1146,17 +1313,17 @@ impl DesktopBackend {
         position: koren_protocol::TextPosition,
     ) -> Result<ResponseValue, ProtocolError> {
         let targets = self.language_targets(document_id, expected_revision)?;
-        for (_, server_id, uri, version) in targets {
-            let Ok(server) = self.language_servers.server_mut(server_id) else {
-                continue;
-            };
-            match server.definition_with_timeout(
-                &uri,
+        for (_, server, uri, version) in targets {
+            let request = LspRequest::Definition {
+                uri,
                 version,
                 position,
-                Duration::from_millis(150),
-            ) {
-                Ok(result) if result.is_current(version) => {
+                timeout: LANGUAGE_FEATURE_TIMEOUT,
+            };
+            match server.request(request).and_then(|ticket| {
+                ticket.recv_timeout(LANGUAGE_FEATURE_TIMEOUT + Duration::from_millis(20))
+            }) {
+                Ok(LspResponse::Definition(result)) if result.is_current(version) => {
                     return Ok(ResponseValue::LanguageDefinitions {
                         document_revision: expected_revision,
                         locations: result
@@ -1170,7 +1337,10 @@ impl DesktopBackend {
                     });
                 }
                 Err(koren_lsp::LspError::UnsupportedFeature(_))
-                | Err(koren_lsp::LspError::RequestTimeout(_)) => continue,
+                | Err(koren_lsp::LspError::RequestTimeout(_))
+                | Err(koren_lsp::LspError::RequestCancelled)
+                | Err(koren_lsp::LspError::RequestQueueFull)
+                | Err(koren_lsp::LspError::ServerNotReady(_)) => continue,
                 Err(error) => return Err(lsp_error(error)),
                 _ => continue,
             }
@@ -1234,74 +1404,85 @@ impl DesktopBackend {
                 .map(event_from_platform),
         );
         let _ = self.tasks.drain_events();
-        let server_ids = self
-            .active_language_servers
-            .iter()
-            .map(|(id, server)| (*id, *server))
-            .collect::<Vec<_>>();
-        let mut dead_servers = Vec::new();
-        for (application_id, server_id) in server_ids {
-            let Ok(server) = self.language_servers.server_mut(server_id) else {
-                continue;
-            };
-            for service_event in server.drain_events() {
-                match service_event {
-                    ServerEvent::Diagnostics(mut diagnostics) => {
-                        let Some(sync) = self.language_document_sync.get(&application_id) else {
-                            continue;
-                        };
-                        let Some(document_id) = sync.document_id(&diagnostics.uri) else {
-                            continue;
-                        };
-                        let Some((version, revision)) = sync.version(document_id) else {
-                            continue;
-                        };
-                        if diagnostics
-                            .document_version
-                            .is_some_and(|seen| seen != version)
-                        {
-                            continue;
-                        }
-                        diagnostics.document_id = Some(document_id.0);
-                        for diagnostic in &mut diagnostics.diagnostics {
-                            diagnostic.document_revision = Some(revision);
-                        }
+        for actor_event in self.language_servers.drain_events() {
+            match actor_event {
+                LspActorEvent::Initialized(server_id) => {
+                    let id = server_id.get();
+                    if self.active_language_servers.contains_key(&id) {
+                        self.initialized_language_servers.insert(id);
                         events.push(DesktopEvent {
-                            kind: "language_diagnostics".into(),
-                            document_id: Some(document_id.0),
-                            revision: Some(revision),
-                            server_id: Some(application_id),
-                            diagnostics: Some(diagnostics),
+                            kind: "language_server_initialized".into(),
+                            server_id: Some(id),
                             ..empty_event()
                         });
                     }
-                    ServerEvent::Stderr(message) | ServerEvent::Error(message) => {
-                        events.push(DesktopEvent {
-                            kind: "language_server_error".into(),
-                            server_id: Some(application_id),
-                            message: Some(message),
-                            ..empty_event()
-                        })
+                }
+                LspActorEvent::Server(server_id, service_event) => {
+                    let application_id = server_id.get();
+                    match service_event {
+                        ServerEvent::Diagnostics(mut diagnostics) => {
+                            let Some(sync) = self.language_document_sync.get(&application_id)
+                            else {
+                                continue;
+                            };
+                            let Some(document_id) = sync.document_id(&diagnostics.uri) else {
+                                continue;
+                            };
+                            let Some((version, revision)) = sync.version(document_id) else {
+                                continue;
+                            };
+                            if diagnostics
+                                .document_version
+                                .is_some_and(|seen| seen != version)
+                            {
+                                continue;
+                            }
+                            diagnostics.document_id = Some(document_id.0);
+                            for diagnostic in &mut diagnostics.diagnostics {
+                                diagnostic.document_revision = Some(revision);
+                            }
+                            events.push(DesktopEvent {
+                                kind: "language_diagnostics".into(),
+                                document_id: Some(document_id.0),
+                                revision: Some(revision),
+                                server_id: Some(application_id),
+                                diagnostics: Some(diagnostics),
+                                ..empty_event()
+                            });
+                        }
+                        ServerEvent::Stderr(message) | ServerEvent::Error(message) => {
+                            events.push(DesktopEvent {
+                                kind: "language_server_error".into(),
+                                server_id: Some(application_id),
+                                message: Some(message),
+                                ..empty_event()
+                            });
+                        }
+                        ServerEvent::Notification { .. } => {}
                     }
-                    ServerEvent::Notification { .. } => {}
+                }
+                LspActorEvent::Failed(server_id, message) => events.push(DesktopEvent {
+                    kind: "language_server_error".into(),
+                    server_id: Some(server_id.get()),
+                    message: Some(message),
+                    ..empty_event()
+                }),
+                LspActorEvent::Stopped(server_id) => {
+                    let id = server_id.get();
+                    if self.active_language_servers.remove(&id).is_some() {
+                        self.initialized_language_servers.remove(&id);
+                        self.language_server_owners.remove(&id);
+                        self.language_document_sync.remove(&id);
+                        let _ = self.language_servers.stop_server(server_id);
+                        events.push(DesktopEvent {
+                            kind: "language_server_stopped".into(),
+                            server_id: Some(id),
+                            message: Some("Language server exited".into()),
+                            ..empty_event()
+                        });
+                    }
                 }
             }
-            if server.is_running().is_ok_and(|running| !running) {
-                dead_servers.push(application_id);
-            }
-        }
-        for application_id in dead_servers {
-            if let Some(server) = self.active_language_servers.remove(&application_id) {
-                let _ = self.language_servers.stop_server(server);
-            }
-            self.language_server_owners.remove(&application_id);
-            self.language_document_sync.remove(&application_id);
-            events.push(DesktopEvent {
-                kind: "language_server_stopped".into(),
-                server_id: Some(application_id),
-                message: Some("Language server exited".into()),
-                ..empty_event()
-            });
         }
         for event in &events {
             if let Ok(payload) = serde_json::to_string(event) {
@@ -1420,8 +1601,8 @@ impl DesktopBackend {
             else {
                 continue;
             };
-            if let Ok(server) = self.language_servers.server_mut(server_id) {
-                let _ = server.send_sync_notification(&notification);
+            if let Ok(server) = self.language_servers.handle(server_id) {
+                let _ = server.notify(notification);
             }
         }
     }
@@ -1442,8 +1623,8 @@ impl DesktopBackend {
             let Ok(notification) = sync.change(document_id, &snapshot) else {
                 continue;
             };
-            if let Ok(server) = self.language_servers.server_mut(server_id) {
-                let _ = server.send_sync_notification(&notification);
+            if let Ok(server) = self.language_servers.handle(server_id) {
+                let _ = server.notify(notification);
             }
         }
     }
@@ -1461,11 +1642,155 @@ impl DesktopBackend {
             let Ok(notification) = sync.close(document_id) else {
                 continue;
             };
-            if let Ok(server) = self.language_servers.server_mut(server_id) {
-                let _ = server.send_sync_notification(&notification);
+            if let Ok(server) = self.language_servers.handle(server_id) {
+                let _ = server.notify(notification);
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum FeatureKind {
+    Hover,
+    Completion,
+    Definition,
+}
+
+fn run_language_feature(
+    kind: FeatureKind,
+    document_id: u64,
+    expected_revision: u64,
+    position: koren_protocol::TextPosition,
+    targets: Vec<(u64, LspServerHandle, String, i32)>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<ResponseValue, ProtocolError> {
+    let deadline = Instant::now() + LANGUAGE_FEATURE_TIMEOUT;
+    let mut tickets = Vec::new();
+    for (_, server, uri, version) in targets {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(not_found(format!("document '{document_id}' is closed")));
+        }
+        let request = match kind {
+            FeatureKind::Hover => LspRequest::Hover {
+                uri,
+                version,
+                position,
+                timeout: LANGUAGE_FEATURE_TIMEOUT,
+            },
+            FeatureKind::Completion => LspRequest::Completion {
+                uri,
+                version,
+                position,
+                timeout: LANGUAGE_FEATURE_TIMEOUT,
+            },
+            FeatureKind::Definition => LspRequest::Definition {
+                uri,
+                version,
+                position,
+                timeout: LANGUAGE_FEATURE_TIMEOUT,
+            },
+        };
+        if let Ok(ticket) = server.request(request) {
+            tickets.push((version, Some(ticket)));
+        }
+    }
+
+    while Instant::now() < deadline && tickets.iter().any(|(_, ticket)| ticket.is_some()) {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(not_found(format!("document '{document_id}' is closed")));
+        }
+        for (version, ticket) in &mut tickets {
+            let Some(pending) = ticket.as_mut() else {
+                continue;
+            };
+            match pending.try_recv() {
+                Ok(Some(response)) => {
+                    *ticket = None;
+                    let result = match response {
+                        LspResponse::Hover(result)
+                            if matches!(kind, FeatureKind::Hover)
+                                && result.is_current(*version) =>
+                        {
+                            let value = result.value;
+                            Some(ResponseValue::LanguageHover {
+                                document_revision: expected_revision,
+                                contents: value.as_ref().map(|hover| hover.contents.clone()),
+                                range: value.and_then(|hover| hover.range),
+                            })
+                        }
+                        LspResponse::Completion(result)
+                            if matches!(kind, FeatureKind::Completion)
+                                && result.is_current(*version) =>
+                        {
+                            Some(ResponseValue::LanguageCompletions {
+                                document_revision: expected_revision,
+                                items: result
+                                    .value
+                                    .into_iter()
+                                    .map(|item| koren_protocol::LanguageCompletionItem {
+                                        label: item.label,
+                                        detail: item.detail,
+                                        insert_text: item.insert_text,
+                                        documentation: item.documentation,
+                                    })
+                                    .collect(),
+                            })
+                        }
+                        LspResponse::Definition(result)
+                            if matches!(kind, FeatureKind::Definition)
+                                && result.is_current(*version) =>
+                        {
+                            Some(ResponseValue::LanguageDefinitions {
+                                document_revision: expected_revision,
+                                locations: result
+                                    .value
+                                    .into_iter()
+                                    .map(|location| koren_protocol::LanguageLocation {
+                                        uri: location.uri,
+                                        range: location.range,
+                                    })
+                                    .collect(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(result) = result {
+                        return Ok(result);
+                    }
+                }
+                Ok(None) => {}
+                Err(koren_lsp::LspError::UnsupportedFeature(_))
+                | Err(koren_lsp::LspError::RequestTimeout(_))
+                | Err(koren_lsp::LspError::RequestCancelled)
+                | Err(koren_lsp::LspError::RequestQueueFull)
+                | Err(koren_lsp::LspError::ServerNotReady(_))
+                | Err(koren_lsp::LspError::ServerTerminated) => *ticket = None,
+                Err(error) => {
+                    *ticket = None;
+                    return Err(lsp_error(error));
+                }
+            }
+        }
+        thread::park_timeout(Duration::from_millis(2));
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Err(not_found(format!("document '{document_id}' is closed")));
+    }
+    Ok(match kind {
+        FeatureKind::Hover => ResponseValue::LanguageHover {
+            document_revision: expected_revision,
+            contents: None,
+            range: None,
+        },
+        FeatureKind::Completion => ResponseValue::LanguageCompletions {
+            document_revision: expected_revision,
+            items: Vec::new(),
+        },
+        FeatureKind::Definition => ResponseValue::LanguageDefinitions {
+            document_revision: expected_revision,
+            locations: Vec::new(),
+        },
+    })
 }
 
 fn command_ping(arguments: &[String]) -> Result<String, CommandError> {
@@ -1870,6 +2195,39 @@ mod tests {
         }
     }
 
+    fn wait_for_event(backend: &mut DesktopBackend, matches: impl Fn(&DesktopEvent) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if backend.drain_events().iter().any(&matches) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "desktop event timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_file(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "language-server fixture gate timed out"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn call_backend(
+        backend: &BackendSender,
+        request_id: &mut u64,
+        method: RequestMethod,
+    ) -> Result<ResponseValue, ProtocolError> {
+        *request_id += 1;
+        send_request(backend, Request::new(*request_id, method))
+            .expect("platform request transport")
+            .result
+    }
+
     #[test]
     fn dispatch_validates_protocol_and_performs_workspace_document_operations() {
         let temp = Temp::new();
@@ -2039,14 +2397,9 @@ mod tests {
         else {
             panic!("expected document open")
         };
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(
-            backend
-                .drain_events()
-                .iter()
-                .any(|event| event.kind == "language_diagnostics"
-                    && event.document_id == Some(document_id))
-        );
+        wait_for_event(&mut backend, |event| {
+            event.kind == "language_diagnostics" && event.document_id == Some(document_id)
+        });
         assert!(
             matches!(backend.method(RequestMethod::LanguageHover { document_id, expected_revision: 0, position: koren_protocol::TextPosition { line: 0, character: 1 } }).unwrap(), ResponseValue::LanguageHover { contents: Some(contents), .. } if contents == "hover info")
         );
@@ -2105,5 +2458,339 @@ mod tests {
             .unwrap();
         backend.method(RequestMethod::CloseWorkspace).unwrap();
         backend.shutdown();
+    }
+
+    #[test]
+    fn stalled_lsp_initialization_and_hover_do_not_block_worker_save_or_close() {
+        let temp = Temp::new();
+        fs::write(temp.0.join("main.demo"), "hello 🦀\n").unwrap();
+        let install_root = temp.0.join("extension-install");
+        let extension_dir = install_root.join("org.example.stalled-server");
+        fs::create_dir_all(&extension_dir).unwrap();
+        fs::write(extension_dir.join("main.lua"), "return {}\n").unwrap();
+        let init_gate = temp.0.join("release-init");
+        let init_reached = temp.0.join("init-reached");
+        let hover_gate = temp.0.join("release-hover");
+        let hover_reached = temp.0.join("hover-reached");
+        let trace = temp.0.join("lsp-trace.jsonl");
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/koren-lsp/tests/fake_lsp_server.py");
+        let command = if cfg!(windows) { "python" } else { "python3" };
+        let args = serde_json::to_string(&fixture.to_string_lossy()).unwrap();
+        let toml_string = |path: &Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+        let manifest = format!(
+            "schema_version=1\nid='org.example.stalled-server'\nname='Stalled test server'\npublisher='Koren tests'\nversion='0.1.0'\ndescription='Concurrency regression fixture'\nentry_point='main.lua'\napi_version='1.0.0'\ncapabilities=['language_definitions','language_server']\n[[languages]]\nid='demo'\nname='Demo'\nextensions=['demo']\n[[language_servers]]\nid='fake'\ncommand='{command}'\nlanguages=['demo']\nfile_extensions=['demo']\narguments=[{args}]\nenvironment={{FAKE_LSP_INIT_GATE={},FAKE_LSP_INIT_REACHED={},FAKE_LSP_HOVER_GATE={},FAKE_LSP_HOVER_REACHED={},FAKE_LSP_TRACE={}}}\n",
+            toml_string(&init_gate),
+            toml_string(&init_reached),
+            toml_string(&hover_gate),
+            toml_string(&hover_reached),
+            toml_string(&trace),
+        );
+        fs::write(extension_dir.join("koren-extension.toml"), manifest).unwrap();
+
+        let mut state = DesktopBackend::new().unwrap();
+        state.extension_root = Some(install_root);
+        let backend = spawn_backend_with_state(state);
+        let (event_tx, event_rx) = mpsc::channel();
+        subscribe(&backend, event_tx).unwrap();
+        let mut request_id = 0;
+        call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::OpenWorkspace {
+                path: temp.0.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+        call_backend(&backend, &mut request_id, RequestMethod::ListExtensions).unwrap();
+        call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::SetExtensionEnabled {
+                extension_id: "org.example.stalled-server".into(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+        let approval = call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::StartLanguageServer {
+                extension_id: "org.example.stalled-server".into(),
+                configuration_id: "fake".into(),
+            },
+        )
+        .unwrap();
+        let ResponseValue::LanguageServerApprovalRequired(approval) = approval else {
+            panic!("expected explicit server approval");
+        };
+        let initialization_dispatch_started = Instant::now();
+        call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::ApproveLanguageServer {
+                approval_id: approval.approval_id,
+            },
+        )
+        .unwrap();
+        println!(
+            "phase65_bridge_initialize_dispatch_ms={:.3}",
+            initialization_dispatch_started.elapsed().as_secs_f64() * 1_000.0
+        );
+        wait_for_file(&init_reached);
+
+        let ResponseValue::DocumentOpened { document_id, .. } = call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::OpenDocument {
+                path: "main.demo".into(),
+            },
+        )
+        .unwrap() else {
+            panic!("expected document open");
+        };
+        let ResponseValue::DocumentChanged { revision, .. } = call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::ApplyDocumentEdits {
+                document_id,
+                expected_revision: 0,
+                edits: vec![TextEdit {
+                    range: koren_protocol::TextRange {
+                        start: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 5,
+                        },
+                    },
+                    new_text: "world".into(),
+                }],
+            },
+        )
+        .unwrap() else {
+            panic!("expected document edit");
+        };
+        let started = Instant::now();
+        assert!(matches!(
+            call_backend(
+                &backend,
+                &mut request_id,
+                RequestMethod::SaveDocument {
+                    document_id,
+                    expected_revision: revision,
+                },
+            ),
+            Ok(ResponseValue::DocumentSaved { dirty: false, .. })
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "save waited for stalled initialize"
+        );
+        println!(
+            "phase65_bridge_save_during_stalled_initialize_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+        assert_eq!(
+            fs::read_to_string(temp.0.join("main.demo")).unwrap(),
+            "world 🦀\n"
+        );
+
+        fs::write(&init_gate, "continue").unwrap();
+        let mut platform_events = Vec::new();
+        wait_for_platform_event(&event_rx, &mut platform_events, |event| {
+            event.kind == "language_server_initialized"
+        });
+        wait_for_platform_event(&event_rx, &mut platform_events, |event| {
+            event.kind == "language_diagnostics" && event.document_id == Some(document_id)
+        });
+        wait_for_trace(&trace, "textDocument/didChange", 1);
+
+        let hover_backend = backend.clone();
+        let hover_id = request_id + 1;
+        request_id = hover_id;
+        let (hover_tx, hover_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = send_request(
+                &hover_backend,
+                Request::new(
+                    hover_id,
+                    RequestMethod::LanguageHover {
+                        document_id,
+                        expected_revision: revision,
+                        position: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 1,
+                        },
+                    },
+                ),
+            );
+            let _ = hover_tx.send(result);
+        });
+        let feature_started = Instant::now();
+        wait_for_file(&hover_reached);
+        println!(
+            "phase65_hover_dispatch_to_fixture_receipt_ms={:.3}",
+            feature_started.elapsed().as_secs_f64() * 1_000.0
+        );
+
+        let ResponseValue::DocumentChanged { revision, .. } = call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::ApplyDocumentEdits {
+                document_id,
+                expected_revision: revision,
+                edits: vec![TextEdit {
+                    range: koren_protocol::TextRange {
+                        start: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 5,
+                        },
+                    },
+                    new_text: "again".into(),
+                }],
+            },
+        )
+        .unwrap() else {
+            panic!("expected second edit");
+        };
+        let started = Instant::now();
+        call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::SaveDocument {
+                document_id,
+                expected_revision: revision,
+            },
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "save waited for stalled hover"
+        );
+        println!(
+            "phase65_bridge_save_during_stalled_hover_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+        let ResponseValue::DocumentChanged { revision, .. } = call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::ApplyDocumentEdits {
+                document_id,
+                expected_revision: revision,
+                edits: vec![TextEdit {
+                    range: koren_protocol::TextRange {
+                        start: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 5,
+                        },
+                    },
+                    new_text: "final".into(),
+                }],
+            },
+        )
+        .unwrap() else {
+            panic!("expected third document edit");
+        };
+        call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::SaveDocument {
+                document_id,
+                expected_revision: revision,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.0.join("main.demo")).unwrap(),
+            "final 🦀\n"
+        );
+        call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::CloseDocument {
+                document_id,
+                discard_unsaved_changes: false,
+            },
+        )
+        .unwrap();
+        let hover_result = hover_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("closed document should cancel its pending feature response")
+            .expect("hover bridge response");
+        assert!(matches!(
+            hover_result.result,
+            Err(ProtocolError {
+                code: ErrorCode::NotFound,
+                ..
+            })
+        ));
+        fs::write(&hover_gate, "continue").unwrap();
+        wait_for_trace(&trace, "textDocument/didChange", 3);
+        wait_for_trace(&trace, "textDocument/didClose", 1);
+        call_backend(&backend, &mut request_id, RequestMethod::CloseWorkspace).unwrap();
+        shutdown(&backend);
+    }
+
+    fn wait_for_platform_event(
+        receiver: &Receiver<Vec<DesktopEvent>>,
+        pending: &mut Vec<DesktopEvent>,
+        matches: impl Fn(&DesktopEvent) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(index) = pending.iter().position(&matches) {
+                pending.remove(index);
+                return;
+            }
+            if let Ok(mut events) = receiver.recv_timeout(Duration::from_millis(100)) {
+                pending.append(&mut events);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "platform event timed out; received={pending:?}"
+            );
+        }
+    }
+
+    fn wait_for_trace(path: &Path, method: &str, required_count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let trace = fs::read_to_string(path).unwrap_or_default();
+            let messages = trace
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|message| {
+                    message.get("method").and_then(serde_json::Value::as_str) == Some(method)
+                })
+                .collect::<Vec<_>>();
+            if messages.len() >= required_count {
+                if method == "textDocument/didChange" {
+                    let versions = messages
+                        .iter()
+                        .filter_map(|message| {
+                            message.pointer("/params/textDocument/version")?.as_i64()
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(versions.windows(2).all(|pair| pair[0] < pair[1]));
+                }
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "document synchronization trace timed out"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }

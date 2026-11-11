@@ -5,6 +5,11 @@
 //! Launch permission is not process isolation; approved servers run with the host user's OS
 //! privileges and should only be trusted when configured by the user.
 
+mod actor;
+pub use actor::{
+    LspActorEvent, LspRequest, LspRequestTicket, LspResponse, LspServerActors, LspServerHandle,
+};
+
 use koren_documents::{DocumentId, DocumentSnapshot};
 use koren_protocol::{TextPosition, TextRange};
 use serde::{Deserialize, Serialize};
@@ -15,7 +20,10 @@ use std::{
     io::{self, BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -410,8 +418,22 @@ impl LspServerManager {
     /// LSP initialization fails.
     pub fn start_server(
         &mut self,
+        config: ServerConfig,
+        authorizer: &mut impl ServerAuthorizer,
+    ) -> Result<ServerId, LspError> {
+        self.start_server_with_timeout(config, authorizer, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// Starts a directly executed server with a host-selected initialization deadline.
+    ///
+    /// # Errors
+    /// Returns an error when configuration validation, authorization, process startup, or
+    /// LSP initialization fails before `initialization_timeout`.
+    pub fn start_server_with_timeout(
+        &mut self,
         mut config: ServerConfig,
         authorizer: &mut impl ServerAuthorizer,
+        initialization_timeout: Duration,
     ) -> Result<ServerId, LspError> {
         config.validate()?;
         if let Some((id, _)) = self
@@ -425,7 +447,7 @@ impl LspServerManager {
             return Err(LspError::AuthorizationDenied(config.id));
         }
         let mut server = LspServer::spawn(&config)?;
-        server.initialize(DEFAULT_REQUEST_TIMEOUT)?;
+        server.initialize(initialization_timeout)?;
         self.next_id = self
             .next_id
             .checked_add(1)
@@ -575,7 +597,7 @@ impl LspServer {
                     "publishDiagnostics": { "relatedInformation": true }
                 }
             }
-        }), timeout)?;
+        }), timeout, None)?;
         self.capabilities = result.get("capabilities").cloned().unwrap_or(Value::Null);
         self.notify("initialized", json!({}))?;
         Ok(())
@@ -660,11 +682,34 @@ impl LspServer {
         position: TextPosition,
         timeout: Duration,
     ) -> Result<VersionedResult<Option<HoverResult>>, LspError> {
+        self.hover_with_timeout_cancelled(uri, version, position, timeout, None)
+    }
+
+    pub(crate) fn hover_with_cancellation(
+        &mut self,
+        uri: &str,
+        version: i32,
+        position: TextPosition,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<VersionedResult<Option<HoverResult>>, LspError> {
+        self.hover_with_timeout_cancelled(uri, version, position, timeout, Some(cancelled))
+    }
+
+    fn hover_with_timeout_cancelled(
+        &mut self,
+        uri: &str,
+        version: i32,
+        position: TextPosition,
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<VersionedResult<Option<HoverResult>>, LspError> {
         self.ensure_capability("hoverProvider")?;
         let result = self.request(
             "textDocument/hover",
             text_position_params(uri, position),
             timeout,
+            cancelled,
         )?;
         Ok(VersionedResult {
             uri: uri.into(),
@@ -697,11 +742,34 @@ impl LspServer {
         position: TextPosition,
         timeout: Duration,
     ) -> Result<VersionedResult<Vec<CompletionItem>>, LspError> {
+        self.completion_with_timeout_cancelled(uri, version, position, timeout, None)
+    }
+
+    pub(crate) fn completion_with_cancellation(
+        &mut self,
+        uri: &str,
+        version: i32,
+        position: TextPosition,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<VersionedResult<Vec<CompletionItem>>, LspError> {
+        self.completion_with_timeout_cancelled(uri, version, position, timeout, Some(cancelled))
+    }
+
+    fn completion_with_timeout_cancelled(
+        &mut self,
+        uri: &str,
+        version: i32,
+        position: TextPosition,
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<VersionedResult<Vec<CompletionItem>>, LspError> {
         self.ensure_capability("completionProvider")?;
         let result = self.request(
             "textDocument/completion",
             text_position_params(uri, position),
             timeout,
+            cancelled,
         )?;
         Ok(VersionedResult {
             uri: uri.into(),
@@ -734,11 +802,34 @@ impl LspServer {
         position: TextPosition,
         timeout: Duration,
     ) -> Result<VersionedResult<Vec<Location>>, LspError> {
+        self.definition_with_timeout_cancelled(uri, version, position, timeout, None)
+    }
+
+    pub(crate) fn definition_with_cancellation(
+        &mut self,
+        uri: &str,
+        version: i32,
+        position: TextPosition,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<VersionedResult<Vec<Location>>, LspError> {
+        self.definition_with_timeout_cancelled(uri, version, position, timeout, Some(cancelled))
+    }
+
+    fn definition_with_timeout_cancelled(
+        &mut self,
+        uri: &str,
+        version: i32,
+        position: TextPosition,
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<VersionedResult<Vec<Location>>, LspError> {
         self.ensure_capability("definitionProvider")?;
         let result = self.request(
             "textDocument/definition",
             text_position_params(uri, position),
             timeout,
+            cancelled,
         )?;
         Ok(VersionedResult {
             uri: uri.into(),
@@ -771,7 +862,7 @@ impl LspServer {
         if self.child.try_wait().ok().flatten().is_some() {
             return;
         }
-        let _ = self.request("shutdown", Value::Null, Duration::from_millis(300));
+        let _ = self.request("shutdown", Value::Null, Duration::from_millis(300), None);
         let _ = self.notify("exit", Value::Null);
         let deadline = Instant::now() + Duration::from_millis(300);
         while Instant::now() < deadline {
@@ -802,6 +893,7 @@ impl LspServer {
         method: &str,
         params: Value,
         timeout: Duration,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<Value, LspError> {
         let id = self.next_request_id;
         self.next_request_id = self
@@ -811,11 +903,17 @@ impl LspServer {
         write_message(&mut self.input, &rpc_envelope(method, Some(id), params))?;
         let deadline = Instant::now() + timeout;
         loop {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                let _ = self.notify("$/cancelRequest", json!({ "id": id }));
+                return Err(LspError::RequestCancelled);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                let _ = self.notify("$/cancelRequest", json!({ "id": id }));
                 return Err(LspError::RequestTimeout(method.into()));
             }
-            match self.incoming.recv_timeout(remaining) {
+            let wait = cancelled.map_or(remaining, |_| remaining.min(Duration::from_millis(10)));
+            match self.incoming.recv_timeout(wait) {
                 Ok(Ok(message)) if message.get("id").and_then(Value::as_u64) == Some(id) => {
                     if let Some(error) = message.get("error") {
                         return Err(LspError::ServerResponse(error.to_string()));
@@ -824,7 +922,10 @@ impl LspServer {
                 }
                 Ok(message) => self.consume(message),
                 Err(RecvTimeoutError::Timeout) => {
-                    return Err(LspError::RequestTimeout(method.into()));
+                    if Instant::now() >= deadline {
+                        let _ = self.notify("$/cancelRequest", json!({ "id": id }));
+                        return Err(LspError::RequestTimeout(method.into()));
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => return Err(LspError::ServerTerminated),
             }
@@ -1224,6 +1325,8 @@ pub enum LspError {
     ServerTerminated,
     /// A request exceeded its deadline.
     RequestTimeout(String),
+    /// The host cancelled the request before its response arrived.
+    RequestCancelled,
     /// Server returned an error response.
     ServerResponse(String),
     /// A requested feature was not advertised by the server.
@@ -1247,6 +1350,10 @@ pub enum LspError {
     VersionExhausted,
     /// Manager-local server id space was exhausted.
     IdentifierExhausted,
+    /// The bounded actor queue is full.
+    RequestQueueFull,
+    /// The server actor has not finished initialization.
+    ServerNotReady(ServerId),
     /// Server manager does not contain the requested id.
     ServerNotFound(ServerId),
 }
@@ -1272,6 +1379,7 @@ impl fmt::Display for LspError {
             Self::RequestTimeout(method) => {
                 write!(f, "language-server request '{method}' timed out")
             }
+            Self::RequestCancelled => f.write_str("language-server request was cancelled"),
             Self::ServerResponse(message) => {
                 write!(f, "language server returned an error: {message}")
             }
@@ -1296,6 +1404,10 @@ impl fmt::Display for LspError {
             }
             Self::IdentifierExhausted => {
                 f.write_str("language-server identifier space is exhausted")
+            }
+            Self::RequestQueueFull => f.write_str("language-server request queue is full"),
+            Self::ServerNotReady(id) => {
+                write!(f, "language server {} is not initialized", id.get())
             }
             Self::ServerNotFound(id) => write!(f, "language server {} is not active", id.get()),
         }
