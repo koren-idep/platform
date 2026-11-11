@@ -4,11 +4,11 @@ Koren has three related products. **Koren IDE Platform** is the reusable, langua
 
 ## Status
 
-Phases 0 through 5 provide lifecycle primitives, the internal protocol, workspace and document services, language-neutral projects and tasks, optional Cargo integration, host-controlled task approvals, a headless session, and the Koren Code Editor desktop shell. Phase 6 adds versioned extension manifests, explicit local extension lifecycle, a bounded Lua 5.4 runtime, typed contributions, and a reusable LSP process client with host-controlled startup approval. Rust remains an optional integration; generic platform services do not require Cargo or rust-analyzer.
+Phases 0 through 5 provide lifecycle primitives, the internal protocol, workspace and document services, language-neutral projects and tasks, optional Cargo integration, host-controlled task approvals, a headless session, and the Koren Code Editor desktop shell. Phase 6 adds versioned extension manifests, explicit local extension lifecycle, a bounded Lua 5.4 runtime, typed contributions, and a reusable LSP process client with host-controlled startup approval. Phase 6.5 moves LSP process I/O into isolated actors and stabilizes Linux desktop smoke startup. Rust remains an optional integration; generic platform services do not require Cargo or rust-analyzer.
 
 ## Build and verify
 
-Install stable Rust (minimum 1.85), Python 3, Node.js 22.12 or later, and Linux GTK 3/WebKitGTK 4.1 development libraries. On Fedora, install `gtk3-devel` and `webkit2gtk4.1-devel`. Install the frontend dependencies and Python development requirements:
+Install stable Rust (minimum 1.85), Python 3, Node.js 22.12 or later, and Linux GTK 3/WebKitGTK 4.1 development libraries. On Fedora, install `gtk3-devel` and `webkit2gtk4.1-devel`. The Linux desktop smoke also requires Xvfb, Openbox, and xdotool. Install the frontend dependencies and Python development requirements:
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
@@ -21,7 +21,7 @@ Run the universal desktop editor with `cargo run --locked -p koren-code`. Its ex
 
 The editor has a compact menu, collapsible file tree, tabs, central CodeMirror editor, resizable bottom panel, and status bar. It offers dark and light themes and uses the protocol-v2 bridge for workspace, document, project, task, extension, and authorization services. Document edits carry revisions and are queued in order; saving waits for acknowledged edits and uses conflict-aware safe saves. The Extensions manager reads only a configured local install root, and extension code must be explicitly enabled and activated. Language-server configurations are manifest data and each external process start requires graphical approval. Open documents synchronize through the shared LSP client; diagnostics appear in CodeMirror and Problems, with hover, completion, and F12 definition navigation when the active server advertises those features. See [docs/EXTENSIONS.md](docs/EXTENSIONS.md) and the examples under `examples/extensions/`.
 
-Frontend checks run via `npm run --prefix apps/koren-code/frontend typecheck`, `lint`, `test`, and `build`. Linux GUI smoke and startup/memory sampling can be run after building with `cargo build --locked -p koren-code` using `xvfb-run -a python3 scripts/desktop_smoke.py target/debug/koren-code`.
+Frontend checks run via `npm run --prefix apps/koren-code/frontend typecheck`, `lint`, `test`, and `build`. Linux GUI smoke and startup/memory sampling can be run after building with `cargo build --locked -p koren-code` using `python3 scripts/run_desktop_smoke.py target/debug/koren-code`. The launcher obtains an unused Xvfb display and clears inherited display and Wayland settings before starting GTK.
 
 Run the existing headless commands:
 

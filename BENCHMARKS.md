@@ -6,7 +6,7 @@ Build the Linux desktop app, then launch it in an X server (a virtual X server i
 
 ```sh
 cargo build --locked -p koren-code
-xvfb-run -a python3 scripts/desktop_smoke.py target/debug/koren-code
+python3 scripts/run_desktop_smoke.py target/debug/koren-code
 ```
 
 The script waits until the visible “Koren Code Editor” window appears, reports elapsed process-start-to-window time, then samples total RSS across the editor process and its current descendants one second later. The application exits automatically in this test mode. One local sample on 2026-11-11 reported 170.2 ms to the window and 373,204 KiB process-tree RSS at the one-second sample point. Environment: Fedora Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, Intel Core i7-1068NG7 at 2.30 GHz, Xvfb plus Openbox, Rust 1.99.1, Tao 0.37.2, and Wry 0.57.2. This is one run, not a median; toolkit initialization, display server, and system load affect both values. Workspace-open, file-open, typing, and task-start interactive timings are not measured by this smoke script and remain uncharacterized. The measurements are diagnostics, not production-hardware performance claims.
@@ -101,4 +101,32 @@ One run on 2026-11-11, Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, Intel Co
 | LSP document revision/change mapping | 10,000 | 0.317 µs | 0.259 µs |
 | Fake LSP diagnostic publication after didOpen | 20 | 140.1 µs | — |
 
-The LSP startup row includes the Python fixture process. The measured Python start/exit row is the external-process baseline; the difference is about 66.1 ms for LSP framing and initialization in this fixture. The Lua VM allocator figure is the VM's own allocated memory after activation, not total app RSS. These fixtures do not represent rust-analyzer or another production language server. The Phase 2 desktop smoke above is the only recorded process-tree RSS measurement; it was collected before Phase 6 and should be repeated on target hardware with an extension/server active. These microbenchmarks do not measure ordinary typing or save latency with a live production server.
+The LSP startup row includes the Python fixture process. The measured Python start/exit row is the external-process baseline; the difference is about 66.1 ms for LSP framing and initialization in this fixture. The Lua VM allocator figure is the VM's own allocated memory after activation, not total app RSS. These fixtures do not represent rust-analyzer or another production language server. The Phase 2 desktop smoke above is an application launch sample without an active language server. Phase 6.5 adds bridge-level save measurements with stalled initialization and hover, plus actor and idle-overhead measurements below.
+
+## Phase 6.5 asynchronous language-service measurements
+
+Run the actor benchmark and the bridge regression with:
+
+```sh
+cargo bench --locked -p koren-lsp --bench phase65
+cargo test --locked -p koren-code stalled_lsp_initialization_and_hover_do_not_block_worker_save_or_close -- --nocapture
+python3 scripts/run_desktop_smoke.py target/debug/koren-code
+```
+
+One local run on 2026-11-11, Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, Intel Core i7-1068NG7 at 2.30 GHz (8 CPUs), Rust `1.99.1`, Python `3.14.8`, optimized Cargo bench profile:
+
+| Workload | Iterations/fixture | Result | What is included |
+|---|---:|---:|---|
+| LSP initialization dispatch | 4 independent actors | 58.6 µs mean, 51.8 µs minimum | Host validation, bounded-channel setup, and thread dispatch; excludes child startup and initialize response |
+| Hover request dispatch | 4 sequential requests | 3.2 µs mean, 1.6 µs minimum | Actor mailbox enqueue and ticket creation; excludes transport and server response |
+| Concurrent hover round trip | 4 independent fake servers | 0.349 ms | Actor scheduling, JSON-RPC, Python fixture work, and response delivery |
+| Idle actor CPU | 4 actors over 2.001 s | 0 scheduler ticks | Sum of `/proc/self/task/*/stat` CPU ticks for the benchmark process's actor threads; tick resolution is 10 ms here, so this is below one tick, not proof of zero CPU use |
+| Host RSS change after actor startup | 4 actors | +1,304 KiB | Benchmark process RSS only; does not include Python child process memory |
+| Host RSS drift during 2 s idle sample | 4 actors | +8 KiB | Process RSS sample variation during the idle interval |
+| Bridge initialize dispatch | 1 stalled fake server | 0.116 ms | Approve request response through the actual desktop backend worker; initialization remains gated |
+| Bridge hover dispatch to fixture receipt | 1 stalled hover | 5.119 ms | Backend feature-pool scheduling, actor enqueue, pipe, and fake-server receipt; excludes hover response because the fixture remains gated |
+| Save during stalled initialize | 1 save | 0.151 ms | Actual bridge save and safe filesystem write while initialize is blocked |
+| Save during stalled hover | 1 save | 0.305 ms | Actual bridge save while the language feature request is blocked |
+| Desktop window launch | 1 smoke run | 172.3 ms; 396,644 KiB process-tree RSS | Window appearance plus one-second RSS sample, with no active LSP process |
+
+The LSP dispatch and round-trip rows are four-sample local microbenchmarks; the bridge rows are one deterministic gated regression run, not latency distributions. The fake servers run locally and do not model rust-analyzer's indexing or diagnostics load. The idle tick counter is Linux-specific and quantized; repeat with a longer interval and on target systems for tighter CPU bounds. The desktop launch smoke validates the virtual-display path only. On this host, `xvfb-run -a` failed because the installed T2 `xvfb-run` script uses a fixed three-second startup delay; a direct `xdpyinfo` probe still could not connect when the application started. The replacement launcher waits until Xvfb writes its `-displayfd` readiness signal, then runs with a fresh X11-only environment. The desktop smoke passed with that launcher. No Windows or macOS GUI environment was run.

@@ -18,3 +18,7 @@ workspace = true
 [[bench]]
 name = "phase6"
 harness = false
+
+[[bench]]
+name = "phase65"
+harness = false
