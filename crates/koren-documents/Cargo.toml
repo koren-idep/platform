@@ -1,0 +1,20 @@
+[package]
+name = "koren-documents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Revisioned in-memory text documents for Koren IDE Platform"
+
+[dependencies]
+koren-core.workspace = true
+koren-protocol.workspace = true
+koren-workspace.workspace = true
+ropey.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "phase2"
+harness = false
