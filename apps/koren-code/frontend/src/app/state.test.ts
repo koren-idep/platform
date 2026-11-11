@@ -9,7 +9,7 @@ describe('project tree state', () => {
     const tree = new ProjectTreeState();
     tree.setEntries('', [{ name: 'src', path: 'src', kind: 'directory', size_bytes: 0 }]);
     expect(tree.visible()).toHaveLength(1);
-    tree.child('src'); tree.toggle('src');
+    expect(tree.toggle('src')).toBe(true);
     tree.setEntries('src', [{ name: 'main.rs', path: 'src/main.rs', kind: 'file', size_bytes: 10 }]);
     expect(tree.visible().map(({ entry }) => entry.path)).toEqual(['src', 'src/main.rs']);
   });
@@ -17,6 +17,10 @@ describe('project tree state', () => {
     const tree = new ProjectTreeState(); tree.setEntries('', [{ name: 'x', path: 'x', kind: 'file', size_bytes: 1 }]);
     tree.setLoading('', true); tree.setError('', 'offline');
     expect(tree.nodes.get('')?.entries).toHaveLength(1); expect(tree.nodes.get('')?.error).toBe('offline');
+  });
+  it('clears stale directory nodes when the workspace changes', () => {
+    const tree = new ProjectTreeState(); tree.child('old'); tree.reset();
+    expect([...tree.nodes.keys()]).toEqual(['']);
   });
 });
 

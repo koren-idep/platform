@@ -71,6 +71,8 @@ export interface TaskSnapshot {
 
 export type RequestMethod =
   | { method: 'ping' }
+  | { method: 'list_commands' }
+  | { method: 'execute_command'; params: { command_id: string } }
   | { method: 'open_workspace'; params: { path: string } }
   | { method: 'close_workspace' }
   | { method: 'list_directory'; params: { path: string } }
@@ -106,6 +108,8 @@ export interface ResponseEnvelope {
 }
 export type ResponseValue =
   | { kind: 'pong' }
+  | { kind: 'commands'; value: string[] }
+  | { kind: 'command_output'; value: string }
   | { kind: 'workspace_opened'; value: { root: string } }
   | { kind: 'workspace_closed'; value: { root: string } }
   | { kind: 'directory_entries'; value: DirectoryEntry[] }

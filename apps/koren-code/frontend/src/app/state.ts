@@ -4,6 +4,10 @@ export interface TreeNode { path: string; expanded: boolean; loading: boolean; e
 export class ProjectTreeState {
   readonly nodes = new Map<string, TreeNode>();
   constructor(readonly root = '') { this.nodes.set(root, { path: root, expanded: true, loading: false, entries: [], error: null }); }
+  reset(): void {
+    this.nodes.clear();
+    this.nodes.set(this.root, { path: this.root, expanded: true, loading: false, entries: [], error: null });
+  }
   toggle(path: string): boolean {
     const node = this.nodes.get(path);
     if (!node) return false;
@@ -18,6 +22,7 @@ export class ProjectTreeState {
     const node = this.nodes.get(path);
     if (!node) return;
     node.entries = entries;
+    for (const entry of entries) if (entry.kind === 'directory') this.child(entry.path);
     node.loading = false;
     node.error = null;
   }
@@ -48,7 +53,15 @@ export class ProjectTreeState {
   }
 }
 
-export interface EditorTab { id: number; path: string; title: string; revision: number; dirty: boolean }
+export interface EditorTab {
+  id: number;
+  path: string;
+  title: string;
+  revision: number;
+  dirty: boolean;
+  language?: string;
+  lineEnding?: 'LF' | 'CRLF';
+}
 export class TabState {
   readonly tabs: EditorTab[] = [];
   activeId: number | null = null;
@@ -63,7 +76,7 @@ export class TabState {
     this.activeId = id;
     return true;
   }
-  update(id: number, patch: Partial<Pick<EditorTab, 'revision' | 'dirty'>>): void {
+  update(id: number, patch: Partial<Pick<EditorTab, 'revision' | 'dirty' | 'language' | 'lineEnding'>>): void {
     const tab = this.tabs.find((item) => item.id === id);
     if (tab) Object.assign(tab, patch);
   }
