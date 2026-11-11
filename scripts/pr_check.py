@@ -26,7 +26,7 @@ def main():
         ("cargo", "clean"),
         ("cargo", "build", "--workspace", "--locked"),
         ("cargo", "build", "--release", "--locked", "-p", "koren-code"),
-        ("xvfb-run", "-a", sys.executable, "scripts/desktop_smoke.py", "target/debug/koren-code"),
+        (sys.executable, "scripts/run_desktop_smoke.py", "target/debug/koren-code"),
     ]
     for command in commands:
         if run(*command):
