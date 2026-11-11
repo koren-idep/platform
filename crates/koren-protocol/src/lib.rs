@@ -42,7 +42,8 @@ pub enum ConflictDecision {
     Reload,
 }
 
-/// Supported request operations in protocol version 2.
+/// Supported request operations in protocol version 2. Project/task operations are additive
+/// extensions of the tagged request contract and do not alter existing version-2 shapes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum RequestMethod {
@@ -114,6 +115,90 @@ pub enum RequestMethod {
         /// Whether unsaved changes may be discarded.
         discard_unsaved_changes: bool,
     },
+    /// Register a language-neutral logical project.
+    RegisterProject {
+        /// User-facing project label.
+        display_name: String,
+        /// Workspace-relative directory.
+        root: String,
+        /// Provider identity.
+        provider_id: String,
+        /// Optional workspace-relative configuration file.
+        configuration_path: Option<String>,
+    },
+    /// List projects in the current workspace.
+    ListProjects,
+    /// Explicitly discover projects using a bounded marker-file provider.
+    DiscoverProjects {
+        /// Registered provider identifier.
+        provider_id: String,
+        /// Filename recognized as a project marker; the file is never read or executed.
+        marker_filename: String,
+        /// Maximum directories to inspect.
+        max_directories: usize,
+        /// Maximum candidates to return.
+        max_projects: usize,
+        /// Maximum directory nesting, with workspace root at depth zero.
+        max_depth: usize,
+    },
+    /// Retrieve one project.
+    ProjectInfo {
+        /// Manager-local project identifier.
+        project_id: u64,
+    },
+    /// Unregister one project.
+    UnregisterProject {
+        /// Manager-local project identifier.
+        project_id: u64,
+    },
+    /// Register a direct-process task definition. Registration does not authorize execution.
+    RegisterTask {
+        /// Stable key within the project scope.
+        key: String,
+        /// User-facing label.
+        display_name: String,
+        /// One of build, check, test, clean, run, or custom.
+        category: String,
+        /// Executable path or name.
+        executable: String,
+        /// Direct process arguments; never shell parsed.
+        arguments: Vec<String>,
+        /// Workspace-relative working directory; empty means workspace root.
+        working_directory: String,
+        /// Process environment overrides, omitted from responses.
+        environment: std::collections::BTreeMap<String, String>,
+        /// Optional timeout.
+        timeout_ms: Option<u64>,
+        /// Optional associated project identifier.
+        project_id: Option<u64>,
+    },
+    /// List task definitions without exposing environment values.
+    ListTasks,
+    /// Start a task with the host's configured authorization policy.
+    StartTask {
+        /// Task definition identifier.
+        task_id: u64,
+    },
+    /// Query lifecycle state.
+    TaskStatus {
+        /// Task run identifier.
+        run_id: u64,
+    },
+    /// Query retained output and lifecycle state.
+    TaskOutput {
+        /// Task run identifier.
+        run_id: u64,
+    },
+    /// Cancel a running task.
+    CancelTask {
+        /// Task run identifier.
+        run_id: u64,
+    },
+    /// Remove a completed run and its retained output.
+    CleanupTask {
+        /// Task run identifier.
+        run_id: u64,
+    },
 }
 
 /// Versioned request envelope for internal consumers.
@@ -157,6 +242,8 @@ pub enum ErrorCode {
     NotOpen,
     /// An operation failed because of the local environment.
     Internal,
+    /// The host authorization policy denied task execution.
+    Unauthorized,
 }
 
 /// Structured error payload.
@@ -269,6 +356,126 @@ pub enum ResponseValue {
         /// Manager-local document identifier.
         document_id: u64,
     },
+    /// One or more projects.
+    Projects(Vec<ProjectSummary>),
+    /// Project registration or lookup result.
+    Project(ProjectSummary),
+    /// Project removed.
+    ProjectClosed {
+        /// Removed project identifier.
+        project_id: u64,
+    },
+    /// Task definition registered.
+    TaskRegistered {
+        /// Registered task identifier.
+        task_id: u64,
+    },
+    /// Task definitions without environment values.
+    Tasks(Vec<TaskSummary>),
+    /// Task process started.
+    TaskStarted {
+        /// Started run identifier.
+        run_id: u64,
+    },
+    /// Task state and bounded output snapshot.
+    TaskSnapshot {
+        /// Run identifier.
+        run_id: u64,
+        /// Definition identifier.
+        task_id: u64,
+        /// Typed task process lifecycle state.
+        state: TaskLifecycle,
+        /// Process exit code, if the process was spawned and provided one.
+        exit_code: Option<i32>,
+        /// Spawn or process failure information.
+        error: Option<String>,
+        /// Retained standard output.
+        stdout: String,
+        /// Retained standard error.
+        stderr: String,
+        /// Whether output exceeded the retention limit.
+        output_truncated: bool,
+    },
+    /// Task cancellation requested.
+    TaskCancelled {
+        /// Run identifier.
+        run_id: u64,
+    },
+    /// Completed task output cleaned up.
+    TaskCleaned {
+        /// Run identifier.
+        run_id: u64,
+    },
+}
+
+/// Serializable project summary with manager-local identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    /// Project identifier.
+    pub project_id: u64,
+    /// Display name.
+    pub display_name: String,
+    /// Workspace-relative project root.
+    pub root: String,
+    /// Provider identifier.
+    pub provider_id: String,
+    /// Optional workspace-relative configuration file.
+    pub configuration_path: Option<String>,
+    /// Lifecycle of the registered project.
+    pub state: ProjectLifecycle,
+}
+
+/// Project lifecycle exposed by the protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectLifecycle {
+    /// Registered and usable.
+    Registered,
+    /// Closing.
+    Closing,
+}
+
+/// Task lifecycle exposed by the protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLifecycle {
+    /// Reserved but not started.
+    Pending,
+    /// Process is active.
+    Running,
+    /// Process exited successfully.
+    Succeeded,
+    /// Process exited unsuccessfully.
+    Failed,
+    /// Explicit cancellation.
+    Cancelled,
+    /// Task timeout elapsed.
+    TimedOut,
+    /// Operating-system process creation failed.
+    SpawnFailed,
+}
+
+/// Serializable task summary. Environment overrides are intentionally omitted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskSummary {
+    /// Task identifier.
+    pub task_id: u64,
+    /// Stable definition key in its project scope.
+    pub key: String,
+    /// Display name.
+    pub display_name: String,
+    /// Category label.
+    pub category: String,
+    /// Executable name/path.
+    pub executable: String,
+    /// Argument vector.
+    pub arguments: Vec<String>,
+    /// Working directory.
+    pub working_directory: String,
+    /// Optional timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Associated project identifier.
+    pub project_id: Option<u64>,
 }
 
 /// Versioned response envelope for internal consumers.
@@ -355,5 +562,43 @@ mod tests {
         assert!(validate_version(PROTOCOL_VERSION).is_ok());
         let error = validate_version(1).unwrap_err();
         assert_eq!(error.code, ErrorCode::UnsupportedVersion);
+    }
+
+    #[test]
+    fn additive_project_and_task_contracts_remain_version_two_and_typed() {
+        let request = Request::new(
+            11,
+            RequestMethod::RegisterTask {
+                key: "check".into(),
+                display_name: "Check".into(),
+                category: "check".into(),
+                executable: "tool".into(),
+                arguments: vec!["--safe".into()],
+                working_directory: ".".into(),
+                environment: std::collections::BTreeMap::new(),
+                timeout_ms: None,
+                project_id: None,
+            },
+        );
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("\"version\":2"));
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), request);
+        let response = Response::new(
+            11,
+            Ok(ResponseValue::TaskSnapshot {
+                run_id: 3,
+                task_id: 1,
+                state: TaskLifecycle::Succeeded,
+                exit_code: Some(0),
+                error: None,
+                stdout: "ok".into(),
+                stderr: String::new(),
+                output_truncated: false,
+            }),
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&serde_json::to_string(&response).unwrap()).unwrap(),
+            response
+        );
     }
 }

@@ -1,9 +1,11 @@
 import json
 import pathlib
 import subprocess
+import sys
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-BIN = ROOT / "target" / "debug" / "koren-headless"
+BIN = ROOT / "target" / "debug" / ("koren-headless.exe" if sys.platform == "win32" else "koren-headless")
 
 
 def invoke(*args):
@@ -109,3 +111,84 @@ def test_session_rejects_unsupported_protocol_version():
     response = json.loads(result.stdout)
     assert response["request_id"] == 77
     assert response["result"]["Err"]["code"] == "unsupported_version"
+
+
+def test_session_project_registry_and_task_authorization(tmp_path):
+    (tmp_path / "src").mkdir()
+    process = subprocess.Popen([str(BIN), "session", "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    def request(i, method):
+        process.stdin.write(json.dumps({"version": 2, "request_id": i, "method": method}) + "\n")
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())
+    try:
+        request(1, {"method": "open_workspace", "params": {"path": str(tmp_path)}})
+        project = request(2, {"method": "register_project", "params": {"display_name": "Demo", "root": "src", "provider_id": "fixture", "configuration_path": None}})
+        assert project["result"]["Ok"]["value"]["display_name"] == "Demo"
+        assert len(request(3, {"method": "list_projects"})["result"]["Ok"]["value"]) == 1
+        registered = request(4, {"method": "register_task", "params": {
+            "key": "print", "display_name": "Print", "category": "custom",
+            "executable": sys.executable, "arguments": ["-c", "print('task-output')"],
+            "working_directory": ".", "environment": {"KOREN_PRIVATE_TEST_VALUE": "do-not-serialize"},
+            "timeout_ms": 5000, "project_id": 1,
+        }})
+        task_id = registered["result"]["Ok"]["value"]["task_id"]
+        assert "do-not-serialize" not in json.dumps(request(5, {"method": "list_tasks"}))
+        denied = request(6, {"method": "start_task", "params": {"task_id": task_id}})
+        assert denied["result"]["Err"]["code"] == "unauthorized"
+        removed = request(7, {"method": "unregister_project", "params": {"project_id": 1}})
+        assert removed["result"]["Ok"]["value"]["project_id"] == 1
+    finally:
+        process.stdin.close()
+        process.wait(timeout=5)
+        assert process.stderr.read() == ""
+
+
+def test_session_runs_approved_task_and_collects_output(tmp_path):
+    process = subprocess.Popen([str(BIN), "session", "--stdio", "--allow-task-execution"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    def request(i, method):
+        process.stdin.write(json.dumps({"version": 2, "request_id": i, "method": method}) + "\n")
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())
+    try:
+        request(1, {"method": "open_workspace", "params": {"path": str(tmp_path)}})
+        task_id = request(2, {"method": "register_task", "params": {
+            "key": "print", "display_name": "Print", "category": "run",
+            "executable": sys.executable, "arguments": ["-c", "import sys; print('task-out'); print('task-err', file=sys.stderr)"],
+            "working_directory": ".", "environment": {}, "timeout_ms": 5000, "project_id": None,
+        }})["result"]["Ok"]["value"]["task_id"]
+        run_id = request(3, {"method": "start_task", "params": {"task_id": task_id}})["result"]["Ok"]["value"]["run_id"]
+        deadline = time.monotonic() + 5
+        response = None
+        while time.monotonic() < deadline:
+            response = request(4, {"method": "task_output", "params": {"run_id": run_id}})
+            snapshot = response["result"]["Ok"]["value"]
+            if snapshot["state"] == "succeeded":
+                break
+        assert "task-out" in snapshot["stdout"]
+        assert "task-err" in snapshot["stderr"]
+        assert snapshot["state"] == "succeeded"
+    finally:
+        process.stdin.close()
+        process.wait(timeout=5)
+        assert process.stderr.read() == ""
+
+
+def test_session_explicit_bounded_marker_discovery(tmp_path):
+    project = tmp_path / "nested" / "demo"
+    project.mkdir(parents=True)
+    (project / "project.marker").write_text("this content is never executed", encoding="utf-8")
+    requests = [
+        {"version": 2, "request_id": 1, "method": {"method": "open_workspace", "params": {"path": str(tmp_path)}}},
+        {"version": 2, "request_id": 2, "method": {"method": "discover_projects", "params": {
+            "provider_id": "fixture.marker", "marker_filename": "project.marker",
+            "max_directories": 16, "max_projects": 4, "max_depth": 8,
+        }}},
+    ]
+    payload = "".join(json.dumps(item) + "\n" for item in requests)
+    result = subprocess.run([str(BIN), "session", "--stdio"], input=payload, capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+    responses = [json.loads(line) for line in result.stdout.splitlines()]
+    discovered = responses[1]["result"]["Ok"]["value"]
+    assert len(discovered) == 1
+    assert discovered[0]["root"] == str(pathlib.Path("nested") / "demo")
+    assert discovered[0]["configuration_path"] == str(pathlib.Path("nested") / "demo" / "project.marker")

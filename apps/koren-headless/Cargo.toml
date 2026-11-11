@@ -12,6 +12,8 @@ koren-protocol.workspace = true
 koren-commands.workspace = true
 koren-workspace.workspace = true
 koren-documents.workspace = true
+koren-projects.workspace = true
+koren-tasks.workspace = true
 serde_json.workspace = true
 
 [[bin]]
