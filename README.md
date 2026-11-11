@@ -4,7 +4,7 @@ Koren IDE Platform is a Rust framework for building reusable development environ
 
 ## Status
 
-Phases 0 through 2 provide lifecycle primitives, an experimental internal protocol, command registration, demand-driven workspace navigation, revisioned text documents, conflict-aware saves, and a headless editing session. This is a backend foundation, not yet a desktop IDE. No language-specific project model or runtime extension loader is implemented.
+Phases 0 through 3 provide lifecycle primitives, an experimental internal protocol, command registration, demand-driven workspace navigation, revisioned text documents, language-neutral projects and discovery providers, bounded direct-process task execution, and a headless session. This is a backend foundation, not yet a desktop IDE. No language-specific project/build integration or runtime extension loader is implemented.
 
 ## Build and verify
 
@@ -25,7 +25,7 @@ cargo run --locked -p koren-headless -- command execute core.ping
 cargo run --locked -p koren-headless -- workspace info . --json
 ```
 
-## Headless document editing
+## Headless workspace, projects, documents, and tasks
 
 `koren-headless session --stdio` reads one versioned JSON request per input line and writes one response per line. The same process retains the workspace and document buffers across requests. For example:
 
@@ -45,7 +45,11 @@ target/debug/koren-headless session --stdio <<JSON
 JSON
 ```
 
-The example edits a temporary file and removes it on exit. Session errors are returned as structured protocol responses. Process diagnostics go to standard error.
+The example edits a temporary file and removes it on exit. Project operations include registration, listing, lookup, removal, and explicit bounded marker discovery; task operations include definition registration/listing, start, status/output, cancellation, and cleanup. They use the same version-2 request envelope. Adding these tagged operations is additive: existing version-2 request and response encodings did not change, so the protocol remains version 2.
+
+Tasks use a direct executable and argument vector; there is no shell expansion. Registering a task does not authorize it to run. The headless host denies starts unless launched with session --stdio --allow-task-execution; that local startup option grants the session client permission to start tasks as an interactive user. Other Rust hosts implement TaskAuthorizer to distinguish interactive users, extensions, and future agents. Task summaries omit environment values.
+
+The task service retains up to 1 MiB per output stream and four concurrent processes by default. Completed output remains in memory until cleanup_task or service shutdown. Closing the workspace or dropping the service requests cancellation of direct child processes. Cancellation does not portably terminate process descendants; see ARCHITECTURE.md. The workspace path policy is not a security sandbox.
 
 ## Workspace and document behavior
 
@@ -59,9 +63,16 @@ Run reproducible, non-gating backend benchmarks with:
 
 ```bash
 cargo bench --locked -p koren-documents --bench phase2
+cargo bench --locked -p koren-projects --bench phase3
 ```
 
-The checked-in [Phase 2 benchmark baseline](BENCHMARKS.md) records the fixture sizes and measurement environment.
+The checked-in backend benchmark baselines in BENCHMARKS.md record fixture sizes and measurement environments.
+
+## Project and task lifecycle
+
+Workspaces own opened filesystem roots. Logical projects are explicit records associated with a workspace and can be nested or coexist under different providers. Project IDs are local to a ProjectManager and do not persist across sessions. Providers are registered explicitly; discovery is invoked by the host with directory, depth, and result limits. The marker-file provider is only a generic fixture and never reads or executes marker content.
+
+Build providers can expose zero or more generic TaskDefinition capabilities. The task service also accepts manually configured definitions with no project. See ARCHITECTURE.md for state, events, authorization, and platform limits.
 
 ## Planned extension model
 

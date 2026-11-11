@@ -6,8 +6,10 @@ The dependency graph points from consumers to the lower-level crates they use:
 
 ```text
 koren-headless ──> koren-core, koren-protocol, koren-commands,
-                   koren-workspace, koren-documents
+                   koren-workspace, koren-documents, koren-projects, koren-tasks
 koren-documents ─> koren-core, koren-protocol, koren-workspace, ropey
+koren-projects ──> koren-core, koren-workspace, koren-tasks
+koren-tasks ─────> koren-core
 koren-workspace ─> koren-core
 koren-protocol  ─> serde
 
@@ -15,7 +17,23 @@ koren-core      (no internal crate dependencies)
 koren-commands  (no internal crate dependencies)
 ```
 
-`koren-core` owns lifecycle primitives and the in-process event queue. `koren-protocol` owns typed versioned request/response contracts and JSON types. `koren-commands` owns command registration, enumeration, and invocation. `koren-workspace` opens one local root and provides bounded, demand-driven navigation. `koren-documents` manages revisioned text buffers and safe-ish local file saves. `koren-headless` is a consumer that wires these public crates together.
+Koren core owns lifecycle primitives and shared event vocabulary. Koren protocol owns typed versioned request/response contracts and JSON types. Koren commands owns command registration, enumeration, and invocation. Koren workspace opens one local root and provides bounded, demand-driven navigation. Koren documents manages revisioned text buffers and local file saves. Koren projects owns manager-local logical projects and explicit bounded discovery providers; providers may expose generic task definitions. Koren tasks owns those definitions, host authorization checks, direct-process execution, bounded output, and run lifecycle. Koren headless wires the public APIs together.
+
+## Project model and discovery
+
+A workspace is a filesystem environment. A project is a logical unit registered within a workspace and identified by a ProjectId that is stable only for one manager instance. It carries a display name, workspace-relative root, provider ID, optional configuration path, provider data, and lifecycle state. Each workspace-relative root can be registered once, even when multiple providers recognize it. Nested roots are allowed. Closing a workspace removes its project records.
+
+ProjectProvider inspects one directory's already bounded workspace entries and returns an optional candidate. ProjectManager discovery is explicit; limits bound directories, nesting, and returned projects. No provider command or configuration file is run. MarkerFileProvider only recognizes a configured filename and exists as a small fixture. There is no Cargo, CMake, Meson, or Gradle integration yet.
+
+Providers return zero or more TaskDefinitions to describe supported capabilities. Definitions use a key scoped to their project, a display name/category, executable plus argv, working directory, environment overrides, optional timeout, and optional project ID. Koren tasks depends only on Koren core; the project crate depends on task contracts, avoiding a cycle.
+
+## Task execution and authorization
+
+TaskManager starts each process with std::process::Command, never an implicit shell. A supervisor thread monitors each child while two reader threads drain stdout/stderr, allowing host request handling to remain responsive. Process starts are synchronous and include the OS spawn call; subsequent waiting and output collection are asynchronous. The default service allows four concurrent children and retains up to 1 MiB for each stream. It continues draining after truncation. Task event and shared platform event queues are FIFO within the service and bounded; oldest events are discarded at capacity. Independent managers have no cross-service ordering.
+
+Run states are Pending, Running, Succeeded, Failed, Cancelled, TimedOut, and SpawnFailed. A spawned process's nonzero exit is Failed with its exit code. An OS spawn error is SpawnFailed with the error message. Cancellation and timeout kill the direct child. After child exit, the supervisor waits up to 200 ms for both output readers to drain; if a descendant inherited a pipe, it completes the run and stops retaining later output, while that reader thread may remain until the pipe closes. Process group/job management is deliberately not implemented, so descendants may remain alive. Workspace close and task manager drop request cancellation of all active direct children; the host should keep the manager alive until task completion when it needs final output.
+
+Registering a task grants no execution permission. A host supplies a TaskAuthorizer on each start and can distinguish interactive users, extensions, and future coding agents. The headless session denies starts by default; launching it with --allow-task-execution explicitly enables starts from that local session as an interactive user. The wire protocol has no caller-provided approved boolean, shell operation, or environment-value response. Environment values can still affect a process and task execution is not a workspace sandbox.
 
 Cargo metadata architecture tests enforce internal dependency directions and reject frontend, language-specific, or agent-runtime dependencies in the backend crates.
 
@@ -43,11 +61,11 @@ Saving writes a uniquely named temporary file in the destination directory, copi
 
 ## Event delivery
 
-Workspace and document managers own their event queues. They enqueue lifecycle, change, save, and conflict events and expose a drain operation. Each manager's events are delivered to its consumer in FIFO order when drained. There is no global ordering across independent managers, persistence, broadcast, callback listener, or background thread. The consumer owns event processing and should drain promptly. Queue ownership avoids registered-listener lifetime leaks.
+Workspace and document managers own their event queues. They enqueue lifecycle, change, save, and conflict events and expose a drain operation. Project events retain at most 1,024 entries; task and shared task events use the configured task event limit (4,096 by default). Each service is FIFO; when its queue fills, it drops the oldest event. There is no global ordering across independent managers, persistence, broadcast, callback listener, or background thread. The consumer owns event processing and should drain promptly. Queue ownership avoids registered-listener lifetime leaks.
 
 ## Protocol evolution and headless session
 
-The experimental protocol is version 2, adding workspace and document operations to the Phase 1 contract. Version 1 requests are rejected. Breaking changes should increment the version and update serialization and compatibility tests together. `koren-headless session --stdio` processes JSON Lines sequentially in one process, with caller-supplied request ids and typed responses. Machine-readable output goes to stdout; diagnostics go to stderr. The session is local-only, not an HTTP or network server.
+The experimental protocol remains version 2. Project/task request and response variants are additive tagged operations; existing version-2 shapes are unchanged. Version 1 requests are rejected. Any incompatible field or encoding change must increment the version and update serialization and compatibility tests together. The headless session processes JSON Lines sequentially in one process, with caller-supplied request IDs and typed responses. Machine-readable output goes to stdout; diagnostics go to stderr. The session is local-only, not an HTTP or network server.
 
 ## Frontend, products, and future interfaces
 
@@ -55,4 +73,8 @@ All crates remain frontend independent. Future desktop code is expected to use T
 
 ## Performance
 
-`cargo bench --locked -p koren-documents --bench phase2` runs reproducible, non-gating workloads for workspace open, listing 500 entries, opening a 1 MiB text file, small and 256 KiB edits in an 8 MiB single-line document, and saving a modified document. Measurements and environment are recorded in [`BENCHMARKS.md`](BENCHMARKS.md). They are baselines for later comparisons, not targets or cross-machine claims.
+Cargo bench for Koren documents runs workspace/document workloads. Cargo bench for Koren tasks covers project registration/enumeration, task registration/start, output capture, and concurrent children. Measurements and environment are recorded in BENCHMARKS.md. They are baselines for later comparisons, not targets or full IDE performance claims.
+
+## Verification
+
+The minimum supported compiler is Rust 1.85. CI has a direct 1.85 build/test job, plus Linux, macOS, and Windows build/unit/integration jobs. The complete PR suite (formatting, Clippy, tests, architecture, Python integration, and clean locked build) runs on Linux.
