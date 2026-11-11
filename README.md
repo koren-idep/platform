@@ -1,20 +1,27 @@
 # Koren IDE Platform
 
-Koren IDE Platform is a Rust framework for building reusable development environments. The **platform** provides shared backend building blocks; **Koren IDE** is the flagship product planned to consume those crates and add Rust focused project and language tooling.
+Koren has three related products. **Koren IDE Platform** is the reusable, language-neutral Rust backend and extension framework. **Koren Code Editor** is the lightweight, universal desktop editor built on that platform. **Koren IDE** is a future Rust-specialized distribution planned for advanced Rust diagnostics and project intelligence. Phase 5 delivers Koren Code Editor; it does not build Koren IDE.
 
 ## Status
 
-Phases 0 through 4 provide lifecycle primitives, an experimental internal protocol, command registration, demand-driven workspace navigation, revisioned text documents, language-neutral projects and task execution, a first-party Cargo provider, host-controlled task approvals, and a headless session. This is a backend foundation, not yet a desktop IDE. No runtime extension loader is implemented.
+Phases 0 through 4 provide lifecycle primitives, an experimental internal protocol, command registration, demand-driven workspace navigation, revisioned text documents, language-neutral projects and task execution, a first-party Cargo provider, host-controlled task approvals, and a headless session. Phase 5 adds the first desktop Koren Code Editor using Tao, Wry, TypeScript, and CodeMirror 6. Rust is its initial development and testing integration; editor and navigation infrastructure remain language-neutral. No runtime extension loader, language server, or advanced Rust intelligence is implemented yet.
 
 ## Build and verify
 
-Install stable Rust (minimum 1.85), Python 3, and the development requirements:
+Install stable Rust (minimum 1.85), Python 3, Node.js 22.12 or later, and Linux GTK 3/WebKitGTK 4.1 development libraries. On Fedora, install `gtk3-devel` and `webkit2gtk4.1-devel`. Install the frontend dependencies and Python development requirements:
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
+npm ci --prefix apps/koren-code/frontend
 python3 scripts/check.py
 python3 scripts/pr_check.py
 ```
+
+Run the universal desktop editor with `cargo run --locked -p koren-code`. Its executable is `koren-code` and its window title is “Koren Code Editor”. `apps/koren-code/build.rs` builds the TypeScript frontend as part of Cargo builds; run `npm ci` first. Release builds embed the built frontend files. On Linux, Tao and Wry use GTK 3 and WebKitGTK 4.1. The current native folder picker is implemented for Linux; Windows and macOS desktop builds are not yet verified.
+
+The editor has a compact menu, collapsible file tree, tabs, central CodeMirror editor, resizable bottom panel, and status bar. It offers dark and light themes and uses the protocol-v2 bridge to call the existing workspace, document, project, task, and approval services. Document edits carry revisions and are queued in order; saving waits for acknowledged edits and uses the platform's conflict-aware safe save. Cargo is an optional first-party provider surfaced in the editor, and every process start requires an explicit graphical approval. The TypeScript editor integration registry allows additional languages to be registered without making Rust a UI or navigation assumption. Extensions, language servers, semantic intelligence, and the future Rust-specialized Koren IDE are not Phase 5 deliverables.
+
+Frontend checks run via `npm run --prefix apps/koren-code/frontend typecheck`, `lint`, `test`, and `build`. Linux GUI smoke and startup/memory sampling can be run after building with `cargo build --locked -p koren-code` using `xvfb-run -a python3 scripts/desktop_smoke.py target/debug/koren-code`.
 
 Run the existing headless commands:
 

@@ -1,5 +1,16 @@
 # Phase 2 benchmark baseline
 
+## Koren Code Editor desktop smoke sample
+
+Build the Linux desktop app, then launch it in an X server (a virtual X server is suitable for CI):
+
+```sh
+cargo build --locked -p koren-code
+xvfb-run -a python3 scripts/desktop_smoke.py target/debug/koren-code
+```
+
+The script waits until the visible “Koren Code Editor” window appears, reports elapsed process-start-to-window time, then samples total RSS across the editor process and its current descendants one second later. The application exits automatically in this test mode. One local sample on 2026-11-11 reported 170.2 ms to the window and 373,204 KiB process-tree RSS at the one-second sample point. Environment: Fedora Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, Intel Core i7-1068NG7 at 2.30 GHz, Xvfb plus Openbox, Rust 1.99.1, Tao 0.37.2, and Wry 0.57.2. This is one run, not a median; toolkit initialization, display server, and system load affect both values. Workspace-open, file-open, typing, and task-start interactive timings are not measured by this smoke script and remain uncharacterized. The measurements are diagnostics, not production-hardware performance claims.
+
 This is a local baseline for comparison in later phases, not a performance target or a cross-machine claim. It was collected with:
 
 ```bash

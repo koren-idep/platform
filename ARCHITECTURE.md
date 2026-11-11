@@ -78,7 +78,11 @@ The experimental protocol remains version 2. Project, Cargo, task, and approval 
 
 ## Frontend, products, and future interfaces
 
-All crates remain frontend independent. Future desktop code is expected to use Tao for windows, Wry/WebKitGTK on Linux, and HTML/CSS/TypeScript outside these backend crates. Koren IDE and other products will be compiled Rust applications providing their own project models, language integrations, and build support. Lua 5.4 runtime extensions, WebAssembly, LSP, DAP, and agent interfaces are future plans only; none are in this workspace.
+All platform crates remain frontend independent. Koren Code Editor is the language-neutral desktop consumer in `apps/koren-code`: a Rust Tao/Wry host, a TypeScript frontend, and CodeMirror 6. Linux uses Wry's GTK container and WebKitGTK 4.1. The frontend accesses services through protocol-v2 JSON requests on the same-origin `koren://app` scheme. The native host serves only embedded or local built assets, rejects external navigation, applies a restrictive content security policy, and exposes a narrow IPC message for the dirty-close decision. Other application requests remain typed versioned protocol messages handled on one backend worker thread. Request bodies are limited to 1 MiB; event delivery uses bounded service queues and a reconnecting long poll.
+
+The editor owns generic file navigation, document tabs, text editing, themes, task presentation, and approval dialogs. Language-specific editor contributions are registered through the frontend `LanguageIntegration` seam; Rust syntax support is one initial integration. Cargo project discovery and tasks come from the reusable `koren-cargo` platform provider. No Rust-only project navigation, settings, or editor assumptions belong in the universal shell. Task approval is a user decision, not a sandbox; the UI shows the exact executable, arguments, working directory, project, and environment variable names before approval.
+
+The product split is: **Koren IDE Platform**, the reusable language-neutral backend and extension framework; **Koren Code Editor**, the universal lightweight editor; and **Koren IDE**, a future Rust-specialized distribution using the same desktop shell and platform APIs. Advanced Rust diagnostics, inspections, semantic analysis, refactoring, and deeper compiler/rust-analyzer integration are outside Phase 5. Runtime extensions, LSP, DAP, and agent interfaces are future work; no runtime extension loader is implemented yet. Shared extension APIs are intended to serve both desktop products.
 
 ## Performance
 
@@ -86,4 +90,4 @@ Cargo bench for Koren documents runs workspace/document workloads. Cargo bench f
 
 ## Verification
 
-The minimum supported compiler is Rust 1.85. CI has a direct 1.85 build/test job, plus Linux, macOS, and Windows build/unit/integration jobs. The complete PR suite (formatting, Clippy, tests, architecture, Python integration, and clean locked build) runs on Linux. The Phase 4 local run verified Linux and Rust 1.85; macOS and Windows CI jobs remain unverified until those jobs run successfully.
+The minimum supported compiler is Rust 1.85. CI has a direct 1.85 build/test job, plus platform build/unit/integration jobs. The complete Linux PR suite includes frontend typecheck, lint, unit tests, production bundle, Rust checks, Python integration, a clean workspace build, release editor build, and an Xvfb window launch smoke test. Cross-platform GUI availability still requires successful CI on the relevant native runners. The desktop smoke script reports the interval until the named window appears and samples the editor process tree's RSS one second later; this is a repeatable local/CI diagnostic, not a user-perceived performance target.
