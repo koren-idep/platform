@@ -5,6 +5,12 @@ export interface Transport {
   events(): Promise<PlatformEvent[]>;
 }
 
+interface DesktopIpc { postMessage(message: string): void }
+
+declare global {
+  interface Window { ipc?: DesktopIpc }
+}
+
 export class KorenError extends Error {
   constructor(readonly code: string, message: string) { super(message); }
 }
@@ -38,10 +44,19 @@ export class KorenClient {
 }
 
 export function createDesktopTransport(base = ''): Transport {
+  const pending = new Map<number, (response: ResponseEnvelope) => void>();
+  window.addEventListener('koren-platform-response', (event) => {
+    const response = (event as CustomEvent<ResponseEnvelope>).detail;
+    pending.get(response.request_id)?.(response);
+    pending.delete(response.request_id);
+  });
   return {
     async request(body) {
-      const response = await fetch(`${base}/api`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-      return await response.json() as ResponseEnvelope;
+      if (!window.ipc) throw new KorenError('ipc_unavailable', 'The desktop bridge is unavailable.');
+      return await new Promise<ResponseEnvelope>((resolve) => {
+        pending.set(body.request_id, resolve);
+        window.ipc!.postMessage(JSON.stringify(body));
+      });
     },
     async events() {
       const response = await fetch(`${base}/events`, { cache: 'no-store' });

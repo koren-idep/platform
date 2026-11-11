@@ -24,11 +24,13 @@ static FRONTEND: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
 enum UiEvent {
     PickWorkspace(RequestAsyncResponder),
+    PickFile(RequestAsyncResponder),
     PickerResolved {
         id: u64,
         path: Option<String>,
         responder: RequestAsyncResponder,
     },
+    BackendResponse(Box<koren_protocol::Response>),
     CloseDecision(bool),
     SmokeExit,
 }
@@ -52,6 +54,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let proxy_for_protocol = proxy.clone();
     let backend_for_protocol = backend.clone();
     let proxy_for_ipc = proxy.clone();
+    let backend_for_ipc = backend.clone();
     let builder = WebViewBuilder::new()
         .with_asynchronous_custom_protocol("koren".into(), move |_id, request, responder| {
             route_request(
@@ -65,15 +68,55 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if request.uri().scheme_str() != Some("koren") || request.uri().host() != Some("app") {
                 return;
             }
+            if request.body().len() > 1024 * 1024 {
+                let request_id = serde_json::from_str::<serde_json::Value>(request.body())
+                    .ok()
+                    .and_then(|message| {
+                        message
+                            .get("request_id")
+                            .and_then(serde_json::Value::as_u64)
+                    });
+                if let Some(request_id) = request_id {
+                    let response = koren_protocol::Response::new(
+                        request_id,
+                        Err(koren_protocol::ProtocolError {
+                            code: koren_protocol::ErrorCode::InvalidRequest,
+                            message: "request body exceeds the 1 MiB bridge limit".into(),
+                        }),
+                    );
+                    let _ = proxy_for_ipc.send_event(UiEvent::BackendResponse(Box::new(response)));
+                }
+                return;
+            }
             let Ok(message) = serde_json::from_str::<serde_json::Value>(request.body()) else {
                 return;
             };
-            if message.get("type").and_then(serde_json::Value::as_str) != Some("close_decision") {
+            if message.get("type").and_then(serde_json::Value::as_str) == Some("close_decision") {
+                if let Some(allow) = message.get("allow").and_then(serde_json::Value::as_bool) {
+                    let _ = proxy_for_ipc.send_event(UiEvent::CloseDecision(allow));
+                }
                 return;
             }
-            if let Some(allow) = message.get("allow").and_then(serde_json::Value::as_bool) {
-                let _ = proxy_for_ipc.send_event(UiEvent::CloseDecision(allow));
-            }
+            let Ok(protocol_request) = serde_json::from_value::<koren_protocol::Request>(message)
+            else {
+                return;
+            };
+            let request_id = protocol_request.request_id;
+            let backend = backend_for_ipc.clone();
+            let proxy = proxy_for_ipc.clone();
+            thread::spawn(move || {
+                let response =
+                    bridge::send_request(&backend, protocol_request).unwrap_or_else(|error| {
+                        koren_protocol::Response::new(
+                            request_id,
+                            Err(koren_protocol::ProtocolError {
+                                code: koren_protocol::ErrorCode::Internal,
+                                message: error,
+                            }),
+                        )
+                    });
+                let _ = proxy.send_event(UiEvent::BackendResponse(Box::new(response)));
+            });
         })
         .with_navigation_handler(|url| url.starts_with("koren://app/"));
 
@@ -151,6 +194,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .to_vec(),
                 ));
             }
+            Event::UserEvent(UiEvent::PickFile(responder)) => {
+                #[cfg(target_os = "linux")]
+                {
+                    dialog_id = dialog_id.saturating_add(1);
+                    let id = dialog_id;
+                    let dialog = gtk::FileChooserNative::new(
+                        Some("Open File"),
+                        Some(window.gtk_window()),
+                        gtk::FileChooserAction::Open,
+                        Some("Open"),
+                        Some("Cancel"),
+                    );
+                    let event_proxy = proxy.clone();
+                    let responder = Rc::new(RefCell::new(Some(responder)));
+                    let response_slot = responder.clone();
+                    dialog.connect_response(move |chooser, response| {
+                        let path = if response == gtk::ResponseType::Accept {
+                            chooser
+                                .filename()
+                                .map(|path| path.to_string_lossy().into_owned())
+                        } else {
+                            None
+                        };
+                        if let Some(responder) = response_slot.borrow_mut().take() {
+                            let _ = event_proxy.send_event(UiEvent::PickerResolved {
+                                id,
+                                path,
+                                responder,
+                            });
+                        }
+                    });
+                    dialogs.borrow_mut().push((id, dialog.clone()));
+                    dialog.show();
+                }
+                #[cfg(not(target_os = "linux"))]
+                responder.respond(json_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    br#"{"error":"native file picker is not available on this platform"}"#.to_vec(),
+                ));
+            }
             Event::UserEvent(UiEvent::PickerResolved {
                 id,
                 path,
@@ -163,6 +246,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let body = serde_json::to_vec(&serde_json::json!({ "path": path }))
                     .unwrap_or_else(|_| b"{\"path\":null}".to_vec());
                 responder.respond(json_response(StatusCode::OK, body));
+            }
+            Event::UserEvent(UiEvent::BackendResponse(response)) => {
+                if let Ok(payload) = serde_json::to_string(&response) {
+                    let script = format!(
+                        "window.dispatchEvent(new CustomEvent('koren-platform-response', {{ detail: {payload} }}));"
+                    );
+                    let _ = webview.evaluate_script(&script);
+                }
             }
             Event::UserEvent(UiEvent::CloseDecision(allow)) => {
                 close_prompt_open = false;
@@ -210,6 +301,12 @@ fn route_request(
     let path = request.uri().path().to_owned();
     if path == "/picker" && request.method() == "GET" {
         if proxy.send_event(UiEvent::PickWorkspace(responder)).is_err() {
+            return;
+        }
+        return;
+    }
+    if path == "/file-picker" && request.method() == "GET" {
+        if proxy.send_event(UiEvent::PickFile(responder)).is_err() {
             return;
         }
         return;
@@ -301,7 +398,7 @@ fn route_request(
 fn is_disallowed_method(path: &str, method: &Method) -> bool {
     match path {
         "/api" => method != Method::POST,
-        "/events" | "/picker" => method != Method::GET,
+        "/events" | "/picker" | "/file-picker" => method != Method::GET,
         _ => false,
     }
 }
@@ -372,6 +469,7 @@ mod tests {
         assert!(!is_disallowed_method("/api", &Method::POST));
         assert!(!is_disallowed_method("/events", &Method::GET));
         assert!(!is_disallowed_method("/picker", &Method::GET));
+        assert!(!is_disallowed_method("/file-picker", &Method::GET));
         assert!(is_disallowed_method("/api", &Method::GET));
         assert!(is_disallowed_method("/events", &Method::POST));
         assert!(is_disallowed_method("/picker", &Method::POST));

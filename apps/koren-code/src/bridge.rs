@@ -1,4 +1,5 @@
 use koren_cargo::CargoProvider;
+use koren_commands::{CommandError, CommandRegistry};
 use koren_core::{Platform, PlatformEvent};
 use koren_documents::{DocumentId, DocumentManager};
 use koren_projects::{DiscoveryLimits, ProjectId, ProjectInfo, ProjectManager};
@@ -127,6 +128,7 @@ impl TaskExecutionPolicy for AlwaysRequireApproval {
 
 struct DesktopBackend {
     platform: Platform,
+    commands: CommandRegistry,
     workspace: WorkspaceManager,
     documents: DocumentManager,
     projects: ProjectManager,
@@ -139,6 +141,14 @@ impl DesktopBackend {
     fn new() -> Result<Self, String> {
         let mut platform = Platform::new();
         platform.initialize().map_err(|error| error.to_string())?;
+        let mut commands = CommandRegistry::new();
+        commands
+            .register(
+                "core.ping",
+                "Check that the platform is running",
+                command_ping,
+            )
+            .map_err(|error| error.to_string())?;
         let mut projects = ProjectManager::new();
         let cargo = CargoProvider::new();
         cargo
@@ -146,6 +156,7 @@ impl DesktopBackend {
             .map_err(|error| error.to_string())?;
         Ok(Self {
             platform,
+            commands,
             workspace: WorkspaceManager::new(),
             documents: DocumentManager::new(),
             projects,
@@ -175,6 +186,14 @@ impl DesktopBackend {
     fn method(&mut self, method: RequestMethod) -> Result<ResponseValue, ProtocolError> {
         match method {
             RequestMethod::Ping => Ok(ResponseValue::Pong),
+            RequestMethod::ListCommands => Ok(ResponseValue::Commands(
+                self.commands.ids().into_iter().map(str::to_owned).collect(),
+            )),
+            RequestMethod::ExecuteCommand { command_id } => self
+                .commands
+                .invoke(&command_id, &[])
+                .map(ResponseValue::CommandOutput)
+                .map_err(command_error),
             RequestMethod::OpenWorkspace { path } => {
                 self.workspace.open(path).map_err(workspace_error)?;
                 Ok(ResponseValue::WorkspaceOpened {
@@ -552,6 +571,25 @@ impl DesktopBackend {
     }
 }
 
+fn command_ping(arguments: &[String]) -> Result<String, CommandError> {
+    if !arguments.is_empty() {
+        return Err(CommandError::Execution(
+            "core.ping takes no arguments".into(),
+        ));
+    }
+    Ok("pong".into())
+}
+
+fn command_error(error: CommandError) -> ProtocolError {
+    ProtocolError {
+        code: match error {
+            CommandError::UnknownCommand(_) => ErrorCode::NotFound,
+            _ => ErrorCode::InvalidRequest,
+        },
+        message: error.to_string(),
+    }
+}
+
 fn event_from_platform(event: PlatformEvent) -> DesktopEvent {
     match event {
         PlatformEvent::WorkspaceOpened { root } => DesktopEvent {
@@ -891,6 +929,29 @@ mod tests {
             backend.dispatch(invalid_version).result,
             Err(ProtocolError {
                 code: ErrorCode::UnsupportedVersion,
+                ..
+            })
+        ));
+        backend.shutdown();
+    }
+
+    #[test]
+    fn platform_commands_are_listed_and_invoked_through_the_existing_registry() {
+        let mut backend = DesktopBackend::new().unwrap();
+        assert!(matches!(
+            backend.method(RequestMethod::ListCommands).unwrap(),
+            ResponseValue::Commands(commands) if commands == ["core.ping"]
+        ));
+        assert!(matches!(
+            backend.method(RequestMethod::ExecuteCommand { command_id: "core.ping".into() }).unwrap(),
+            ResponseValue::CommandOutput(output) if output == "pong"
+        ));
+        assert!(matches!(
+            backend.method(RequestMethod::ExecuteCommand {
+                command_id: "missing.command".into()
+            }),
+            Err(ProtocolError {
+                code: ErrorCode::NotFound,
                 ..
             })
         ));
