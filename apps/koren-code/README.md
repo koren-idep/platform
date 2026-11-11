@@ -28,8 +28,10 @@ The full repository verification is `python3 scripts/pr_check.py`. On Linux, the
 
 ## Manual Linux acceptance
 
-Run `cargo run --locked -p koren-code`, open the repository root from **File**, and verify the explorer loads the root without recursively enumerating it. Expand directories, open a Rust source file, open a second file, and switch tabs. Make rapid edits in both tabs, save with Ctrl+S, then verify the file contents and dirty markers. To check conflict handling, modify an open file externally, save in the editor, inspect the disk preview, and choose reload or overwrite explicitly. Switch dark/light themes and resize/collapse the explorer and bottom panel.
+Run `cargo run --locked -p koren-code`, open a workspace from **File**, and verify the explorer loads the root without recursively enumerating it. Expand directories, open a Rust source file, open a second file, and switch tabs. Make rapid edits in both tabs, save with Ctrl+S, then verify the file contents and dirty markers. To check conflict handling, modify an open file externally, save in the editor, inspect the disk preview, and choose reload or overwrite explicitly. Switch dark/light themes and resize/collapse the explorer and bottom panel.
 
-For task authorization, select **Build → Discover Cargo**, inspect the Cargo project and tasks, request a task, verify the exact command and environment variable names in the approval dialog, and exercise both Deny and Approve once. Approved runs should show bounded output, status, exit result, and cancellation control. Closing a dirty document or the app should offer explicit save/discard/cancel choices.
+For task authorization, select **Run → Discover Cargo Projects**, inspect the Cargo project and tasks, request a task, and verify the exact command and environment variable names in the approval dialog. Choose Deny or explicitly approve a run. Approved runs should show bounded output, status, exit result, and cancellation control. Closing a dirty document or the app should offer explicit save/discard/cancel choices.
 
 The automated desktop smoke test verifies window creation and collects startup/RSS diagnostics; it does not automate those interactive steps. Windows and macOS desktop behavior remains unverified.
+
+See [Phase 5.5 UI refinement notes](PHASE_5_5.md) for the interactive visual acceptance record and screenshots.
