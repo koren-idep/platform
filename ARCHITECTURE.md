@@ -6,10 +6,13 @@ The dependency graph points from consumers to the lower-level crates they use:
 
 ```text
 koren-headless ──> koren-core, koren-protocol, koren-commands,
-                   koren-workspace, koren-documents, koren-projects, koren-tasks
+                   koren-workspace, koren-documents, koren-projects,
+                   koren-tasks, koren-cargo
 koren-documents ─> koren-core, koren-protocol, koren-workspace, ropey
 koren-projects ──> koren-core, koren-workspace, koren-tasks
 koren-tasks ─────> koren-core
+koren-cargo ─────> koren-projects, koren-tasks, koren-workspace,
+                   serde, serde_json, toml, glob
 koren-workspace ─> koren-core
 koren-protocol  ─> serde
 
@@ -17,13 +20,17 @@ koren-core      (no internal crate dependencies)
 koren-commands  (no internal crate dependencies)
 ```
 
-Koren core owns lifecycle primitives and shared event vocabulary. Koren protocol owns typed versioned request/response contracts and JSON types. Koren commands owns command registration, enumeration, and invocation. Koren workspace opens one local root and provides bounded, demand-driven navigation. Koren documents manages revisioned text buffers and local file saves. Koren projects owns manager-local logical projects and explicit bounded discovery providers; providers may expose generic task definitions. Koren tasks owns those definitions, host authorization checks, direct-process execution, bounded output, and run lifecycle. Koren headless wires the public APIs together.
+Koren core owns lifecycle primitives and shared event vocabulary. Koren protocol owns typed versioned request/response contracts and JSON types. Koren commands owns command registration, enumeration, and invocation. Koren workspace opens one local root and provides bounded, demand-driven navigation. Koren documents manages revisioned text buffers and local file saves. Koren projects owns manager-local logical projects and explicit bounded discovery providers; provider discovery can override per-directory detection when it must group related manifests. Providers may expose generic task definitions. Koren tasks owns those definitions, host authorization checks, direct-process execution, bounded output, and run lifecycle. Koren cargo is an optional first-party Rust integration and is not a dependency of the generic project, task, workspace, or document crates. Koren headless wires the public APIs together.
 
 ## Project model and discovery
 
 A workspace is a filesystem environment. A project is a logical unit registered within a workspace and identified by a ProjectId that is stable only for one manager instance. It carries a display name, workspace-relative root, provider ID, optional configuration path, provider data, and lifecycle state. Each workspace-relative root can be registered once, even when multiple providers recognize it. Nested roots are allowed. Closing a workspace removes its project records.
 
-ProjectProvider inspects one directory's already bounded workspace entries and returns an optional candidate. ProjectManager discovery is explicit; limits bound directories, nesting, and returned projects. No provider command or configuration file is run. MarkerFileProvider only recognizes a configured filename and exists as a small fixture. There is no Cargo, CMake, Meson, or Gradle integration yet.
+ProjectProvider inspects one directory's already bounded workspace entries and returns an optional candidate. ProjectManager discovery is explicit; limits bound directories, nesting, and returned projects. No provider command or configuration file is run. MarkerFileProvider only recognizes a configured filename and exists as a small fixture.
+
+`koren-cargo` reads up to 1 MiB from each explicitly inspected Cargo manifest and honors workspace member and exclude globs. One workspace root is one Koren project; its package is in the root package field when present, while member packages are typed metadata under that workspace project. A nested Cargo workspace is a separate project, and a non-member package manifest remains an independent project. Discovery is bounded and performs no Cargo invocation. Manifest-declared names, directly declared versions, and common targets are available immediately. An explicit `cargo metadata --offline --format-version 1 --no-deps` task can provide authoritative inherited versions and target paths; its JSON output is parsed through a typed adapter. The task uses the regular host approval path and never runs during discovery.
+
+The provider contributes workspace-level build/check/test/clean tasks and package-scoped build/check/test/clean plus binary run tasks where targets are known. Each uses executable `cargo`, an argv vector, an explicit manifest path, and the project workspace as its working directory. Cargo still reads the project's normal configuration. There is no implicit shell or Cargo invocation in generic services.
 
 Providers return zero or more TaskDefinitions to describe supported capabilities. Definitions use a key scoped to their project, a display name/category, executable plus argv, working directory, environment overrides, optional timeout, and optional project ID. Koren tasks depends only on Koren core; the project crate depends on task contracts, avoiding a cycle.
 
@@ -33,7 +40,9 @@ TaskManager starts each process with std::process::Command, never an implicit sh
 
 Run states are Pending, Running, Succeeded, Failed, Cancelled, TimedOut, and SpawnFailed. A spawned process's nonzero exit is Failed with its exit code. An OS spawn error is SpawnFailed with the error message. Cancellation and timeout kill the direct child. After child exit, the supervisor waits up to 200 ms for both output readers to drain; if a descendant inherited a pipe, it completes the run and stops retaining later output, while that reader thread may remain until the pipe closes. Process group/job management is deliberately not implemented, so descendants may remain alive. Workspace close and task manager drop request cancellation of all active direct children; the host should keep the manager alive until task completion when it needs final output.
 
-Registering a task grants no execution permission. A host supplies a TaskAuthorizer on each start and can distinguish interactive users, extensions, and future coding agents. The headless session denies starts by default; launching it with --allow-task-execution explicitly enables starts from that local session as an interactive user. The wire protocol has no caller-provided approved boolean, shell operation, or environment-value response. Environment values can still affect a process and task execution is not a workspace sandbox.
+Registering a task grants no execution permission. A host supplies a TaskAuthorizer for immediate starts and a TaskExecutionPolicy for requests that can be allowed, denied, or held for approval. TaskApprovalManager stores a manager-local one-time request ID and immutable command snapshot, including actor and environment overrides. Approval consumes the request before starting and verifies the registered definition still matches the snapshot. Pending requests do not consume process concurrency slots, expire after their host-set lifetime, and can be invalidated on project, workspace, or session closure. Headless request operations default to pending approval; explicit approve/deny operations consume the request. The legacy --allow-task-execution flag remains a deliberately permissive trusted-host mode and is never enabled by default.
+
+Protocol approval summaries include the executable, arguments, working directory, project, actor, and environment variable names, but never values. Rust hosts should keep environment values out of logs and presentation surfaces. Approvals are not sandboxing: a permitted Cargo build can execute project-controlled build scripts and programs. Workspace path checks do not constrain a running process.
 
 Cargo metadata architecture tests enforce internal dependency directions and reject frontend, language-specific, or agent-runtime dependencies in the backend crates.
 
@@ -65,7 +74,7 @@ Workspace and document managers own their event queues. They enqueue lifecycle, 
 
 ## Protocol evolution and headless session
 
-The experimental protocol remains version 2. Project/task request and response variants are additive tagged operations; existing version-2 shapes are unchanged. Version 1 requests are rejected. Any incompatible field or encoding change must increment the version and update serialization and compatibility tests together. The headless session processes JSON Lines sequentially in one process, with caller-supplied request IDs and typed responses. Machine-readable output goes to stdout; diagnostics go to stderr. The session is local-only, not an HTTP or network server.
+The experimental protocol remains version 2. Project, Cargo, task, and approval request/response variants are additive tagged operations; existing version-2 shapes are unchanged. Version 1 requests are rejected. Any incompatible field or encoding change must increment the version and update serialization and compatibility tests together. The headless session processes JSON Lines sequentially in one process, with caller-supplied request IDs and typed responses. Machine-readable output goes to stdout; diagnostics go to stderr. The session is local-only, not an HTTP or network server.
 
 ## Frontend, products, and future interfaces
 
@@ -73,8 +82,8 @@ All crates remain frontend independent. Future desktop code is expected to use T
 
 ## Performance
 
-Cargo bench for Koren documents runs workspace/document workloads. Cargo bench for Koren tasks covers project registration/enumeration, task registration/start, output capture, and concurrent children. Measurements and environment are recorded in BENCHMARKS.md. They are baselines for later comparisons, not targets or full IDE performance claims.
+Cargo bench for Koren documents runs workspace/document workloads. Cargo bench for Koren tasks covers project registration/enumeration, task registration/start, output capture, and concurrent children. Source inspection found task completion polling every 10 ms; the supervisor interval is now 1 ms. The same Linux benchmark dropped mean task completion from about 10.1 ms to 1.15 ms and four-child completion from 11.2 ms to 2.43 ms. Output capture remains dominated by child startup and scheduling. Measurements and environment are recorded in BENCHMARKS.md; they are local baselines, not full IDE performance claims.
 
 ## Verification
 
-The minimum supported compiler is Rust 1.85. CI has a direct 1.85 build/test job, plus Linux, macOS, and Windows build/unit/integration jobs. The complete PR suite (formatting, Clippy, tests, architecture, Python integration, and clean locked build) runs on Linux.
+The minimum supported compiler is Rust 1.85. CI has a direct 1.85 build/test job, plus Linux, macOS, and Windows build/unit/integration jobs. The complete PR suite (formatting, Clippy, tests, architecture, Python integration, and clean locked build) runs on Linux. The Phase 4 local run verified Linux and Rust 1.85; macOS and Windows CI jobs remain unverified until those jobs run successfully.

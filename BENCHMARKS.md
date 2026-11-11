@@ -52,4 +52,18 @@ Environment: Linux x86_64, kernel 7.2.9-310.t2.fc44.x86_64; Intel Core i7-1068NG
 | Output capture, 32 KiB stdout and stderr | 5 | 59,051.2 µs | 17,482.1 µs |
 | Four concurrent child completions | 4 | 11,187.0 µs | — |
 
-The approximately 10 ms completion floor includes the supervisor's 10 ms child-status polling interval. The output workload includes child creation, output production, pipe draining, and capture, and should not be read as an isolated byte-copy measurement. These values are local backend baselines only; rerun them on target hardware and storage before comparing.
+The original approximately 10 ms completion floor came from the supervisor's 10 ms child-status polling interval. The output workload includes child creation, output production, pipe draining, and capture, and should not be read as an isolated byte-copy measurement. These values are local backend baselines only; rerun them on target hardware and storage before comparing.
+
+## Phase 4 task completion remeasurement
+
+Source inspection confirmed the supervisor called `Child::try_wait` every 10 ms. The process has a dedicated supervisor thread already, so the poll interval was reduced to 1 ms without blocking unrelated platform work or changing cancellation and timeout paths. One remeasurement on the same Linux machine and optimized profile produced:
+
+| Workload | Original Phase 3 mean | After 1 ms polling | Notes |
+|---|---:|---:|---|
+| Task completion, including child startup and exit | 10,118.8 µs | 1,150.8 µs | About 88.6% lower; includes process startup and monitor scheduling |
+| Four concurrent child completions | 11,187.0 µs | 2,427.7 µs | About 78.3% lower; includes process startup |
+| Direct process startup and exit baseline | 648.2 µs | 627.9 µs | OS/process fixture baseline |
+| Task start dispatch, including OS spawn | 342.6 µs | 235.1 µs | Includes pipe setup and reader-thread creation; not a pure Koren dispatch cost |
+| Output capture, 32 KiB stdout and stderr | 59,051.2 µs | 49,747.6 µs | Includes child startup and scheduling; variation is too large to attribute to copying |
+
+The completion change tracks the removed 10 ms polling floor. This is a single local run, not a cross-platform result. Output capture remains dominated by child startup, pipe scheduling, and fixture behavior; the benchmark does not isolate those costs or justify a claim about byte-copy performance. The 1 ms poll keeps bounded completion latency with a dedicated waiting thread, at the cost of more wakeups for long-running tasks.

@@ -151,6 +151,20 @@ pub enum RequestMethod {
         /// Manager-local project identifier.
         project_id: u64,
     },
+    /// Explicitly discover Cargo projects without running Cargo or a project command.
+    DiscoverCargoProjects {
+        /// Maximum directories to inspect.
+        max_directories: usize,
+        /// Maximum Cargo roots to return.
+        max_projects: usize,
+        /// Maximum directory nesting, with workspace root at depth zero.
+        max_depth: usize,
+    },
+    /// Retrieve manifest-derived Cargo information for one project.
+    CargoProjectInfo {
+        /// Manager-local project identifier.
+        project_id: u64,
+    },
     /// Register a direct-process task definition. Registration does not authorize execution.
     RegisterTask {
         /// Stable key within the project scope.
@@ -178,6 +192,23 @@ pub enum RequestMethod {
     StartTask {
         /// Task definition identifier.
         task_id: u64,
+    },
+    /// Request host-controlled execution of one task definition.
+    RequestTaskExecution {
+        /// Task definition identifier.
+        task_id: u64,
+    },
+    /// List unexpired task execution requests awaiting host approval.
+    ListPendingApprovals,
+    /// Approve and consume one exact pending execution request.
+    ApproveTaskExecution {
+        /// One-time approval request identifier.
+        request_id: u64,
+    },
+    /// Deny and consume one pending execution request.
+    DenyTaskExecution {
+        /// One-time approval request identifier.
+        request_id: u64,
     },
     /// Query lifecycle state.
     TaskStatus {
@@ -365,6 +396,10 @@ pub enum ResponseValue {
         /// Removed project identifier.
         project_id: u64,
     },
+    /// Cargo projects discovered within explicit traversal bounds.
+    CargoProjects(Vec<CargoProjectSummary>),
+    /// Typed Cargo information for one logical project.
+    CargoProject(CargoProjectSummary),
     /// Task definition registered.
     TaskRegistered {
         /// Registered task identifier.
@@ -376,6 +411,22 @@ pub enum ResponseValue {
     TaskStarted {
         /// Started run identifier.
         run_id: u64,
+    },
+    /// Execution request is awaiting one-time approval.
+    ApprovalRequired(ExecutionApprovalSummary),
+    /// Pending requests in manager-local identifier order.
+    PendingApprovals(Vec<ExecutionApprovalSummary>),
+    /// Approved request and started task run.
+    TaskApproved {
+        /// Consumed request identifier.
+        request_id: u64,
+        /// New task run identifier.
+        run_id: u64,
+    },
+    /// Denied request was consumed without starting a process.
+    TaskDenied {
+        /// Consumed request identifier.
+        request_id: u64,
     },
     /// Task state and bounded output snapshot.
     TaskSnapshot {
@@ -476,6 +527,72 @@ pub struct TaskSummary {
     pub timeout_ms: Option<u64>,
     /// Associated project identifier.
     pub project_id: Option<u64>,
+}
+
+/// Typed Cargo target information returned by the headless session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CargoTargetSummary {
+    /// Target name.
+    pub name: String,
+    /// Normalized target kind.
+    pub kind: String,
+    /// Source path when known.
+    pub source_path: Option<String>,
+}
+
+/// Package information from a local Cargo manifest.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CargoPackageSummary {
+    /// Package name.
+    pub name: String,
+    /// Package version, if declared directly in this manifest.
+    pub version: Option<String>,
+    /// Workspace-relative manifest path.
+    pub manifest_path: String,
+    /// Declared or conventionally detected targets.
+    pub targets: Vec<CargoTargetSummary>,
+}
+
+/// Cargo workspace or package attached to a language-neutral Koren project.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CargoProjectSummary {
+    /// General logical project fields.
+    pub project: ProjectSummary,
+    /// Whether the manifest declares a Cargo workspace.
+    pub is_workspace: bool,
+    /// Package represented by the root manifest, when present.
+    pub package: Option<CargoPackageSummary>,
+    /// Packages declared as workspace members.
+    pub members: Vec<CargoPackageSummary>,
+}
+
+/// Safe presentation view of one pending execution approval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionApprovalSummary {
+    /// One-time approval request identifier.
+    pub request_id: u64,
+    /// Task definition identifier.
+    pub task_id: u64,
+    /// Task's stable key.
+    pub task_key: String,
+    /// Human-readable task name.
+    pub display_name: String,
+    /// Executable to be started.
+    pub executable: String,
+    /// Exact argv to be started.
+    pub arguments: Vec<String>,
+    /// Working directory.
+    pub working_directory: String,
+    /// Names of environment variables overridden; values are intentionally omitted.
+    pub environment_keys: Vec<String>,
+    /// Associated logical project, if any.
+    pub project_id: Option<u64>,
+    /// Workspace scope invalidating this request on close.
+    pub workspace_root: String,
+    /// Requesting actor known to this host.
+    pub requesting_actor: String,
+    /// Remaining request lifetime in milliseconds when serialized.
+    pub expires_in_ms: u64,
 }
 
 /// Versioned response envelope for internal consumers.
@@ -599,6 +716,39 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Response>(&serde_json::to_string(&response).unwrap()).unwrap(),
             response
+        );
+
+        let approval_request = Request::new(12, RequestMethod::RequestTaskExecution { task_id: 8 });
+        let encoded = serde_json::to_string(&approval_request).unwrap();
+        assert!(encoded.contains("\"version\":2"));
+        assert!(encoded.contains("request_task_execution"));
+        assert_eq!(
+            serde_json::from_str::<Request>(&encoded).unwrap(),
+            approval_request
+        );
+        let approval = Response::new(
+            12,
+            Ok(ResponseValue::ApprovalRequired(ExecutionApprovalSummary {
+                request_id: 4,
+                task_id: 8,
+                task_key: "cargo.metadata".into(),
+                display_name: "Cargo offline metadata".into(),
+                executable: "cargo".into(),
+                arguments: vec!["metadata".into(), "--offline".into()],
+                working_directory: "/workspace".into(),
+                environment_keys: vec!["TOKEN".into()],
+                project_id: Some(3),
+                workspace_root: "/workspace".into(),
+                requesting_actor: "interactive_user".into(),
+                expires_in_ms: 120_000,
+            })),
+        );
+        let encoded = serde_json::to_string(&approval).unwrap();
+        assert!(encoded.contains("approval_required"));
+        assert!(!encoded.contains("secret-value"));
+        assert_eq!(
+            serde_json::from_str::<Response>(&encoded).unwrap(),
+            approval
         );
     }
 }

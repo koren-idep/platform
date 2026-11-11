@@ -192,3 +192,114 @@ def test_session_explicit_bounded_marker_discovery(tmp_path):
     assert len(discovered) == 1
     assert discovered[0]["root"] == str(pathlib.Path("nested") / "demo")
     assert discovered[0]["configuration_path"] == str(pathlib.Path("nested") / "demo" / "project.marker")
+
+
+def test_cargo_workspace_discovery_and_approved_offline_metadata(tmp_path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["crates/*"]\nresolver = "2"\n', encoding="utf-8"
+    )
+    package = tmp_path / "crates" / "demo"
+    (package / "src").mkdir(parents=True)
+    (package / "Cargo.toml").write_text(
+        '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8"
+    )
+    (package / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+
+    process = subprocess.Popen(
+        [str(BIN), "session", "--stdio"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    request_id = 0
+
+    def request(method):
+        nonlocal request_id
+        request_id += 1
+        process.stdin.write(json.dumps({"version": 2, "request_id": request_id, "method": method}) + "\n")
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())
+
+    try:
+        assert "Ok" in request({"method": "open_workspace", "params": {"path": str(tmp_path)}})["result"]
+        discovered = request({"method": "discover_cargo_projects", "params": {
+            "max_directories": 32, "max_projects": 8, "max_depth": 8,
+        }})["result"]["Ok"]["value"]
+        assert len(discovered) == 1
+        cargo_project = discovered[0]
+        assert cargo_project["is_workspace"] is True
+        assert [member["name"] for member in cargo_project["members"]] == ["demo"]
+        project_id = cargo_project["project"]["project_id"]
+        info = request({"method": "cargo_project_info", "params": {"project_id": project_id}})
+        assert info["result"]["Ok"]["value"]["members"][0]["version"] == "0.1.0"
+
+        task_list = request({"method": "list_tasks"})["result"]["Ok"]["value"]
+        metadata_task = next(task for task in task_list if task["key"].endswith("metadata"))
+        assert {task["category"] for task in task_list} >= {"build", "check", "test", "clean"}
+        requested = request({"method": "request_task_execution", "params": {"task_id": metadata_task["task_id"]}})
+        approval = requested["result"]["Ok"]["value"]
+        assert requested["result"]["Ok"]["kind"] == "approval_required"
+        assert "--offline" in approval["arguments"]
+        pending = request({"method": "list_pending_approvals"})["result"]["Ok"]["value"]
+        assert [entry["request_id"] for entry in pending] == [approval["request_id"]]
+
+        approved = request({"method": "approve_task_execution", "params": {"request_id": approval["request_id"]}})
+        run_id = approved["result"]["Ok"]["value"]["run_id"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            result = request({"method": "task_output", "params": {"run_id": run_id}})
+            snapshot = result["result"]["Ok"]["value"]
+            if snapshot["state"] != "running":
+                break
+        assert snapshot["state"] == "succeeded", snapshot
+        assert any(package["name"] == "demo" for package in json.loads(snapshot["stdout"])["packages"])
+        assert "SECRET" not in json.dumps(approval)
+
+        build_task = next(task for task in task_list if task["category"] == "build")
+        pending = request({"method": "request_task_execution", "params": {"task_id": build_task["task_id"]}})
+        pending_id = pending["result"]["Ok"]["value"]["request_id"]
+        request({"method": "unregister_project", "params": {"project_id": project_id}})
+        stale = request({"method": "approve_task_execution", "params": {"request_id": pending_id}})
+        assert stale["result"]["Err"]["code"] == "not_found"
+        assert "Ok" in request({"method": "close_workspace"})["result"]
+    finally:
+        process.stdin.close()
+        assert process.wait(timeout=10) == 0, process.stderr.read()
+        assert process.stderr.read() == ""
+
+
+def test_task_approval_denial_does_not_spawn_and_hides_environment_values(tmp_path):
+    marker = tmp_path / "should-not-exist.txt"
+    process = subprocess.Popen(
+        [str(BIN), "session", "--stdio"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    request_id = 0
+
+    def request(method):
+        nonlocal request_id
+        request_id += 1
+        process.stdin.write(json.dumps({"version": 2, "request_id": request_id, "method": method}) + "\n")
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())
+
+    try:
+        request({"method": "open_workspace", "params": {"path": str(tmp_path)}})
+        task_id = request({"method": "register_task", "params": {
+            "key": "write-marker", "display_name": "Write marker", "category": "custom",
+            "executable": sys.executable,
+            "arguments": ["-c", "from pathlib import Path; Path(" + repr(str(marker)) + ").write_text('ran')"],
+            "working_directory": ".", "environment": {"API_SECRET": "hidden-value"},
+            "timeout_ms": 5000, "project_id": None,
+        }})["result"]["Ok"]["value"]["task_id"]
+        approval = request({"method": "request_task_execution", "params": {"task_id": task_id}})["result"]["Ok"]["value"]
+        assert approval["environment_keys"] == ["API_SECRET"]
+        assert "hidden-value" not in json.dumps(approval)
+        denied = request({"method": "deny_task_execution", "params": {"request_id": approval["request_id"]}})
+        assert denied["result"]["Ok"]["kind"] == "task_denied"
+        repeated = request({"method": "approve_task_execution", "params": {"request_id": approval["request_id"]}})
+        assert repeated["result"]["Err"]["code"] == "not_found"
+        assert not marker.exists()
+        assert "Ok" in request({"method": "close_workspace"})["result"]
+    finally:
+        process.stdin.close()
+        assert process.wait(timeout=5) == 0, process.stderr.read()
+        assert process.stderr.read() == ""
