@@ -25,6 +25,9 @@ koren-documents = { workspace = true }
 koren-projects = { workspace = true }
 koren-tasks = { workspace = true }
 koren-cargo = { workspace = true }
+koren-extensions = { workspace = true }
+koren-lua = { workspace = true }
+koren-lsp = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"

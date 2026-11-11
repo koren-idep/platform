@@ -1,8 +1,9 @@
 import { redo, redoDepth, selectAll, undo, undoDepth } from '@codemirror/commands';
 import { EditorState } from '@codemirror/state';
 import { basicSetup, EditorView } from 'codemirror';
+import { linter, setDiagnostics, type Diagnostic as CodeMirrorDiagnostic } from '@codemirror/lint';
 import { KorenClient, KorenError, createDesktopTransport } from './services/client';
-import type { CargoProjectSummary, ExecutionApprovalSummary, PlatformEvent, ResponseValue, TaskSummary } from './services/protocol';
+import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionMenuSummary, ExtensionSummary, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ResponseValue, TaskSummary, TextRange } from './services/protocol';
 import { approvalChoice, conflictChoice } from './app/dialogs';
 import { filterCommands, nextCommandSelection } from './app/commands';
 import { readLayout, persistLayout, type LayoutPreferences } from './app/layout';
@@ -10,11 +11,14 @@ import { formatCursorPosition, lineEndingFor } from './app/status';
 import { runConfigurationTasks, selectedRunTask } from './app/toolbar';
 import { nextTheme, persistTheme, readTheme } from './app/theme';
 import { taskStatus, visibleOutput } from './app/taskPresentation';
+import { extensionCanActivate, extensionToggleLabel, languageServerEnabled } from './app/extensions';
+import { diagnosticsForRevision, withDiagnosticPublication } from './app/diagnostics';
 import { ProjectTreeState, TabState, type EditorTab } from './app/state';
 import { DocumentEditPipeline } from './editor/sync';
 import { editsFromViewUpdate } from './editor/transactions';
 import { languageForPath, languageNameForPath } from './editor/languages';
 import { flushAndSave } from './editor/save';
+import { languageServiceExtensions } from './editor/languageServices';
 import './styles/main.css';
 
 const client = new KorenClient(createDesktopTransport());
@@ -53,6 +57,7 @@ app.innerHTML = `
         <button role="menuitem" data-action="focus-editor">Focus Editor <kbd>F6</kbd></button>
         <div class="menu-separator"></div><button role="menuitem" data-action="previous-tab">Previous Tab <kbd>Ctrl+Shift+Tab</kbd></button>
         <button role="menuitem" data-action="next-tab">Next Tab <kbd>Ctrl+Tab</kbd></button>
+        <div id="extension-navigate-items"></div>
       </div></details>
       <details class="menu-group"><summary>Run</summary><div class="menu-popup" role="menu">
         <button role="menuitem" data-action="discover">Discover Cargo Projects</button>
@@ -65,6 +70,8 @@ app.innerHTML = `
       </div></details>
       <details class="menu-group"><summary>Tools</summary><div class="menu-popup" role="menu">
         <button role="menuitem" data-action="command-palette">Command Palette… <kbd>Ctrl+Shift+P</kbd></button>
+        <button role="menuitem" data-action="extensions">Extensions…</button>
+        <div id="extension-tools-items"></div>
         <button role="menuitem" data-action="copy-path">Copy Current File Path</button>
         <button role="menuitem" data-action="refresh">Refresh Project Explorer</button>
       </div></details>
@@ -137,6 +144,8 @@ app.innerHTML = `
   <dialog id="close-dialog" class="dialog"><form method="dialog"><header>Unsaved documents</header><p>Save your changes before closing Koren Code Editor?</p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="discard" class="secondary">Discard and close</button><button value="save" class="primary">Save all and close</button></div></form></dialog>
   <dialog id="switch-workspace-dialog" class="dialog"><form method="dialog"><header>Switch workspace?</header><p>Choose what to do with open documents before changing folders.</p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="discard" class="secondary">Discard and switch</button><button value="save" class="primary">Save and switch</button></div></form></dialog>
   <dialog id="command-dialog" class="dialog command-dialog"><form method="dialog"><header>Command Palette</header><input id="command-search" type="search" placeholder="Search available commands" autocomplete="off" aria-label="Search commands"><div id="command-results" role="listbox" aria-label="Available commands"></div><footer><kbd>↑</kbd><kbd>↓</kbd> navigate <kbd>Enter</kbd> run <kbd>Esc</kbd> close</footer></form></dialog>
+  <dialog id="extensions-dialog" class="dialog extensions-dialog"><form method="dialog"><header>Extensions</header><p class="subtle">Local extensions from the configured Koren extensions folder. Code runs only after you enable and activate it.</p><div id="extension-list" class="extension-list"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
+  <dialog id="language-server-approval-dialog" class="dialog"><form method="dialog"><header>Start language server?</header><p class="subtle">This starts an external program with your user account permissions. Approval is not a sandbox. Review the exact command and workspace.</p><dl id="language-server-approval-details"></dl><div class="dialog-actions"><button value="deny" class="secondary">Deny</button><button value="approve" class="primary">Approve and start</button></div></form></dialog>
   <dialog id="settings-dialog" class="dialog settings-dialog"><form method="dialog"><header>Settings</header><label for="theme-setting">Color theme</label><select id="theme-setting"><option value="dark">OLED Black</option><option value="light">Light</option></select><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="info-dialog" class="dialog"><form method="dialog"><header id="info-title"></header><div id="info-content" class="info-content"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <div id="status-toast" role="status" aria-live="polite"></div>`;
@@ -160,7 +169,11 @@ let selectedPath = '';
 let runId: number | null = null;
 const documentViews = new Map<number, { state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF' }>();
 const taskById = new Map<number, TaskSummary>();
+const activeLanguageServers = new Map<string, number>();
+const diagnosticsByDocument = new Map<number, Map<string, LanguageDiagnosticSet>>();
+let editorContextMenus: ExtensionMenuSummary[] = [];
 let registeredCommands: string[] = [];
+const commandLabels = new Map<string, string>();
 let editor: EditorView | null = null;
 let outputRefreshTimer = 0;
 let toastTimer = 0;
@@ -319,6 +332,12 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
   const lineEnding = lineEndingFor(contents);
   const lineSeparator = lineEnding === 'CRLF' ? '\r\n' : '\n';
   const languageExtensions = await languageForPath(tab.path);
+  const serviceExtensions = languageServiceExtensions(client, {
+    documentId: tab.id,
+    revision: () => documentViews.get(tab.id)?.pipeline.currentRevision ?? revision,
+    flush: () => documentViews.get(tab.id)?.pipeline.flush() ?? Promise.resolve(),
+    navigate: navigateToDefinition,
+  });
   const theme = EditorView.theme({
     '&': { height: '100%', color: 'var(--text)', backgroundColor: 'var(--bg)' },
     '.cm-content': { caretColor: 'var(--accent)' },
@@ -330,12 +349,16 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
   });
   const state = EditorState.create({
     doc: contents,
-    extensions: [basicSetup, theme, EditorState.tabSize.of(4), EditorState.lineSeparator.of(lineSeparator), EditorView.lineWrapping, ...languageExtensions,
+    extensions: [basicSetup, linter(() => []), theme, EditorState.tabSize.of(4), EditorState.lineSeparator.of(lineSeparator), EditorView.lineWrapping, ...languageExtensions, ...serviceExtensions,
       EditorView.updateListener.of((update) => {
         const entry = documentViews.get(tab.id);
         if (!entry) return;
         entry.state = update.state;
-        if (update.docChanged) entry.pipeline.enqueue(editsFromViewUpdate(update));
+        if (update.docChanged) {
+          entry.pipeline.enqueue(editsFromViewUpdate(update));
+          diagnosticsByDocument.delete(tab.id);
+          queueMicrotask(() => { if (tabs.activeId === tab.id) renderLanguageDiagnostics(tab.id); renderProblems(); });
+        }
         if (update.docChanged || update.selectionSet || update.focusChanged) updateStatusDocument();
       })],
   });
@@ -379,7 +402,9 @@ function selectTab(id: number): void {
   if (!tab) return;
   selectedPath = tab.path;
   const entry = documentViews.get(id); if (entry && editor) editor.setState(entry.state);
+  renderLanguageDiagnostics(id);
   renderTree(); renderTabs(); updateStatusDocument(); editor?.focus();
+  void client.call({ method: 'read_document', params: { document_id: id } }).catch(showError);
 }
 
 function updateStatusDocument(): void {
@@ -421,7 +446,7 @@ async function closeTab(tab: EditorTab): Promise<void> {
     await documentViews.get(tab.id)?.pipeline.flush();
     await client.call({ method: 'close_document', params: { document_id: tab.id, discard_unsaved_changes: action === 'discard' } });
     const wasActive = tabs.activeId === tab.id;
-    tabs.close(tab.id); documentViews.delete(tab.id);
+    tabs.close(tab.id); documentViews.delete(tab.id); diagnosticsByDocument.delete(tab.id); renderProblems();
     if (wasActive && tabs.activeId !== null) selectTab(tabs.activeId); else renderTabs();
     updateStatusDocument();
   } catch (error) { showError(error); }
@@ -674,6 +699,16 @@ function handlePlatformEvent(event: PlatformEvent): void {
   if (event.kind === 'task_output_available' && event.run_id) queueOutputRefresh(event.run_id);
   if (event.kind === 'task_finished' && event.run_id) void updateTaskOutput(event.run_id);
   if (event.kind === 'save_conflict_detected') setStatus('File changed outside Koren; review the save conflict.');
+  if (event.kind === 'language_diagnostics' && event.document_id && event.diagnostics) {
+    const providers = withDiagnosticPublication(diagnosticsByDocument.get(event.document_id), event.diagnostics);
+    diagnosticsByDocument.set(event.document_id, providers);
+    renderLanguageDiagnostics(event.document_id); renderProblems();
+  }
+  if (event.kind === 'language_server_error' && event.message) setStatus(event.message);
+  if (event.kind === 'language_server_stopped' && event.server_id) {
+    for (const [key, id] of activeLanguageServers) if (id === event.server_id) { activeLanguageServers.delete(key); clearDiagnosticProviders(key); }
+    if (event.message) setStatus(event.message);
+  }
 }
 
 function setTheme(theme: 'dark' | 'light'): void {
@@ -692,14 +727,193 @@ function showPanel(panel: 'output' | 'problems' | 'tasks' | 'projects'): void {
   setBottomCollapsed(false);
 }
 
+function codeMirrorDiagnostics(documentId: number): CodeMirrorDiagnostic[] {
+  const entry = documentViews.get(documentId);
+  if (!entry) return [];
+  const result: CodeMirrorDiagnostic[] = [];
+  for (const { provider, diagnostic } of diagnosticsForRevision(diagnosticsByDocument.get(documentId), entry.pipeline.currentRevision)) {
+    const from = editorPosition(entry.state.doc, diagnostic.range.start.line, diagnostic.range.start.character);
+    const to = editorPosition(entry.state.doc, diagnostic.range.end.line, diagnostic.range.end.character);
+    const severity = diagnostic.severity === 'information' || diagnostic.severity === null ? 'info' : diagnostic.severity;
+    result.push({ from, to: Math.max(from, to), severity, message: diagnostic.message, source: diagnostic.source ?? provider });
+  }
+  return result;
+}
+
+function editorPosition(doc: EditorState['doc'], lineNumber: number, column: number): number {
+  const line = doc.line(Math.max(1, Math.min(doc.lines, lineNumber + 1)));
+  return Math.max(line.from, Math.min(line.to, line.from + column));
+}
+
+function renderLanguageDiagnostics(documentId: number): void {
+  if (tabs.activeId === documentId && editor) editor.dispatch(setDiagnostics(editor.state, codeMirrorDiagnostics(documentId)));
+}
+
+function renderProblems(): void {
+  const host = document.querySelector<HTMLDivElement>('#problems')!; host.replaceChildren();
+  const rows = [...diagnosticsByDocument.entries()].flatMap(([documentId, providers]) => {
+    const entry = documentViews.get(documentId);
+    if (!entry) return [];
+    return diagnosticsForRevision(providers, entry.pipeline.currentRevision)
+      .map(({ diagnostic, provider }) => ({ documentId, diagnostic, provider }));
+  });
+  document.querySelector('#problem-count')!.textContent = String(rows.length);
+  for (const row of rows) {
+    const button = document.createElement('button'); button.className = 'problem-row';
+    const severity = document.createElement('span'); severity.className = `problem-severity ${row.diagnostic.severity ?? 'information'}`; severity.textContent = row.diagnostic.severity ?? 'info';
+    const message = document.createElement('span'); message.className = 'problem-message'; message.textContent = row.diagnostic.message;
+    const tab = tabs.tabs.find((item) => item.id === row.documentId);
+    const location = document.createElement('span'); location.className = 'problem-location'; location.textContent = `${tab?.title ?? row.provider}:${row.diagnostic.range.start.line + 1}`;
+    button.append(severity, message, location);
+    button.addEventListener('click', () => {
+      selectTab(row.documentId);
+      if (editor) editor.dispatch({ selection: { anchor: editorPosition(editor.state.doc, row.diagnostic.range.start.line, row.diagnostic.range.start.character) }, scrollIntoView: true });
+      showPanel('problems');
+    });
+    host.append(button);
+  }
+  if (!rows.length) host.innerHTML = '<div class="panel-empty">No problems reported by installed language integrations.</div>';
+}
+
+function clearDiagnosticProviders(prefix: string): void {
+  for (const [documentId, providers] of diagnosticsByDocument) {
+    for (const provider of providers.keys()) if (provider === prefix || provider.startsWith(`${prefix}.`)) providers.delete(provider);
+    if (!providers.size) diagnosticsByDocument.delete(documentId);
+    renderLanguageDiagnostics(documentId);
+  }
+  renderProblems();
+}
+
 async function openCommandPalette(): Promise<void> {
   try {
     registeredCommands = expect(await client.call({ method: 'list_commands' }), 'commands').value;
+    const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value;
+    commandLabels.clear();
+    for (const command of catalog.commands) commandLabels.set(command.id, command.title);
     renderCommandResults('');
     const dialog = document.querySelector<HTMLDialogElement>('#command-dialog')!;
     const input = document.querySelector<HTMLInputElement>('#command-search')!;
     input.value = ''; dialog.showModal(); input.focus();
   } catch (error) { showError(error); }
+}
+
+async function openExtensions(): Promise<void> {
+  try {
+    const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value;
+    renderExtensions(catalog);
+    document.querySelector<HTMLDialogElement>('#extensions-dialog')!.showModal();
+  } catch (error) { showError(error); }
+}
+
+function renderExtensions(catalog: ExtensionCatalog): void {
+  editorContextMenus = catalog.menu_items.filter((entry) => entry.location === 'editor_context');
+  for (const [location, hostId] of [['tools', 'extension-tools-items'], ['navigate', 'extension-navigate-items']] as const) {
+    const menu = document.querySelector<HTMLDivElement>(`#${hostId}`)!; menu.replaceChildren();
+    for (const item of catalog.menu_items.filter((entry) => entry.location === location)) {
+      const button = document.createElement('button'); button.setAttribute('role', 'menuitem'); button.textContent = item.label;
+      button.addEventListener('click', () => void executeCommand(item.command_id)); menu.append(button);
+    }
+    if (menu.childElementCount) menu.prepend(Object.assign(document.createElement('div'), { className: 'menu-separator' }));
+  }
+  const host = document.querySelector<HTMLDivElement>('#extension-list')!;
+  host.replaceChildren();
+  for (const extension of catalog.extensions) {
+    const row = document.createElement('article'); row.className = 'extension-row';
+    const details = document.createElement('div'); details.className = 'extension-details';
+    const title = document.createElement('strong'); title.textContent = extension.name;
+    const meta = document.createElement('span'); meta.textContent = `${extension.id} · ${extension.version} · ${extension.state}`;
+    const description = document.createElement('p'); description.textContent = extension.description;
+    details.append(title, meta, description);
+    const actions = document.createElement('div'); actions.className = 'extension-actions';
+    const toggle = document.createElement('button'); toggle.className = 'small-button';
+    toggle.textContent = extensionToggleLabel(extension);
+    toggle.addEventListener('click', () => void changeExtension(extension, !extension.enabled));
+    actions.append(toggle);
+    if (extensionCanActivate(extension)) {
+      const activate = document.createElement('button'); activate.className = 'small-button'; activate.textContent = 'Activate';
+      activate.addEventListener('click', () => void activateExtension(extension.id)); actions.append(activate);
+    }
+    const serverConfigs = catalog.language_servers.filter((server) => server.extension_id === extension.id);
+    for (const server of serverConfigs) {
+      const key = `${server.extension_id}.${server.configuration_id}`;
+      const control = document.createElement('button'); control.className = 'small-button';
+      const activeId = activeLanguageServers.get(key);
+      control.textContent = activeId ? `Stop ${server.configuration_id}` : `Start ${server.configuration_id}`;
+      control.disabled = !languageServerEnabled(extension, server);
+      control.addEventListener('click', () => activeId ? void stopLanguageServer(key, activeId) : void startLanguageServer(server));
+      actions.append(control);
+    }
+    row.append(details, actions);
+    if (extension.error) { const error = document.createElement('p'); error.className = 'extension-error'; error.textContent = extension.error; row.append(error); }
+    host.append(row);
+  }
+  if (!catalog.extensions.length) host.innerHTML = '<div class="panel-empty">No local extensions installed.</div>';
+}
+
+async function startLanguageServer(server: LanguageServerSummary): Promise<void> {
+  try {
+    const result = await client.call({ method: 'start_language_server', params: { extension_id: server.extension_id, configuration_id: server.configuration_id } });
+    if (result.kind === 'language_server_started') {
+      activeLanguageServers.set(`${server.extension_id}.${server.configuration_id}`, result.value.server_id);
+      renderExtensions(expect(await client.call({ method: 'list_extensions' }), 'extensions').value);
+      setStatus(`Started language server ${server.configuration_id}`); return;
+    }
+    if (result.kind !== 'language_server_approval_required') throw new Error(`Unexpected response: ${result.kind}`);
+    const decision = await askLanguageServerApproval(result.value);
+    if (decision === 'approve') {
+      const started = expect(await client.call({ method: 'approve_language_server', params: { approval_id: result.value.approval_id } }), 'language_server_started').value;
+      activeLanguageServers.set(`${started.extension_id}.${started.configuration_id}`, started.server_id);
+      renderExtensions(expect(await client.call({ method: 'list_extensions' }), 'extensions').value);
+      setStatus(`Started language server ${started.configuration_id}`);
+    } else {
+      await client.call({ method: 'deny_language_server', params: { approval_id: result.value.approval_id } });
+      setStatus('Language-server start denied');
+    }
+  } catch (error) { showError(error); }
+}
+
+function askLanguageServerApproval(approval: LanguageServerApprovalSummary): Promise<string> {
+  const details = document.querySelector<HTMLDListElement>('#language-server-approval-details')!; details.replaceChildren();
+  for (const [label, value] of [
+    ['Extension', approval.extension_id], ['Configuration', approval.configuration_id],
+    ['Executable', approval.command], ['Arguments', approval.arguments.join(' ') || '(none)'],
+    ['Working directory', approval.working_directory], ['Environment names', approval.environment_keys.join(', ') || '(none)'],
+  ]) {
+    const term = document.createElement('dt'); term.textContent = label;
+    const description = document.createElement('dd'); description.textContent = value; details.append(term, description);
+  }
+  const dialog = document.querySelector<HTMLDialogElement>('#language-server-approval-dialog')!; dialog.showModal();
+  return new Promise((resolve) => dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true }));
+}
+
+async function stopLanguageServer(key: string, id: number): Promise<void> {
+  try {
+    await client.call({ method: 'stop_language_server', params: { server_id: id } });
+    activeLanguageServers.delete(key);
+    clearDiagnosticProviders(key);
+    renderExtensions(expect(await client.call({ method: 'list_extensions' }), 'extensions').value);
+    setStatus('Language server stopped');
+  } catch (error) { showError(error); }
+}
+
+async function changeExtension(extension: ExtensionSummary, enabled: boolean): Promise<void> {
+  try {
+    await client.call({ method: 'set_extension_enabled', params: { extension_id: extension.id, enabled } });
+    if (!enabled) clearDiagnosticProviders(extension.id);
+    const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value;
+    renderExtensions(catalog); setStatus(`${extension.name} ${enabled ? 'enabled' : 'disabled'}`);
+  } catch (error) { showError(error); }
+}
+
+async function activateExtension(id: string): Promise<void> {
+  try {
+    await client.call({ method: 'activate_extension', params: { extension_id: id } });
+    const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value;
+    renderExtensions(catalog); setStatus(`Activated ${id}`);
+  } catch (error) {
+    showError(error);
+    try { renderExtensions(expect(await client.call({ method: 'list_extensions' }), 'extensions').value); } catch { /* preserve activation error */ }
+  }
 }
 let commandSelection = 0;
 function renderCommandResults(query: string): void {
@@ -708,7 +922,7 @@ function renderCommandResults(query: string): void {
   const host = document.querySelector<HTMLDivElement>('#command-results')!; host.replaceChildren();
   for (const [index, command] of results.entries()) {
     const button = document.createElement('button'); button.setAttribute('role', 'option');
-    button.setAttribute('aria-selected', String(index === commandSelection)); button.textContent = command;
+    button.setAttribute('aria-selected', String(index === commandSelection)); button.textContent = commandLabels.has(command) ? `${commandLabels.get(command)} · ${command}` : command;
     button.addEventListener('mouseenter', () => {
       commandSelection = index;
       for (const option of host.querySelectorAll<HTMLButtonElement>('[role="option"]')) {
@@ -723,6 +937,11 @@ function renderCommandResults(query: string): void {
 async function executeCommand(command: string): Promise<void> {
   document.querySelector<HTMLDialogElement>('#command-dialog')!.close();
   try {
+    const active = tabs.active;
+    if (active) {
+      await documentViews.get(active.id)?.pipeline.flush();
+      await client.call({ method: 'read_document', params: { document_id: active.id } });
+    }
     const result = expect(await client.call({ method: 'execute_command', params: { command_id: command } }), 'command_output').value;
     setStatus(`${command}: ${result}`);
   } catch (error) { showError(error); }
@@ -758,6 +977,7 @@ function handleAction(action: string, target: HTMLElement): void {
     case 'cancel-task': if (runId !== null) void client.call({ method: 'cancel_task', params: { run_id: runId } }).then(() => setStatus('Cancellation requested')).catch(showError); break;
     case 'refresh': if (workspaceRoot) void refreshDirectory(''); else setStatus('Open a workspace first'); break;
     case 'command-palette': void openCommandPalette(); break;
+    case 'extensions': void openExtensions(); break;
     case 'copy-path': void copyCurrentPath(); break;
     case 'shortcuts': showInfo('Keyboard Shortcuts', 'Ctrl+O  Open Folder\nCtrl+Shift+O  Open File\nCtrl+S  Save\nCtrl+W  Close Active Tab\nCtrl+Shift+P  Command Palette\nCtrl+B  Toggle Project Explorer\nCtrl+J  Toggle Bottom Panel\nAlt+T  Toggle Theme\nCtrl+Tab / Ctrl+Shift+Tab  Change Tab\nF6  Focus Editor\nF5  Cancel Active Task'); break;
     case 'about': showInfo('Koren Code Editor', 'A lightweight, universal code editor powered by Koren IDE Platform.\n\nVersion 0.1.0'); break;
@@ -779,7 +999,41 @@ async function copyCurrentPath(): Promise<void> {
   } catch { setStatus('Clipboard access is unavailable'); }
 }
 
+async function navigateToDefinition(uri: string, range: TextRange): Promise<void> {
+  if (!workspaceRoot) return;
+  try {
+    const target = new URL(uri);
+    if (target.protocol !== 'file:') return;
+    let filePath = decodeURIComponent(target.pathname);
+    if (/^\/[A-Za-z]:\//.test(filePath)) filePath = filePath.slice(1);
+    const root = workspaceRoot.replaceAll('\\', '/').replace(/\/$/, '');
+    const candidate = filePath.replaceAll('\\', '/');
+    if (!candidate.startsWith(`${root}/`)) { setStatus('Definition is outside the open workspace'); return; }
+    const relative = candidate.slice(root.length + 1);
+    await openDocument(relative);
+    const active = tabs.active;
+    if (!active || !editor) return;
+    const line = editor.state.doc.line(Math.max(1, Math.min(editor.state.doc.lines, range.start.line + 1)));
+    const position = Math.max(line.from, Math.min(line.to, line.from + range.start.character));
+    editor.dispatch({ selection: { anchor: position }, scrollIntoView: true }); editor.focus();
+  } catch (error) { showError(error); }
+}
+
+document.addEventListener('contextmenu', (event) => {
+  const target = event.target as HTMLElement;
+  if (!target.closest('#editor') || !editorContextMenus.length) return;
+  event.preventDefault();
+  document.querySelector('#editor-context-menu')?.remove();
+  const menu = document.createElement('div'); menu.id = 'editor-context-menu'; menu.className = 'editor-context-menu'; menu.setAttribute('role', 'menu');
+  for (const item of editorContextMenus) {
+    const button = document.createElement('button'); button.setAttribute('role', 'menuitem'); button.textContent = item.label;
+    button.addEventListener('click', () => { menu.remove(); void executeCommand(item.command_id); }); menu.append(button);
+  }
+  menu.style.left = `${event.clientX}px`; menu.style.top = `${event.clientY}px`; document.body.append(menu);
+});
+
 document.addEventListener('click', (event) => {
+  if (!(event.target as HTMLElement).closest('#editor-context-menu')) document.querySelector('#editor-context-menu')?.remove();
   const target = (event.target as HTMLElement).closest<HTMLElement>('[data-action]');
   if (target) handleAction(target.dataset.action ?? '', target);
   if (!(event.target as HTMLElement).closest('.menu-group')) {

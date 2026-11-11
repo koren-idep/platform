@@ -68,11 +68,45 @@ export interface TaskSnapshot {
   stderr: string;
   output_truncated: boolean;
 }
+export interface ExtensionSummary {
+  id: string; name: string; publisher: string; version: string; description: string;
+  enabled: boolean; state: 'disabled' | 'installed' | 'activating' | 'active' | 'failed'; error: string | null;
+}
+export interface ExtensionCommandSummary { id: string; title: string; description: string }
+export interface ExtensionMenuSummary { command_id: string; label: string; location: string }
+export interface ExtensionCatalog { extensions: ExtensionSummary[]; commands: ExtensionCommandSummary[]; menu_items: ExtensionMenuSummary[]; language_servers: LanguageServerSummary[] }
+export interface LanguageServerSummary {
+  extension_id: string; configuration_id: string; command: string; arguments: string[];
+  languages: string[]; file_extensions: string[]; environment_keys: string[];
+}
+export interface LanguageServerApprovalSummary {
+  approval_id: number; extension_id: string; configuration_id: string; command: string;
+  arguments: string[]; working_directory: string; environment_keys: string[];
+}
+export type DiagnosticSeverity = 'error' | 'warning' | 'information' | 'hint' | null;
+export interface LanguageDiagnostic {
+  uri: string; range: TextRange; severity: DiagnosticSeverity; message: string; source: string | null;
+  code: string | null; related_information: Array<{ uri: string; range: TextRange; message: string }>;
+  document_revision: number | null; document_version: number | null;
+}
+export interface LanguageDiagnosticSet {
+  provider_id: string; uri: string; document_version: number | null; document_id: number | null; diagnostics: LanguageDiagnostic[];
+}
 
 export type RequestMethod =
   | { method: 'ping' }
   | { method: 'list_commands' }
   | { method: 'execute_command'; params: { command_id: string } }
+  | { method: 'list_extensions' }
+  | { method: 'set_extension_enabled'; params: { extension_id: string; enabled: boolean } }
+  | { method: 'activate_extension'; params: { extension_id: string } }
+  | { method: 'start_language_server'; params: { extension_id: string; configuration_id: string } }
+  | { method: 'approve_language_server'; params: { approval_id: number } }
+  | { method: 'deny_language_server'; params: { approval_id: number } }
+  | { method: 'stop_language_server'; params: { server_id: number } }
+  | { method: 'language_hover'; params: { document_id: number; expected_revision: number; position: TextPosition } }
+  | { method: 'language_completion'; params: { document_id: number; expected_revision: number; position: TextPosition } }
+  | { method: 'language_definition'; params: { document_id: number; expected_revision: number; position: TextPosition } }
   | { method: 'open_workspace'; params: { path: string } }
   | { method: 'close_workspace' }
   | { method: 'list_directory'; params: { path: string } }
@@ -110,6 +144,16 @@ export type ResponseValue =
   | { kind: 'pong' }
   | { kind: 'commands'; value: string[] }
   | { kind: 'command_output'; value: string }
+  | { kind: 'extensions'; value: ExtensionCatalog }
+  | { kind: 'extension_changed'; value: ExtensionSummary }
+  | { kind: 'language_servers'; value: LanguageServerSummary[] }
+  | { kind: 'language_server_approval_required'; value: LanguageServerApprovalSummary }
+  | { kind: 'language_server_started'; value: { server_id: number; extension_id: string; configuration_id: string } }
+  | { kind: 'language_server_denied'; value: { approval_id: number } }
+  | { kind: 'language_server_stopped'; value: { server_id: number } }
+  | { kind: 'language_hover'; value: { document_revision: number; contents: string | null; range: TextRange | null } }
+  | { kind: 'language_completions'; value: { document_revision: number; items: Array<{ label: string; detail: string | null; insert_text: string | null; documentation: string | null }> } }
+  | { kind: 'language_definitions'; value: { document_revision: number; locations: Array<{ uri: string; range: TextRange }> } }
   | { kind: 'workspace_opened'; value: { root: string } }
   | { kind: 'workspace_closed'; value: { root: string } }
   | { kind: 'directory_entries'; value: DirectoryEntry[] }
@@ -132,4 +176,4 @@ export type ResponseValue =
   | { kind: 'task_cancelled'; value: { run_id: number } }
   | { kind: 'task_cleaned'; value: { run_id: number } };
 
-export interface PlatformEvent { kind: string; document_id?: number; project_id?: number; run_id?: number; revision?: number; root?: string }
+export interface PlatformEvent { kind: string; document_id?: number; project_id?: number; run_id?: number; server_id?: number; revision?: number; root?: string; diagnostics?: LanguageDiagnosticSet; message?: string }

@@ -56,6 +56,69 @@ pub enum RequestMethod {
         /// Identifier of the command to invoke.
         command_id: String,
     },
+    /// List installed extensions and their active command contributions.
+    ListExtensions,
+    /// Explicitly enable an installed extension without executing its code.
+    SetExtensionEnabled {
+        /// Reverse-DNS extension identifier.
+        extension_id: String,
+        /// Whether the extension should be enabled.
+        enabled: bool,
+    },
+    /// Explicitly execute an enabled extension's Lua activation entry point.
+    ActivateExtension {
+        /// Reverse-DNS extension identifier.
+        extension_id: String,
+    },
+    /// Request startup of one declared language server.
+    StartLanguageServer {
+        /// Declaring extension.
+        extension_id: String,
+        /// Configuration identifier from its manifest.
+        configuration_id: String,
+    },
+    /// Approve and consume one exact language-server launch request.
+    ApproveLanguageServer {
+        /// One-time approval identifier.
+        approval_id: u64,
+    },
+    /// Deny and consume one language-server launch request.
+    DenyLanguageServer {
+        /// One-time approval identifier.
+        approval_id: u64,
+    },
+    /// Gracefully stop one active language server.
+    StopLanguageServer {
+        /// Server identifier returned after startup.
+        server_id: u64,
+    },
+    /// Request hover from a server synchronized with the stated revision.
+    LanguageHover {
+        /// Open document identifier.
+        document_id: u64,
+        /// Revision shown by the editor.
+        expected_revision: u64,
+        /// UTF-16 document position.
+        position: TextPosition,
+    },
+    /// Request completions from a server synchronized with the stated revision.
+    LanguageCompletion {
+        /// Open document identifier.
+        document_id: u64,
+        /// Revision shown by the editor.
+        expected_revision: u64,
+        /// UTF-16 document position.
+        position: TextPosition,
+    },
+    /// Request definition locations from a synchronized language server.
+    LanguageDefinition {
+        /// Open document identifier.
+        document_id: u64,
+        /// Revision shown by the editor.
+        expected_revision: u64,
+        /// UTF-16 document position.
+        position: TextPosition,
+    },
     /// Read information about a local directory.
     WorkspaceInfo {
         /// Local filesystem path to inspect.
@@ -328,6 +391,56 @@ pub enum ResponseValue {
     Commands(Vec<String>),
     /// Text returned by a command.
     CommandOutput(String),
+    /// Installed extension metadata and active command contributions.
+    Extensions(ExtensionCatalog),
+    /// Extension lifecycle transition result.
+    ExtensionChanged(ExtensionSummary),
+    /// Installed extension language-server configurations.
+    LanguageServers(Vec<LanguageServerSummary>),
+    /// Host approval is required before the external executable can start.
+    LanguageServerApprovalRequired(LanguageServerApprovalSummary),
+    /// Language server started after approval.
+    LanguageServerStarted {
+        /// Manager-local server identity.
+        server_id: u64,
+        /// Declaring extension.
+        extension_id: String,
+        /// Configuration identifier.
+        configuration_id: String,
+    },
+    /// Language-server approval was denied.
+    LanguageServerDenied {
+        /// Consumed approval identity.
+        approval_id: u64,
+    },
+    /// Language server stopped.
+    LanguageServerStopped {
+        /// Stopped server identity.
+        server_id: u64,
+    },
+    /// Versioned hover content or an empty result.
+    LanguageHover {
+        /// Document revision used for the request.
+        document_revision: u64,
+        /// Plain text or markdown content.
+        contents: Option<String>,
+        /// Optional hover range.
+        range: Option<TextRange>,
+    },
+    /// Versioned completion items.
+    LanguageCompletions {
+        /// Document revision used for the request.
+        document_revision: u64,
+        /// Plain-text completion values.
+        items: Vec<LanguageCompletionItem>,
+    },
+    /// Versioned definition navigation results.
+    LanguageDefinitions {
+        /// Document revision used for the request.
+        document_revision: u64,
+        /// Definition locations.
+        locations: Vec<LanguageLocation>,
+    },
     /// Root path and top-level entry count.
     Workspace {
         /// Canonical workspace root path.
@@ -471,6 +584,122 @@ pub enum ResponseValue {
         /// Run identifier.
         run_id: u64,
     },
+}
+
+/// Extension metadata exposed to the desktop without implementation details.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionSummary {
+    /// Reverse-DNS identifier.
+    pub id: String,
+    /// User-facing name.
+    pub name: String,
+    /// Publisher.
+    pub publisher: String,
+    /// Release version.
+    pub version: String,
+    /// Description.
+    pub description: String,
+    /// Whether explicitly enabled.
+    pub enabled: bool,
+    /// Lifecycle state.
+    pub state: String,
+    /// Last activation error.
+    pub error: Option<String>,
+}
+
+/// Installed extensions and their safe command/menu contributions.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionCatalog {
+    /// Installed extension metadata.
+    pub extensions: Vec<ExtensionSummary>,
+    /// Active namespaced commands.
+    pub commands: Vec<ExtensionCommandSummary>,
+    /// Active typed menu actions.
+    pub menu_items: Vec<ExtensionMenuSummary>,
+    /// Declarative language-server configurations.
+    pub language_servers: Vec<LanguageServerSummary>,
+}
+
+/// A validated extension command contribution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionCommandSummary {
+    /// Namespaced command identifier.
+    pub id: String,
+    /// Display title.
+    pub title: String,
+    /// Short description.
+    pub description: String,
+}
+
+/// Validated extension menu action exposed through the desktop bridge.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionMenuSummary {
+    /// Namespaced command identifier.
+    pub command_id: String,
+    /// Menu label.
+    pub label: String,
+    /// Placement identifier.
+    pub location: String,
+}
+
+/// Declared external language-server command for a workspace.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LanguageServerSummary {
+    /// Declaring extension identifier.
+    pub extension_id: String,
+    /// Manifest-local configuration identifier.
+    pub configuration_id: String,
+    /// Direct executable.
+    pub command: String,
+    /// Direct argument vector.
+    pub arguments: Vec<String>,
+    /// Language identifiers served.
+    pub languages: Vec<String>,
+    /// File suffixes served.
+    pub file_extensions: Vec<String>,
+    /// Environment override names; values are never exposed.
+    pub environment_keys: Vec<String>,
+}
+
+/// Exact launch parameters requiring one-time user approval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LanguageServerApprovalSummary {
+    /// One-time request identifier.
+    pub approval_id: u64,
+    /// Declaring extension identifier.
+    pub extension_id: String,
+    /// Configuration identifier.
+    pub configuration_id: String,
+    /// Executable to be started.
+    pub command: String,
+    /// Exact argument vector.
+    pub arguments: Vec<String>,
+    /// Working directory of the server.
+    pub working_directory: String,
+    /// Environment override names; values are hidden.
+    pub environment_keys: Vec<String>,
+}
+
+/// Plain-text completion information returned through protocol v2.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LanguageCompletionItem {
+    /// Completion label.
+    pub label: String,
+    /// Optional display detail.
+    pub detail: Option<String>,
+    /// Optional insertion text.
+    pub insert_text: Option<String>,
+    /// Optional documentation.
+    pub documentation: Option<String>,
+}
+
+/// A definition target and UTF-16 range.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LanguageLocation {
+    /// File URI.
+    pub uri: String,
+    /// Target range.
+    pub range: TextRange,
 }
 
 /// Serializable project summary with manager-local identity.
@@ -784,6 +1013,56 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Response>(&encoded).unwrap(),
             approval
+        );
+    }
+
+    #[test]
+    fn extension_and_language_service_contracts_are_additive_protocol_v2_variants() {
+        let requests = [
+            RequestMethod::ListExtensions,
+            RequestMethod::SetExtensionEnabled {
+                extension_id: "org.example.hello".into(),
+                enabled: true,
+            },
+            RequestMethod::StartLanguageServer {
+                extension_id: "org.example.lang".into(),
+                configuration_id: "demo".into(),
+            },
+            RequestMethod::LanguageHover {
+                document_id: 4,
+                expected_revision: 9,
+                position: TextPosition {
+                    line: 1,
+                    character: 2,
+                },
+            },
+        ];
+        for method in requests {
+            let request = Request::new(42, method);
+            let encoded = serde_json::to_string(&request).unwrap();
+            assert!(encoded.contains("\"version\":2"));
+            assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), request);
+        }
+        let response = Response::new(
+            42,
+            Ok(ResponseValue::LanguageServerApprovalRequired(
+                LanguageServerApprovalSummary {
+                    approval_id: 2,
+                    extension_id: "org.example.lang".into(),
+                    configuration_id: "demo".into(),
+                    command: "demo-server".into(),
+                    arguments: vec!["--stdio".into()],
+                    working_directory: "/workspace".into(),
+                    environment_keys: vec!["API_TOKEN".into()],
+                },
+            )),
+        );
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(encoded.contains("language_server_approval_required"));
+        assert!(encoded.contains("API_TOKEN"));
+        assert_eq!(
+            serde_json::from_str::<Response>(&encoded).unwrap(),
+            response
         );
     }
 }
