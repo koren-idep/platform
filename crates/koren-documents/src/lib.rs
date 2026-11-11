@@ -617,6 +617,33 @@ impl DocumentManager {
         Ok(info)
     }
 
+    /// Reads the bounded external file contents shown for a pending save conflict.
+    ///
+    /// Returns `None` when the file was deleted. This is a preview only; the later
+    /// conflict decision rechecks that the disk version has not changed again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError::NoPendingConflict`] if no save conflict is pending,
+    /// or the same size, encoding, and filesystem errors as a document read.
+    pub fn conflict_contents(&self, id: DocumentId) -> Result<Option<String>, DocumentError> {
+        let document = self.document(id)?;
+        if document.pending_conflict.is_none() {
+            return Err(DocumentError::NoPendingConflict(id));
+        }
+        let path = document
+            .absolute_path
+            .as_ref()
+            .ok_or(DocumentError::NoBackingFile(id))?;
+        match read_text_file(path, self.max_document_bytes) {
+            Ok((contents, _, _)) => Ok(Some(contents)),
+            Err(DocumentError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resolves a previously detected external modification.
     ///
     /// `Overwrite` writes the in-memory revision only if the file still matches
@@ -1226,6 +1253,10 @@ mod tests {
     #[test]
     fn detects_external_changes_and_requires_explicit_resolution() {
         let (temp, _workspace, mut documents, id) = setup(b"initial");
+        assert!(matches!(
+            documents.conflict_contents(id),
+            Err(DocumentError::NoPendingConflict(document_id)) if document_id == id
+        ));
         documents
             .insert_text(
                 id,
@@ -1242,6 +1273,10 @@ mod tests {
             documents.save(id, 1),
             Err(DocumentError::Conflict(_))
         ));
+        assert_eq!(
+            documents.conflict_contents(id).unwrap().as_deref(),
+            Some("external")
+        );
         assert_eq!(fs::read(temp.0.join("source.rs")).unwrap(), b"external");
         documents
             .resolve_conflict(id, 1, koren_protocol::ConflictDecision::Overwrite)

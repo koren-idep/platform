@@ -99,6 +99,11 @@ pub enum RequestMethod {
         /// Revision the save was requested for.
         expected_revision: u64,
     },
+    /// Read bounded current disk contents after a save conflict was detected.
+    ReadDocumentConflict {
+        /// Document identifier.
+        document_id: u64,
+    },
     /// Resolve a conflict returned by a prior save attempt.
     ResolveDocumentConflict {
         /// Document identifier.
@@ -381,6 +386,15 @@ pub enum ResponseValue {
         revision: u64,
         /// Whether the document remains dirty.
         dirty: bool,
+    },
+    /// External contents for a pending conflict; absent means the file was deleted.
+    DocumentConflictContents {
+        /// Document identifier.
+        document_id: u64,
+        /// Workspace-relative backing path.
+        path: Option<String>,
+        /// External UTF-8 file contents, or `None` if deleted.
+        contents: Option<String>,
     },
     /// Result of closing a document.
     DocumentClosed {
@@ -725,6 +739,27 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Request>(&encoded).unwrap(),
             approval_request
+        );
+        let conflict_preview =
+            Request::new(13, RequestMethod::ReadDocumentConflict { document_id: 6 });
+        let encoded = serde_json::to_string(&conflict_preview).unwrap();
+        assert!(encoded.contains("read_document_conflict"));
+        assert_eq!(
+            serde_json::from_str::<Request>(&encoded).unwrap(),
+            conflict_preview
+        );
+        let preview_response = Response::new(
+            13,
+            Ok(ResponseValue::DocumentConflictContents {
+                document_id: 6,
+                path: Some("src/main.rs".into()),
+                contents: Some("fn main() {}\\n".into()),
+            }),
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&serde_json::to_string(&preview_response).unwrap())
+                .unwrap(),
+            preview_response
         );
         let approval = Response::new(
             12,

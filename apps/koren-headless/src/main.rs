@@ -293,6 +293,7 @@ fn handle_method(
         RequestMethod::ListDirectory { path } => list_directory(session.workspace, path),
         method @ (RequestMethod::OpenDocument { .. }
         | RequestMethod::ReadDocument { .. }
+        | RequestMethod::ReadDocumentConflict { .. }
         | RequestMethod::ApplyDocumentEdits { .. }
         | RequestMethod::SaveDocument { .. }
         | RequestMethod::ResolveDocumentConflict { .. }
@@ -1073,6 +1074,19 @@ fn handle_document_method(
                 contents: snapshot.text,
                 revision: snapshot.info.revision,
                 dirty: snapshot.info.dirty,
+            })
+        }
+        RequestMethod::ReadDocumentConflict { document_id } => {
+            let info = documents
+                .info(DocumentId(document_id))
+                .map_err(|error| document_error(&error))?;
+            let contents = documents
+                .conflict_contents(DocumentId(document_id))
+                .map_err(|error| document_error(&error))?;
+            Ok(ResponseValue::DocumentConflictContents {
+                document_id,
+                path: info.path.map(|path| path.to_string_lossy().into_owned()),
+                contents,
             })
         }
         RequestMethod::ApplyDocumentEdits {
