@@ -18,8 +18,15 @@ def main():
         (sys.executable, "scripts/architecture.py"),
         ("cargo", "build", "--locked", "-p", "koren-headless"),
         (sys.executable, "-m", "pytest", "-q"),
+        ("npm", "ci", "--prefix", "apps/koren-code/frontend"),
+        ("npm", "run", "--prefix", "apps/koren-code/frontend", "typecheck"),
+        ("npm", "run", "--prefix", "apps/koren-code/frontend", "lint"),
+        ("npm", "test", "--prefix", "apps/koren-code/frontend"),
+        ("npm", "run", "--prefix", "apps/koren-code/frontend", "build"),
         ("cargo", "clean"),
         ("cargo", "build", "--workspace", "--locked"),
+        ("cargo", "build", "--release", "--locked", "-p", "koren-code"),
+        ("xvfb-run", "-a", sys.executable, "scripts/desktop_smoke.py", "target/debug/koren-code"),
     ]
     for command in commands:
         if run(*command):

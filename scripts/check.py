@@ -14,6 +14,11 @@ def main():
         ("cargo", "fmt", "--all", "--", "--check"),
         ("cargo", "check", "--workspace", "--locked"),
         (sys.executable, "scripts/architecture.py"),
+        ("npm", "ci", "--prefix", "apps/koren-code/frontend"),
+        ("npm", "run", "--prefix", "apps/koren-code/frontend", "typecheck"),
+        ("npm", "run", "--prefix", "apps/koren-code/frontend", "lint"),
+        ("npm", "test", "--prefix", "apps/koren-code/frontend"),
+        ("npm", "run", "--prefix", "apps/koren-code/frontend", "build"),
     ]
     for command in commands:
         if run(*command):
