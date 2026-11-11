@@ -16,6 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const CHILD_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
 /// Manager-local task definition identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TaskId(u64);
@@ -82,7 +84,7 @@ pub trait TaskAuthorizer: Send + Sync {
     fn authorize(&self, caller: &TaskCaller, task: &TaskDefinition) -> Result<(), TaskError>;
 }
 /// Task definition, independent from execution permission.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct TaskDefinition {
     /// Stable within this manager/provider scope.
     pub key: String,
@@ -102,6 +104,24 @@ pub struct TaskDefinition {
     pub timeout: Option<Duration>,
     /// Optional logical project association.
     pub project_id: Option<u64>,
+}
+impl fmt::Debug for TaskDefinition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskDefinition")
+            .field("key", &self.key)
+            .field("display_name", &self.display_name)
+            .field("category", &self.category)
+            .field("executable", &self.executable)
+            .field("arguments", &self.arguments)
+            .field("working_directory", &self.working_directory)
+            .field(
+                "environment_keys",
+                &self.environment.keys().collect::<Vec<_>>(),
+            )
+            .field("timeout", &self.timeout)
+            .field("project_id", &self.project_id)
+            .finish()
+    }
 }
 /// Task service limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +203,12 @@ pub enum TaskError {
     Unauthorized(String),
     /// Filesystem or process error.
     Io(String),
+    /// An approval request no longer exists.
+    ApprovalNotFound,
+    /// An approval request expired before it was decided.
+    ApprovalExpired,
+    /// An approval request was invalidated by project, workspace, or session closure.
+    ApprovalInvalidated,
 }
 impl fmt::Display for TaskError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -190,6 +216,11 @@ impl fmt::Display for TaskError {
             Self::NotFound => f.write_str("task or run was not found"),
             Self::Invalid(s) | Self::Io(s) => f.write_str(s),
             Self::Unauthorized(s) => write!(f, "task execution denied: {s}"),
+            Self::ApprovalNotFound => f.write_str("execution approval request was not found"),
+            Self::ApprovalExpired => f.write_str("execution approval request expired"),
+            Self::ApprovalInvalidated => {
+                f.write_str("execution approval request was invalidated by closure")
+            }
         }
     }
 }
@@ -243,6 +274,122 @@ pub struct TaskManager {
     events: Arc<Mutex<VecDeque<TaskEvent>>>,
     core_events: Arc<Mutex<VecDeque<PlatformEvent>>>,
 }
+
+/// One-time identifier for a host-mediated task execution request.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExecutionRequestId(u64);
+impl ExecutionRequestId {
+    /// Reconstructs an identifier received from the host protocol.
+    #[must_use]
+    pub const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+    /// Numeric manager-local value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Exact task definition and actor captured when execution was requested.
+///
+/// Environment values are retained in this in-memory snapshot to bind approval to the
+/// actual execution. Its debug representation redacts those values.
+#[derive(Clone)]
+pub struct TaskExecutionSnapshot {
+    /// Task definition identifier.
+    pub task_id: TaskId,
+    /// Immutable task definition captured for this request.
+    pub definition: TaskDefinition,
+    /// Host-supplied actor identity.
+    pub caller: TaskCaller,
+    /// Workspace owning this request; used to invalidate pending work on close.
+    pub workspace_root: PathBuf,
+}
+impl fmt::Debug for TaskExecutionSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskExecutionSnapshot")
+            .field("task_id", &self.task_id)
+            .field("key", &self.definition.key)
+            .field("executable", &self.definition.executable)
+            .field("arguments", &self.definition.arguments)
+            .field("working_directory", &self.definition.working_directory)
+            .field(
+                "environment_keys",
+                &self.definition.environment.keys().collect::<Vec<_>>(),
+            )
+            .field("project_id", &self.definition.project_id)
+            .field("caller", &self.caller)
+            .field("workspace_root", &self.workspace_root)
+            .finish()
+    }
+}
+
+/// Policy outcome for a new execution request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskAuthorizationDecision {
+    /// Execute immediately under the host's deliberately permissive policy.
+    Allow,
+    /// Reject without creating an approval request.
+    Deny(String),
+    /// Wait for a separate host approval decision.
+    RequireApproval,
+}
+
+/// Host policy evaluated against the immutable execution request snapshot.
+pub trait TaskExecutionPolicy: Send + Sync {
+    /// Chooses immediate execution, denial, or explicit approval.
+    fn decide(&self, request: &TaskExecutionSnapshot) -> TaskAuthorizationDecision;
+}
+
+/// Pending request exposed to a host for an approval prompt.
+#[derive(Clone)]
+pub struct TaskExecutionRequest {
+    /// One-time request identifier.
+    pub id: ExecutionRequestId,
+    /// Immutable execution snapshot.
+    pub snapshot: TaskExecutionSnapshot,
+}
+impl fmt::Debug for TaskExecutionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskExecutionRequest")
+            .field("id", &self.id)
+            .field("snapshot", &self.snapshot)
+            .finish()
+    }
+}
+
+/// Result of applying the host's initial execution policy.
+#[derive(Debug)]
+pub enum TaskExecutionRequestOutcome {
+    /// The host policy allowed the request and a run was started.
+    Started(TaskRunId),
+    /// The host must approve or deny this one-time request.
+    ApprovalRequired(Box<TaskExecutionRequest>),
+}
+
+struct PendingExecution {
+    request: TaskExecutionRequest,
+    deadline: Instant,
+}
+
+/// Owns one-time approval requests and binds each approval to an immutable task snapshot.
+///
+/// Pending requests do not consume task concurrency slots. Hosts must explicitly decide each
+/// request. Closing the associated project, workspace, or service invalidates it.
+#[derive(Default)]
+pub struct TaskApprovalManager {
+    next_id: u64,
+    pending: BTreeMap<ExecutionRequestId, PendingExecution>,
+}
+impl fmt::Debug for TaskApprovalManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskApprovalManager")
+            .field("pending_count", &self.pending.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl TaskManager {
     /// Creates an empty task service.
     ///
@@ -303,6 +450,9 @@ impl TaskManager {
     #[must_use]
     pub fn list(&self) -> Vec<(TaskId, &TaskDefinition)> {
         self.definitions.iter().map(|(a, b)| (*a, b)).collect()
+    }
+    fn definition(&self, id: TaskId) -> Result<&TaskDefinition, TaskError> {
+        self.definitions.get(&id).ok_or(TaskError::NotFound)
     }
     /// Starts an authorized task. Process creation happens synchronously; waiting and output collection use background threads.
     ///
@@ -484,6 +634,211 @@ impl TaskManager {
         }
     }
 }
+
+const MAX_PENDING_APPROVALS: usize = 256;
+
+impl TaskApprovalManager {
+    /// Creates an empty approval service.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Applies a host policy to one task and stores an exact one-time approval request when needed.
+    ///
+    /// At most 256 unexpired requests are retained. Each request expires after `ttl` and is
+    /// independent of task concurrency slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown task, denied request, invalid scope or lifetime,
+    /// exhausted request IDs, or a full pending queue.
+    pub fn request_execution(
+        &mut self,
+        tasks: &mut TaskManager,
+        task_id: TaskId,
+        caller: TaskCaller,
+        workspace_root: PathBuf,
+        policy: &dyn TaskExecutionPolicy,
+        ttl: Duration,
+    ) -> Result<TaskExecutionRequestOutcome, TaskError> {
+        self.expire_requests();
+        if ttl.is_zero() || workspace_root.as_os_str().is_empty() {
+            return Err(TaskError::Invalid(
+                "approval lifetime and workspace root must be non-empty".into(),
+            ));
+        }
+        let snapshot = TaskExecutionSnapshot {
+            task_id,
+            definition: tasks.definition(task_id)?.clone(),
+            caller,
+            workspace_root,
+        };
+        match policy.decide(&snapshot) {
+            TaskAuthorizationDecision::Allow => {
+                let run_id = start_snapshot(tasks, &snapshot)?;
+                Ok(TaskExecutionRequestOutcome::Started(run_id))
+            }
+            TaskAuthorizationDecision::Deny(reason) => Err(TaskError::Unauthorized(reason)),
+            TaskAuthorizationDecision::RequireApproval => {
+                if self.pending.len() >= MAX_PENDING_APPROVALS {
+                    return Err(TaskError::Invalid(
+                        "maximum pending execution approval count reached".into(),
+                    ));
+                }
+                let id = ExecutionRequestId(
+                    self.next_id
+                        .checked_add(1)
+                        .ok_or_else(|| TaskError::Invalid("approval id space exhausted".into()))?,
+                );
+                self.next_id = id.0;
+                let deadline = Instant::now()
+                    .checked_add(ttl)
+                    .ok_or_else(|| TaskError::Invalid("approval lifetime is too large".into()))?;
+                let request = TaskExecutionRequest { id, snapshot };
+                let returned_request = request.clone();
+                self.pending
+                    .insert(id, PendingExecution { request, deadline });
+                Ok(TaskExecutionRequestOutcome::ApprovalRequired(Box::new(
+                    returned_request,
+                )))
+            }
+        }
+    }
+
+    /// Lists unexpired requests in creation order, removing any that have expired.
+    pub fn pending_requests(&mut self) -> Vec<&TaskExecutionRequest> {
+        self.expire_requests();
+        self.pending.values().map(|entry| &entry.request).collect()
+    }
+
+    /// Returns the remaining lifetime of one unexpired request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request is missing or expired.
+    pub fn remaining_lifetime(&self, id: ExecutionRequestId) -> Result<Duration, TaskError> {
+        let pending = self.pending.get(&id).ok_or(TaskError::ApprovalNotFound)?;
+        let remaining = pending.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            Err(TaskError::ApprovalExpired)
+        } else {
+            Ok(remaining)
+        }
+    }
+
+    /// Approves and executes a pending request exactly once.
+    ///
+    /// Calling this method is the host's authorization decision. The task definition must still
+    /// match the stored snapshot byte-for-byte, including environment overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing, expired, or invalidated requests and task start failures.
+    pub fn approve(
+        &mut self,
+        tasks: &mut TaskManager,
+        id: ExecutionRequestId,
+    ) -> Result<TaskRunId, TaskError> {
+        let pending = self
+            .pending
+            .remove(&id)
+            .ok_or(TaskError::ApprovalNotFound)?;
+        if Instant::now() >= pending.deadline {
+            return Err(TaskError::ApprovalExpired);
+        }
+        start_snapshot(tasks, &pending.request.snapshot)
+    }
+
+    /// Rejects and consumes a pending request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request does not exist or has expired.
+    pub fn deny(&mut self, id: ExecutionRequestId) -> Result<(), TaskError> {
+        let pending = self
+            .pending
+            .remove(&id)
+            .ok_or(TaskError::ApprovalNotFound)?;
+        if Instant::now() >= pending.deadline {
+            return Err(TaskError::ApprovalExpired);
+        }
+        Ok(())
+    }
+
+    /// Invalidates all pending requests associated with a project.
+    pub fn invalidate_project(&mut self, project_id: u64) -> Vec<ExecutionRequestId> {
+        self.invalidate_where(|request| request.snapshot.definition.project_id == Some(project_id))
+    }
+
+    /// Invalidates all pending requests associated with a workspace root.
+    pub fn invalidate_workspace(
+        &mut self,
+        workspace_root: &std::path::Path,
+    ) -> Vec<ExecutionRequestId> {
+        self.invalidate_where(|request| request.snapshot.workspace_root == workspace_root)
+    }
+
+    /// Invalidates every pending request, for example when the owning session closes.
+    pub fn shutdown(&mut self) -> Vec<ExecutionRequestId> {
+        let ids = self.pending.keys().copied().collect();
+        self.pending.clear();
+        ids
+    }
+
+    /// Removes expired requests and returns their identifiers.
+    pub fn expire_requests(&mut self) -> Vec<ExecutionRequestId> {
+        let now = Instant::now();
+        let ids = self
+            .pending
+            .iter()
+            .filter(|(_, request)| now >= request.deadline)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.pending.remove(id);
+        }
+        ids
+    }
+
+    fn invalidate_where(
+        &mut self,
+        predicate: impl Fn(&TaskExecutionRequest) -> bool,
+    ) -> Vec<ExecutionRequestId> {
+        let ids = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| predicate(&pending.request))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.pending.remove(id);
+        }
+        ids
+    }
+}
+
+struct SnapshotAuthorizer<'a>(&'a TaskDefinition);
+impl TaskAuthorizer for SnapshotAuthorizer<'_> {
+    fn authorize(&self, _caller: &TaskCaller, task: &TaskDefinition) -> Result<(), TaskError> {
+        if task == self.0 {
+            Ok(())
+        } else {
+            Err(TaskError::Unauthorized(
+                "task definition changed after approval request".into(),
+            ))
+        }
+    }
+}
+
+fn start_snapshot(
+    tasks: &mut TaskManager,
+    snapshot: &TaskExecutionSnapshot,
+) -> Result<TaskRunId, TaskError> {
+    let authorizer = SnapshotAuthorizer(&snapshot.definition);
+    tasks.start(snapshot.task_id, &snapshot.caller, &authorizer)
+}
+
 struct OutputReader {
     run_id: TaskRunId,
     limit: usize,
@@ -702,7 +1057,7 @@ fn supervise(
             timed_out = true;
             kill_and_reap(&child);
         }
-        thread::park_timeout(Duration::from_millis(10));
+        thread::park_timeout(CHILD_STATUS_POLL_INTERVAL);
     }
 }
 fn wait_for_readers(readers: &Receiver<()>) {
@@ -864,6 +1219,24 @@ mod tests {
             Err(TaskError::Unauthorized("policy denied".into()))
         }
     }
+    struct RequireApproval;
+    impl TaskExecutionPolicy for RequireApproval {
+        fn decide(&self, _: &TaskExecutionSnapshot) -> TaskAuthorizationDecision {
+            TaskAuthorizationDecision::RequireApproval
+        }
+    }
+    struct AllowImmediately;
+    impl TaskExecutionPolicy for AllowImmediately {
+        fn decide(&self, _: &TaskExecutionSnapshot) -> TaskAuthorizationDecision {
+            TaskAuthorizationDecision::Allow
+        }
+    }
+    struct DenyExecution;
+    impl TaskExecutionPolicy for DenyExecution {
+        fn decide(&self, _: &TaskExecutionSnapshot) -> TaskAuthorizationDecision {
+            TaskAuthorizationDecision::Deny("host denied".into())
+        }
+    }
     fn def(key: &str) -> TaskDefinition {
         TaskDefinition {
             key: key.into(),
@@ -962,6 +1335,20 @@ mod tests {
         let events = m.drain_events();
         assert_eq!(events.first().map(|e| e.kind), Some(TaskEventKind::Started));
         assert_eq!(events.last().map(|e| e.kind), Some(TaskEventKind::Finished));
+        let finished = events
+            .iter()
+            .position(|event| event.kind == TaskEventKind::Finished)
+            .unwrap();
+        assert!(
+            events[..finished]
+                .iter()
+                .any(|event| event.kind == TaskEventKind::OutputAvailable)
+        );
+        assert!(
+            !events[finished + 1..]
+                .iter()
+                .any(|event| event.kind == TaskEventKind::OutputAvailable)
+        );
         m.cleanup(r).unwrap();
         assert!(m.status(r).is_err());
     }
@@ -1082,5 +1469,199 @@ mod tests {
             wait_finished(&manager, second_run).state,
             TaskState::Cancelled
         );
+    }
+
+    #[test]
+    fn approval_is_one_time_and_bound_to_the_stored_command_snapshot() {
+        let mut tasks = TaskManager::new(TaskOptions::default()).unwrap();
+        let mut definition = def("approval-snapshot");
+        definition
+            .environment
+            .insert("TOKEN".into(), "SECRET_VALUE".into());
+        assert!(format!("{definition:?}").contains("environment_keys"));
+        assert!(!format!("{definition:?}").contains("SECRET_VALUE"));
+        let task_id = tasks.register(definition).unwrap();
+        let mut approvals = TaskApprovalManager::new();
+        let outcome = approvals
+            .request_execution(
+                &mut tasks,
+                task_id,
+                TaskCaller::InteractiveUser,
+                env::current_dir().unwrap(),
+                &RequireApproval,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let TaskExecutionRequestOutcome::ApprovalRequired(mut request) = outcome else {
+            panic!("default host policy must require approval");
+        };
+        assert_eq!(request.id.get(), 1);
+        assert_eq!(approvals.pending_requests().len(), 1);
+        assert!(format!("{request:?}").contains("environment_keys"));
+        assert!(!format!("{request:?}").contains("SECRET_VALUE"));
+
+        // The public response is a copy; mutating it cannot change the stored command.
+        request.snapshot.definition.arguments.clear();
+        let run_id = approvals.approve(&mut tasks, request.id).unwrap();
+        assert!(matches!(
+            wait_finished(&tasks, run_id).state,
+            TaskState::Succeeded { .. }
+        ));
+        assert!(
+            tasks
+                .output(run_id)
+                .unwrap()
+                .stdout
+                .contains("fixture:approval-snapshot")
+        );
+        assert!(matches!(
+            approvals.approve(&mut tasks, request.id),
+            Err(TaskError::ApprovalNotFound)
+        ));
+
+        let mut long_definition = def("approved-cancellation");
+        long_definition
+            .environment
+            .insert("KOREN_TASK_FIXTURE".into(), "hold".into());
+        let long_task = tasks.register(long_definition).unwrap();
+        let long_request = approvals
+            .request_execution(
+                &mut tasks,
+                long_task,
+                TaskCaller::InteractiveUser,
+                env::current_dir().unwrap(),
+                &RequireApproval,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let TaskExecutionRequestOutcome::ApprovalRequired(long_request) = long_request else {
+            panic!("expected cancellation task approval");
+        };
+        let long_run = approvals.approve(&mut tasks, long_request.id).unwrap();
+        wait_output(&tasks, long_run, "ready");
+        tasks.cancel(long_run).unwrap();
+        assert_eq!(wait_finished(&tasks, long_run).state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn authorization_decisions_do_not_start_denied_or_pending_tasks() {
+        let mut tasks = TaskManager::new(TaskOptions {
+            max_concurrent: 1,
+            ..TaskOptions::default()
+        })
+        .unwrap();
+        let task_id = tasks.register(def("denied-before-spawn")).unwrap();
+        let mut approvals = TaskApprovalManager::new();
+        assert!(matches!(
+            approvals.request_execution(
+                &mut tasks,
+                task_id,
+                TaskCaller::InteractiveUser,
+                env::current_dir().unwrap(),
+                &DenyExecution,
+                Duration::from_secs(5),
+            ),
+            Err(TaskError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            approvals.request_execution(
+                &mut tasks,
+                task_id,
+                TaskCaller::InteractiveUser,
+                env::current_dir().unwrap(),
+                &RequireApproval,
+                Duration::from_secs(5),
+            ),
+            Ok(TaskExecutionRequestOutcome::ApprovalRequired(_))
+        ));
+        assert!(tasks.status(TaskRunId::from_raw(1)).is_err());
+        assert_eq!(approvals.pending_requests().len(), 1);
+
+        let run_id = match approvals
+            .request_execution(
+                &mut tasks,
+                task_id,
+                TaskCaller::InteractiveUser,
+                env::current_dir().unwrap(),
+                &AllowImmediately,
+                Duration::from_secs(5),
+            )
+            .unwrap()
+        {
+            TaskExecutionRequestOutcome::Started(id) => id,
+            TaskExecutionRequestOutcome::ApprovalRequired(_) => panic!("expected immediate allow"),
+        };
+        assert!(matches!(
+            wait_finished(&tasks, run_id).state,
+            TaskState::Succeeded { .. }
+        ));
+    }
+
+    #[test]
+    fn approvals_are_distinct_expire_and_invalidate_on_scope_close() {
+        let mut tasks = TaskManager::new(TaskOptions::default()).unwrap();
+        let mut project_task = def("project-approval");
+        project_task.project_id = Some(42);
+        let task_id = tasks.register(project_task).unwrap();
+        let mut approvals = TaskApprovalManager::new();
+        let workspace = env::current_dir().unwrap();
+        let make_request = |approvals: &mut TaskApprovalManager, tasks: &mut TaskManager, ttl| {
+            approvals
+                .request_execution(
+                    tasks,
+                    task_id,
+                    TaskCaller::CodingAgent("agent-a".into()),
+                    workspace.clone(),
+                    &RequireApproval,
+                    ttl,
+                )
+                .unwrap()
+        };
+        let first = make_request(&mut approvals, &mut tasks, Duration::from_secs(5));
+        let second = make_request(&mut approvals, &mut tasks, Duration::from_secs(5));
+        let (
+            TaskExecutionRequestOutcome::ApprovalRequired(first),
+            TaskExecutionRequestOutcome::ApprovalRequired(second),
+        ) = (first, second)
+        else {
+            panic!("expected two pending approvals");
+        };
+        assert_ne!(first.id, second.id);
+        assert_eq!(approvals.invalidate_project(42), vec![first.id, second.id]);
+        assert!(matches!(
+            approvals.approve(&mut tasks, first.id),
+            Err(TaskError::ApprovalNotFound)
+        ));
+
+        let workspace_request = make_request(&mut approvals, &mut tasks, Duration::from_secs(5));
+        let TaskExecutionRequestOutcome::ApprovalRequired(workspace_request) = workspace_request
+        else {
+            panic!("expected pending approval");
+        };
+        assert_eq!(
+            approvals.invalidate_workspace(&workspace),
+            vec![workspace_request.id]
+        );
+
+        let expiring = make_request(&mut approvals, &mut tasks, Duration::from_millis(1));
+        let TaskExecutionRequestOutcome::ApprovalRequired(expiring) = expiring else {
+            panic!("expected pending approval");
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while approvals.expire_requests().is_empty() {
+            assert!(Instant::now() < deadline, "approval did not expire");
+            thread::yield_now();
+        }
+        assert!(matches!(
+            approvals.approve(&mut tasks, expiring.id),
+            Err(TaskError::ApprovalNotFound)
+        ));
+
+        let session = make_request(&mut approvals, &mut tasks, Duration::from_secs(5));
+        let TaskExecutionRequestOutcome::ApprovalRequired(session) = session else {
+            panic!("expected pending approval");
+        };
+        assert_eq!(approvals.shutdown(), vec![session.id]);
+        assert!(approvals.pending_requests().is_empty());
     }
 }
