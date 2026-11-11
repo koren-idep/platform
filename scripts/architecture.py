@@ -14,8 +14,9 @@ ALLOWED_INTERNAL_DEPS = {
     "koren-tasks": {"koren-core"},
     "koren-cargo": {"koren-projects", "koren-tasks", "koren-workspace"},
     "koren-headless": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo"},
+    "koren-code": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo"},
 }
-BACKEND_PACKAGES = set(ALLOWED_INTERNAL_DEPS) - {"koren-headless"}
+BACKEND_PACKAGES = set(ALLOWED_INTERNAL_DEPS) - {"koren-headless", "koren-code"}
 FORBIDDEN_BACKEND_DEPS = {
     "tao", "wry", "tauri", "web-view", "webview", "gtk4", "egui", "iced",
     "web-sys", "wasm-bindgen", "js-sys", "deno_core", "boa_engine",

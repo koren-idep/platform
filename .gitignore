@@ -1,4 +1,6 @@
 /target/
+apps/koren-code/frontend/node_modules/
+apps/koren-code/frontend/dist/
 /.pytest_cache/
 __pycache__/
 *.py[cod]

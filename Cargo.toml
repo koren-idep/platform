@@ -10,6 +10,7 @@ members = [
     "crates/koren-tasks",
     "crates/koren-cargo",
     "apps/koren-headless",
+    "apps/koren-code",
 ]
 
 [workspace.package]
