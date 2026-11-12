@@ -130,3 +130,25 @@ One local run on 2026-11-11, Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, In
 | Desktop window launch | 1 smoke run | 172.3 ms; 396,644 KiB process-tree RSS | Window appearance plus one-second RSS sample, with no active LSP process |
 
 The LSP dispatch and round-trip rows are four-sample local microbenchmarks; the bridge rows are one deterministic gated regression run, not latency distributions. The fake servers run locally and do not model rust-analyzer's indexing or diagnostics load. The idle tick counter is Linux-specific and quantized; repeat with a longer interval and on target systems for tighter CPU bounds. The desktop launch smoke validates the virtual-display path only. On this host, `xvfb-run -a` failed because the installed T2 `xvfb-run` script uses a fixed three-second startup delay; a direct `xdpyinfo` probe still could not connect when the application started. The replacement launcher waits until Xvfb writes its `-displayfd` readiness signal, then runs with a fresh X11-only environment. The desktop smoke passed with that launcher. No Windows or macOS GUI environment was run.
+
+## Phase 7 extension contribution measurements
+
+Run the registry/Lua benchmark and the synthetic command-palette filter benchmark with:
+
+```sh
+cargo bench --locked -p koren-lua --bench phase7
+node scripts/bench_phase7_palette.mjs
+```
+
+One local run on 2026-11-11, Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, Intel Core i7-1068NG7 at 2.30 GHz (8 CPUs), Rust `1.99.1`, Node `22.23.1`, optimized Cargo bench profile:
+
+| Workload | Iterations/fixture | Result | What is included |
+|---|---:|---:|---|
+| Empty contribution registry initialization | 100,000 | 0.019 µs mean, 0.017 µs minimum | Empty owner map construction |
+| Lua activation, register 65 commands, panel, setting, theme and diagnostic, registry commit, deactivate | 100 | 257.0 µs mean, 210.3 µs minimum | One in-process Lua VM and contribution transaction; not disk discovery or desktop rendering |
+| Lua allocator after that activation | 1 | 36,828 bytes | Lua VM allocator only, not process RSS |
+| Plain-text tool-window update and drain | 10,000 | 1.485 µs mean, 1.221 µs minimum | Lua callback, bounded queue insert, and host-side drain |
+| Palette filter over 1,000 labeled commands | 10,000 | 120.4 µs mean, 90.7 µs minimum | Synthetic Node filter using the frontend's case-insensitive substring algorithm; excludes DOM rendering and event handling |
+| Process RSS before/after one active extension | 1 | 4,256 KiB / 4,256 KiB (0 KiB sampled delta) | Immediate `/proc/self/status` samples in the benchmark process; 4 KiB granularity and allocator reuse make this too coarse to infer zero extension overhead |
+
+Panel construction and multiple-command registration are measured as part of the activation transaction rather than as separate isolated timings. These are local microbenchmarks, not desktop interaction distributions. Windows and macOS performance were not measured.

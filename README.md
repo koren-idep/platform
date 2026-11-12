@@ -4,7 +4,7 @@ Koren has three related products. **Koren IDE Platform** is the reusable, langua
 
 ## Status
 
-Phases 0 through 5 provide lifecycle primitives, the internal protocol, workspace and document services, language-neutral projects and tasks, optional Cargo integration, host-controlled task approvals, a headless session, and the Koren Code Editor desktop shell. Phase 6 adds versioned extension manifests, explicit local extension lifecycle, a bounded Lua 5.4 runtime, typed contributions, and a reusable LSP process client with host-controlled startup approval. Phase 6.5 moves LSP process I/O into isolated actors and stabilizes Linux desktop smoke startup. Rust remains an optional integration; generic platform services do not require Cargo or rust-analyzer.
+Phases 0 through 5 provide lifecycle primitives, the internal protocol, workspace and document services, language-neutral projects and tasks, optional Cargo integration, host-controlled task approvals, a headless session, and the Koren Code Editor desktop shell. Phase 6 adds versioned extension manifests, explicit local extension lifecycle, a bounded Lua 5.4 runtime, typed contributions, and a reusable LSP process client with host-controlled startup approval. Phase 6.5 moves LSP process I/O into isolated actors and stabilizes Linux desktop smoke startup. Phase 7 extends the shared owner-indexed registry with declarative panels, typed settings, safe theme tokens, command metadata, generic wizard forms, and diagnostic presentation details. Rust remains an optional integration; generic platform services do not require Cargo or rust-analyzer.
 
 ## Build and verify
 
@@ -95,4 +95,4 @@ Build providers can expose zero or more generic TaskDefinition capabilities. The
 
 ## Extensions and language services
 
-The reusable extension manager, Lua 5.4 host adapter, and generic stdio LSP client live in `koren-extensions`, `koren-lua`, and `koren-lsp`. See [docs/EXTENSIONS.md](docs/EXTENSIONS.md) for compatibility, lifecycle, capabilities, process authorization, and local development. The examples include a command/menu extension and an optional rust-analyzer configuration. The editor does not bundle external language servers or implement the future Rust-specialized Koren IDE.
+The reusable extension manager, Lua 5.4 host adapter, and generic stdio LSP client live in `koren-extensions`, `koren-lua`, and `koren-lsp`. See [docs/EXTENSIONS.md](docs/EXTENSIONS.md) for compatibility, lifecycle, capabilities, process authorization, and local development. The Developer Tools example demonstrates the shared command, menu, panel, settings, theme, and diagnostic detail APIs; a separate example declares an optional rust-analyzer integration. The editor does not bundle external language servers or implement the future Rust-specialized Koren IDE.
