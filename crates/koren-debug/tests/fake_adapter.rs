@@ -125,6 +125,17 @@ fn fake_adapter_initializes_stops_inspects_and_disconnects() {
         "{:?}",
         session.info()
     );
+    wait_until("verified breakpoint", || {
+        manager
+            .source_breakpoints(&source)
+            .first()
+            .is_some_and(|breakpoint| breakpoint.verified == Some(true))
+    });
+    assert_eq!(manager.source_breakpoints(&source)[0].actual_line, Some(3));
+    assert!(matches!(
+        session.restart(),
+        Err(koren_debug::DebugError::Unsupported(_))
+    ));
 
     let thread_request = session.threads().unwrap();
     wait_for_response(&manager, &session, thread_request, "threads");
@@ -186,7 +197,7 @@ fn manager_runs_multiple_independent_sessions_and_cleans_them_up() {
 #[test]
 fn failed_initialization_adapter_crash_and_reverse_request_fail_safely() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for mode in ["failed-initialize", "crash"] {
+    for mode in ["failed-initialize", "crash", "disconnect-after-init"] {
         let mut manager = manager_with_fake_adapter_mode(&root, mode);
         let started = manager.start_session("fake.launch", &mut Allow).unwrap();
         let session = manager.session(started.session_id).unwrap();
@@ -203,6 +214,22 @@ fn failed_initialization_adapter_crash_and_reverse_request_fail_safely() {
         assert!(session.info().error.is_some());
         manager.shutdown();
     }
+
+    let mut manager = manager_with_fake_adapter_mode(&root, "out-of-order-response");
+    let started = manager.start_session("fake.launch", &mut Allow).unwrap();
+    let session = manager.session(started.session_id).unwrap();
+    wait_until("out-of-order response ignored", || {
+        session.info().state == DebugSessionState::Paused
+            || session.info().state == DebugSessionState::Failed
+    });
+    assert_eq!(
+        session.info().state,
+        DebugSessionState::Paused,
+        "{:?}",
+        session.info()
+    );
+    session.stop().unwrap();
+    manager.shutdown();
 
     let mut manager = manager_with_fake_adapter_mode(&root, "reverse-request");
     let started = manager.start_session("fake.launch", &mut Allow).unwrap();

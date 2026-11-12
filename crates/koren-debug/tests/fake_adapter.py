@@ -44,6 +44,9 @@ while True:
             send({"seq": 100, "type": "response", "request_seq": request["seq"],
                   "command": command, "success": False, "message": "fixture init failure"})
             break
+        if MODE == "out-of-order-response":
+            send({"seq": 97, "type": "response", "request_seq": request["seq"] + 100,
+                  "command": "threads", "success": True, "body": {}})
         if MODE == "reverse-request":
             send({"seq": 99, "type": "request", "command": "runInTerminal",
                   "arguments": {"kind": "integrated", "args": ["must-not-run"]}})
@@ -59,6 +62,8 @@ while True:
                             "supportsVariablePaging": True,
                             "supportsTerminateRequest": True})
         send({"seq": 101, "type": "event", "event": "initialized", "body": {}})
+        if MODE == "disconnect-after-init":
+            break
     elif command == "launch" or command == "attach":
         response(request)
         send({"seq": 102, "type": "event", "event": "stopped",
