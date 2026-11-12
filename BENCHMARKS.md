@@ -210,7 +210,7 @@ One local run on 2026-11-11, Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, In
 | One-file text diff | 50 runs | 1.36 ms mean, 1.14 ms minimum | Bounded libgit2 patch generation |
 | Stage plus unstage | 50 runs | 1.60 ms mean, 1.31 ms minimum | One selected tracked file per operation pair |
 | Search result grouping | 5,000 results / 100 files, 50 runs | 0.337 ms mean, 0.206 ms median | Production grouping helper; excludes DOM construction and browser paint |
-| Desktop startup | 1 smoke run | 177.5 ms to window; 399,276 KiB process-tree RSS after 1 s | Debug executable, one local Linux/Xvfb run; same smoke timing and RSS boundary as above |
+| Desktop startup | 1 smoke run | 176.9 ms to window; 401,680 KiB process-tree RSS after 1 s | Debug executable, one local Linux/Xvfb run; same smoke timing and RSS boundary as above |
 
 These fixtures are small local microbenchmarks on a temporary filesystem. They do not measure cold disks, network filesystems, very large repositories, UI paint, or concurrent editing. The Git dependency's native build/link size is platform/toolchain dependent. The startup result above is one local debug run; it measures process-start to window appearance and one-second process-tree RSS, not interactive latency. Windows and macOS were not measured.
 
@@ -228,3 +228,24 @@ Controlled PTY measurements were recorded with `cargo test -p koren-terminal ...
 The PTY fixture verifies byte ordering and no loss across the measured 2 MiB payload. These values are not repeated-run statistics. Shell-specific startup time, per-session RSS split from child RSS, idle CPU, sustained concurrent sessions, xterm render responsiveness, and clipboard/terminal behavior in a native WebKitGTK window remain unmeasured. Desktop startup and one-second process-tree RSS are measured separately by the Linux smoke test; opening no terminal starts no shell or PTY worker.
 
 After Phase 9B, the final Linux desktop smoke reported 171.1 ms to window appearance and 400,576 KiB process-tree RSS after one second, with no terminal opened. This is a single run using the same smoke boundary as the Phase 9A baseline above; it does not isolate terminal-service memory, and the RSS difference is within the variability of single-run samples.
+
+## Phase 9C DAP measurements
+
+Reproduce the deterministic fake-adapter workload with:
+
+```sh
+cargo bench --locked -p koren-debug --bench phase9c
+```
+
+One local run on 2026-11-11, Linux x86_64, optimized Rust bench profile, Python stdio fake adapter, 10 samples per workload:
+
+| Workload | Mean / minimum | Measurement boundary |
+|---|---:|---|
+| Adapter spawn, DAP initialize, launch, and first paused state | 30.456 / 26.843 ms | Includes Python process startup, actor scheduling, initialization, launch, and polling until paused |
+| Threads request/response | 0.038 / 0.009 ms | Host dispatch through fake DAP response observation |
+| Stack trace request/response | 16.169 / 16.137 ms | Same boundary; test harness scheduling is included |
+| Scopes request/response | 8.127 / 8.073 ms | Same boundary |
+| Variables request/response | 8.089 / 8.074 ms | Same boundary |
+| Second session start while first is active | 26.932 / 25.862 ms | Includes fake process startup and paused-state observation for session two |
+
+These are single-process means/minima with a tiny local fixture, not percentiles or real-debugger measurements. The differing response times reflect polling and scheduling noise in this harness. Breakpoint synchronization latency, debug panel paint/interaction latency, idle CPU/RSS split from WebKit, and session event throughput under load were not separately measured. The editor startup smoke has no active debugger, so it shows lazy startup behavior only; it cannot isolate debug-service overhead. See [DEBUGGING.md](docs/DEBUGGING.md) for compatibility limits.

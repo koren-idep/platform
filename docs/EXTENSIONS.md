@@ -130,6 +130,12 @@ The Git adapter uses `git2` and libgit2 locally. It does not invoke user hooks; 
 
 Interactive terminal sessions are host-only capabilities in Koren Code Editor. Lua extensions receive no terminal create/start/write/resize/close API, and terminal output events are excluded from extension callbacks. An extension must not try to bypass this policy through a contributed panel or command. Shell startup requires direct user approval in the desktop; after approval, commands typed into that shell are not individually approved. See [docs/TERMINAL.md](TERMINAL.md) for session lifecycle, transport, and platform constraints.
 
+## Phase 9C debugger contributions
+
+Extensions may declare `debug_adapters` and `debug_configurations` in `koren-extension.toml` when they include the `debug_adapters` capability. Declarations are validated as owned manifest contributions. Profile IDs must be unique within the owner, refer to a declared adapter, and provide a valid launch target or attach process ID. `${workspaceFolder}` is resolved by the host when a workspace is active. Definitions are exposed only while the extension is active; disabling or deactivating it removes the extension's contributions. The host qualifies IDs with the extension ID to avoid collisions.
+
+Registering a DAP adapter is metadata only and never starts a process. Each start must go through the desktop's graphical approval, which covers the adapter and target configuration. Lua retains its existing restrictions: there is no arbitrary process, debugger, or terminal API. See [docs/DEBUGGING.md](DEBUGGING.md) for the manifest example, lifecycle, and support limits.
+
 ## Local development
 
 Copy `examples/extensions/org.example.hello` into the extension root, reopen the Extensions manager, enable it, then activate it. The Developer Tools example demonstrates a command, menu and palette entry, user-opened workspace panel, typed setting, safe theme, diagnostic details, and panel refresh. Copy `examples/extensions/org.example.text-inspection` to demonstrate Lua rule registration and a safe replacement proposal. The optional `org.koren.rust-analyzer` example uses the same configuration path for any LSP-compatible editor host; install `rust-analyzer` separately before starting it. It is not bundled and is not required for editing.
