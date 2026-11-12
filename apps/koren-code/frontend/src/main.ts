@@ -3,7 +3,7 @@ import { EditorState } from '@codemirror/state';
 import { basicSetup, EditorView } from 'codemirror';
 import { linter, setDiagnostics, type Diagnostic as CodeMirrorDiagnostic } from '@codemirror/lint';
 import { KorenClient, KorenError, createDesktopTransport } from './services/client';
-import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary, ExtensionSettingSummary, ExtensionSettingValue, ExtensionSummary, ExtensionThemeSummary, ExtensionToolWindowSummary, ExtensionUiDocument, InspectionConfigurationSummary, InspectionFinding, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ResponseValue, TaskSummary, TextRange } from './services/protocol';
+import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary, ExtensionSettingSummary, ExtensionSettingValue, ExtensionSummary, ExtensionThemeSummary, ExtensionToolWindowSummary, ExtensionUiDocument, InspectionConfigurationSummary, InspectionFinding, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ProjectInspectionSummary, ResponseValue, TaskSummary, TextRange } from './services/protocol';
 import { approvalChoice, conflictChoice } from './app/dialogs';
 import { commandShortcutMatches, filterCommands, nextCommandSelection } from './app/commands';
 import { activePanelLayout, diagnosticDetailMatches, extensionMenusAt, safeThemeVariables, validExtensionSettingValue } from './app/extensions';
@@ -14,6 +14,7 @@ import { nextTheme, persistTheme, readTheme } from './app/theme';
 import { taskStatus, visibleOutput } from './app/taskPresentation';
 import { extensionCanActivate, extensionToggleLabel, languageServerEnabled } from './app/extensions';
 import { diagnosticsForRevision, withDiagnosticPublication } from './app/diagnostics';
+import { filterInspectionFindings, inspectionFindingGroupKey, revisionBoundEdits, type InspectionGrouping, type InspectionSeverityFilter } from './app/inspectionPresentation';
 import { ProjectTreeState, TabState, type EditorTab } from './app/state';
 import { DocumentEditPipeline } from './editor/sync';
 import { editsFromViewUpdate } from './editor/transactions';
@@ -74,6 +75,8 @@ app.innerHTML = `
       <details class="menu-group"><summary>Tools</summary><div class="menu-popup" role="menu">
         <button role="menuitem" data-action="command-palette">Command Palette… <kbd>Ctrl+Shift+P</kbd></button>
         <button role="menuitem" data-action="extensions">Extensions…</button>
+        <button role="menuitem" data-action="import-sarif">Import SARIF Report…</button>
+        <button role="menuitem" data-action="export-sarif">Export Current Inspections…</button>
         <div id="extension-tools-items"></div>
         <button role="menuitem" data-action="copy-path">Copy Current File Path</button>
         <button role="menuitem" data-action="refresh">Refresh Project Explorer</button>
@@ -132,7 +135,7 @@ app.innerHTML = `
         <div id="output" class="panel-content output"><div class="panel-empty">Task output will appear here.</div></div>
         <div id="problems" class="panel-content problem-list hidden"><div class="problem-filters"><label>Severity <select id="problem-severity-filter"><option value="all">All</option><option value="error">Errors</option><option value="warning">Warnings</option><option value="information">Information</option><option value="hint">Hints</option></select></label><label>Group by <select id="problem-grouping"><option value="file">File</option><option value="provider">Provider</option><option value="category">Category</option><option value="severity">Severity</option></select></label></div><div id="problem-entries"><div class="panel-empty">No problems reported by installed language integrations.</div></div></div>
         <div id="tasks" class="panel-content task-list hidden"><div class="panel-empty">Discover Cargo projects to see available tasks.</div></div>
-        <div id="projects" class="panel-content project-list hidden"><div class="panel-empty">Project information will appear here.</div></div>
+        <div id="projects" class="panel-content project-list hidden"><div class="project-analysis-controls"><button data-action="start-project-analysis">Analyze Open Documents</button><button data-action="cancel-project-analysis" disabled>Cancel</button><button data-action="load-project-findings" hidden>Load More Findings</button><span id="project-analysis-status">Uses a bounded snapshot of currently open documents.</span></div><div id="project-list"><div class="panel-empty">Project information will appear here.</div></div></div>
         <div id="extension-panel-content"></div>
       </section>
     </section>
@@ -164,7 +167,7 @@ const welcome = document.querySelector<HTMLElement>('#welcome')!;
 const tabsHost = document.querySelector<HTMLDivElement>('#tabs')!;
 const outputHost = document.querySelector<HTMLDivElement>('#output')!;
 const taskHost = document.querySelector<HTMLDivElement>('#tasks')!;
-const projectHost = document.querySelector<HTMLDivElement>('#projects')!;
+const projectHost = document.querySelector<HTMLDivElement>('#project-list')!;
 const runConfiguration = document.querySelector<HTMLSelectElement>('#run-configuration')!;
 const toast = document.querySelector<HTMLDivElement>('#status-toast')!;
 const workbench = document.querySelector<HTMLElement>('#workbench')!;
@@ -177,6 +180,7 @@ const taskById = new Map<number, TaskSummary>();
 const activeLanguageServers = new Map<string, number>();
 const diagnosticsByDocument = new Map<number, Map<string, LanguageDiagnosticSet>>();
 const inspectionFindingsByDocument = new Map<number, InspectionFinding[]>();
+let importedSarifFindings: InspectionFinding[] = [];
 const inspectionTimers = new Map<number, number>();
 const inspectionGenerations = new Map<number, number>();
 let editorContextMenus: ExtensionMenuSummary[] = [];
@@ -191,8 +195,13 @@ const commandMetadata = new Map<string, { description: string; shortcut: string 
 let editor: EditorView | null = null;
 let outputRefreshTimer = 0;
 let toastTimer = 0;
-let problemSeverityFilter = 'all';
-let problemGrouping = 'file';
+let problemSeverityFilter: InspectionSeverityFilter = 'all';
+let problemGrouping: InspectionGrouping = 'file';
+let activeProjectInspection: number | null = null;
+let latestProjectInspectionId: number | null = null;
+let projectInspectionTimer = 0;
+let projectInspectionOffset: number | null = null;
+let projectSnapshotFindings: InspectionFinding[] = [];
 
 function expect<T extends ResponseValue['kind']>(response: ResponseValue, kind: T): Extract<ResponseValue, { kind: T }> {
   if (response.kind !== kind) throw new Error(`Expected ${kind}, received ${response.kind}`);
@@ -843,9 +852,10 @@ function renderProblems(): void {
   }).filter(({ diagnostic }) => problemSeverityFilter === 'all' || (diagnostic.severity ?? 'information') === problemSeverityFilter);
   const inspectionRows = [...inspectionFindingsByDocument.entries()].flatMap(([documentId, findings]) => {
     const entry = documentViews.get(documentId);
-    return entry ? findings.filter((finding) => finding.document_revision === entry.pipeline.currentRevision && (problemSeverityFilter === 'all' || finding.severity === problemSeverityFilter)).map((finding) => ({ documentId, finding })) : [];
+    return entry ? filterInspectionFindings(findings.filter((finding) => finding.document_revision === entry.pipeline.currentRevision), problemSeverityFilter).map((finding) => ({ documentId, finding })) : [];
   });
-  document.querySelector('#problem-count')!.textContent = String(rows.length + inspectionRows.length);
+  const historicalRows = filterInspectionFindings([...importedSarifFindings, ...projectSnapshotFindings], problemSeverityFilter);
+  document.querySelector('#problem-count')!.textContent = String(rows.length + inspectionRows.length + historicalRows.length);
   const groups = new Set<string>();
   const groupHeading = (key: string): void => {
     if (problemGrouping === 'file' || groups.has(key)) return;
@@ -881,10 +891,14 @@ function renderProblems(): void {
   }
   for (const { documentId, finding } of inspectionRows) {
     const tab = tabs.tabs.find((item) => item.id === documentId);
-    const key = problemGrouping === 'provider' ? finding.provider_id : problemGrouping === 'category' ? finding.category ?? finding.rule_id : problemGrouping === 'severity' ? finding.severity : tab?.title ?? finding.path;
+    const key = inspectionFindingGroupKey(finding, problemGrouping, tab?.title ?? finding.path);
     groupHeading(key); renderInspectionFinding(host, documentId, finding);
   }
-  if (!rows.length && !inspectionRows.length) host.innerHTML = '<div class="panel-empty">No problems reported by installed language integrations.</div>';
+  for (const finding of historicalRows) {
+    groupHeading(inspectionFindingGroupKey(finding, problemGrouping));
+    renderImportedFinding(host, finding);
+  }
+  if (!rows.length && !inspectionRows.length && !historicalRows.length) host.innerHTML = '<div class="panel-empty">No problems reported by installed language integrations.</div>';
 }
 
 function renderInspectionFinding(host: HTMLElement, documentId: number, finding: InspectionFinding): void {
@@ -905,7 +919,20 @@ function renderInspectionFinding(host: HTMLElement, documentId: number, finding:
   const summary = document.createElement('summary'); summary.textContent = `${finding.rule_id} · ${finding.category ?? finding.provider_id} · ${finding.origin}`;
   details.append(summary);
   if (finding.explanation) { const explanation = document.createElement('p'); explanation.textContent = finding.explanation; details.append(explanation); }
-  for (const related of finding.related) { const note = document.createElement('p'); note.textContent = `${related.path}:${related.range.start.line + 1} — ${related.message}`; details.append(note); }
+  for (const related of finding.related) {
+    const matchingTab = tabs.tabs.find((item) => item.path === related.path || item.path.endsWith(`/${related.path}`));
+    if (matchingTab) {
+      const link = document.createElement('button'); link.type = 'button';
+      link.textContent = `${related.path}:${related.range.start.line + 1} — ${related.message}`;
+      link.addEventListener('click', (event) => {
+        event.stopPropagation(); selectTab(matchingTab.id);
+        if (editor) editor.dispatch({ selection: { anchor: editorPosition(editor.state.doc, related.range.start.line, related.range.start.character) }, scrollIntoView: true });
+      });
+      details.append(link);
+    } else {
+      const note = document.createElement('p'); note.textContent = `${related.path}:${related.range.start.line + 1} — ${related.message}`; details.append(note);
+    }
+  }
   for (const action of finding.actions) {
     const fix = document.createElement('button'); fix.type = 'button'; fix.textContent = action.disabled_reason ? `${action.title} — ${action.disabled_reason}` : action.title;
     fix.disabled = Boolean(action.disabled_reason) || !action.edits.length;
@@ -915,6 +942,117 @@ function renderInspectionFinding(host: HTMLElement, documentId: number, finding:
   row.append(details); host.append(row);
 }
 
+function renderImportedFinding(host: HTMLElement, finding: InspectionFinding): void {
+  const row = document.createElement('div'); row.className = 'problem-entry';
+  const button = document.createElement('button'); button.className = 'problem-row';
+  const severity = document.createElement('span'); severity.className = `problem-severity ${finding.severity}`; severity.textContent = finding.severity;
+  const message = document.createElement('span'); message.className = 'problem-message'; message.textContent = finding.message;
+  const historicalSource = finding.origin === 'imported' ? 'Imported SARIF report' : 'Project snapshot';
+  const location = document.createElement('span'); location.className = 'problem-location'; location.textContent = `${finding.path}:${finding.range.start.line + 1} · ${historicalSource}`;
+  button.append(severity, message, location);
+  const matchingTab = tabs.tabs.find((tab) => tab.path === finding.path || tab.path.endsWith(`/${finding.path}`));
+  if (matchingTab) button.addEventListener('click', () => {
+    selectTab(matchingTab.id);
+    if (editor) editor.dispatch({ selection: { anchor: editorPosition(editor.state.doc, finding.range.start.line, finding.range.start.character) }, scrollIntoView: true });
+  });
+  const detail = document.createElement('details'); detail.className = 'diagnostic-detail';
+  const summary = document.createElement('summary'); summary.textContent = `${finding.rule_id} · ${finding.category ?? finding.provider_id} · ${historicalSource}`;
+  detail.append(summary);
+  const source = document.createElement('p'); source.textContent = `${historicalSource}${finding.source_id ? ` ${finding.source_id}` : ''}${finding.source_revision ? ` from source revision ${finding.source_revision}` : ' with no source revision recorded'}. It is not a live diagnostic.`; detail.append(source);
+  if (finding.explanation) { const explanation = document.createElement('p'); explanation.textContent = finding.explanation; detail.append(explanation); }
+  for (const related of finding.related) {
+    const relatedTab = tabs.tabs.find((tab) => tab.path === related.path || tab.path.endsWith(`/${related.path}`));
+    if (relatedTab) {
+      const link = document.createElement('button'); link.type = 'button'; link.textContent = `${related.path}:${related.range.start.line + 1} — ${related.message}`;
+      link.addEventListener('click', () => {
+        selectTab(relatedTab.id);
+        if (editor) editor.dispatch({ selection: { anchor: editorPosition(editor.state.doc, related.range.start.line, related.range.start.character) }, scrollIntoView: true });
+      }); detail.append(link);
+    } else {
+      const note = document.createElement('p'); note.textContent = `${related.path}:${related.range.start.line + 1} — ${related.message}`; detail.append(note);
+    }
+  }
+  row.append(button, detail); host.append(row);
+}
+
+async function importSarif(): Promise<void> {
+  try {
+    const selection = await fetch('/file-picker', { cache: 'no-store' });
+    const { path } = await selection.json() as { path: string | null };
+    if (!path) return;
+    const imported = expect(await client.call({ method: 'import_sarif', params: { path } }), 'imported_sarif').value;
+    importedSarifFindings = imported.findings;
+    renderProblems(); showPanel('problems');
+    setStatus(`Imported ${imported.findings.length} historical findings${imported.warnings.length ? ` with ${imported.warnings.length} warnings` : ''}`);
+  } catch (error) { showError(error); }
+}
+
+async function exportSarif(): Promise<void> {
+  try {
+    const report = expect(await client.call({ method: 'export_sarif' }), 'sarif_report').value;
+    const url = URL.createObjectURL(new Blob([report.document], { type: 'application/sarif+json' }));
+    const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'koren-inspections.sarif'; anchor.click(); URL.revokeObjectURL(url);
+    setStatus(`Exported SARIF 2.1.0${report.warnings.length ? ` with ${report.warnings.length} warnings` : ''}`);
+  } catch (error) { showError(error); }
+}
+
+async function startProjectInspection(): Promise<void> {
+  if (activeProjectInspection !== null) { setStatus('A project inspection is already active'); return; }
+  try {
+    const result = expect(await client.call({ method: 'start_project_inspection' }), 'project_inspection_started').value;
+    activeProjectInspection = result.job_id;
+    latestProjectInspectionId = result.job_id;
+    projectInspectionOffset = 0;
+    projectSnapshotFindings = [];
+    const status = document.querySelector<HTMLElement>('#project-analysis-status')!;
+    status.textContent = 'Starting explicit analysis of the currently open document snapshot…';
+    document.querySelector<HTMLButtonElement>('[data-action="cancel-project-analysis"]')!.disabled = false;
+    await pollProjectInspection(result.job_id);
+  } catch (error) { showError(error); }
+}
+
+async function pollProjectInspection(jobId: number): Promise<void> {
+  try {
+    const summary: ProjectInspectionSummary = expect(await client.call({ method: 'project_inspection_status', params: { job_id: jobId } }), 'project_inspection_status').value;
+    const status = document.querySelector<HTMLElement>('#project-analysis-status')!;
+    status.textContent = `${summary.state}: ${summary.completed_documents}/${summary.total_documents} documents${summary.current_path ? ` · ${summary.current_path}` : ''}${summary.result_count ? ` · ${summary.result_count} findings` : ''}${summary.error ? ` · ${summary.error}` : ''}`;
+    if (summary.state === 'running' || summary.state === 'cancelling') {
+      projectInspectionTimer = window.setTimeout(() => void pollProjectInspection(jobId), 200);
+      return;
+    }
+    activeProjectInspection = null;
+    document.querySelector<HTMLButtonElement>('[data-action="cancel-project-analysis"]')!.disabled = true;
+    if (summary.state === 'completed') {
+      await loadProjectInspectionFindings(jobId, 0);
+      showPanel('problems');
+    }
+  } catch (error) {
+    activeProjectInspection = null;
+    document.querySelector<HTMLButtonElement>('[data-action="cancel-project-analysis"]')!.disabled = true;
+    showError(error);
+  }
+}
+
+async function loadProjectInspectionFindings(jobId: number, offset: number): Promise<void> {
+  try {
+    const page = expect(await client.call({ method: 'project_inspection_findings', params: { job_id: jobId, offset, limit: 100 } }), 'project_inspection_findings').value;
+    projectSnapshotFindings = offset === 0 ? page.findings : [...projectSnapshotFindings, ...page.findings];
+    projectInspectionOffset = page.next_offset;
+    const loadMore = document.querySelector<HTMLButtonElement>('[data-action="load-project-findings"]')!;
+    loadMore.hidden = projectInspectionOffset === null;
+    renderProblems();
+  } catch (error) { showError(error); }
+}
+
+async function cancelProjectInspection(): Promise<void> {
+  if (activeProjectInspection === null) return;
+  try {
+    await client.call({ method: 'cancel_project_inspection', params: { job_id: activeProjectInspection } });
+    window.clearTimeout(projectInspectionTimer);
+    await pollProjectInspection(activeProjectInspection);
+  } catch (error) { showError(error); }
+}
+
 async function applyInspectionAction(documentId: number, action: InspectionFinding['actions'][number]): Promise<void> {
   const entry = documentViews.get(documentId);
   const tab = tabs.tabs.find((item) => item.id === documentId);
@@ -922,12 +1060,13 @@ async function applyInspectionAction(documentId: number, action: InspectionFindi
   try {
     await entry.pipeline.flush();
     const revision = entry.pipeline.currentRevision;
-    if (action.edits.some((edit) => edit.path !== tab.path || edit.expected_revision !== revision)) {
+    const edits = revisionBoundEdits(action, tab.path, revision);
+    if (!edits) {
       setStatus('This quick fix is stale or targets another file. Run inspection again.');
       return;
     }
     const doc = editor.state.doc;
-    const changes = action.edits.map((edit) => ({
+    const changes = edits.map((edit) => ({
       from: editorPosition(doc, edit.range.start.line, edit.range.start.character),
       to: editorPosition(doc, edit.range.end.line, edit.range.end.character),
       insert: edit.new_text,
@@ -945,6 +1084,12 @@ function clearDiagnosticProviders(prefix: string): void {
   for (const [documentId, providers] of diagnosticsByDocument) {
     for (const provider of providers.keys()) if (provider === prefix || provider.startsWith(`${prefix}.`)) providers.delete(provider);
     if (!providers.size) diagnosticsByDocument.delete(documentId);
+    renderLanguageDiagnostics(documentId);
+  }
+  for (const [documentId, findings] of inspectionFindingsByDocument) {
+    const remaining = findings.filter((finding) => finding.provider_id !== prefix && !finding.provider_id.startsWith(`${prefix}.`));
+    if (remaining.length) inspectionFindingsByDocument.set(documentId, remaining);
+    else inspectionFindingsByDocument.delete(documentId);
     renderLanguageDiagnostics(documentId);
   }
   renderProblems();
@@ -1131,11 +1276,16 @@ function renderInspectionSettings(configuration: InspectionConfigurationSummary)
   const profile = document.createElement('select');
   for (const name of configuration.profiles) { const option = document.createElement('option'); option.value = name; option.textContent = name; profile.append(option); }
   profile.value = configuration.selected_profile;
+  const createProfile = document.createElement('button'); createProfile.type = 'button'; createProfile.textContent = 'New Profile';
+  createProfile.addEventListener('click', () => {
+    const name = window.prompt('Name the new inspection profile');
+    if (name?.trim()) void createInspectionProfile(name, workspaceOnly.checked);
+  });
   const workspaceOnly = document.createElement('input'); workspaceOnly.type = 'checkbox';
   workspaceOnly.checked = configuration.workspace_specific;
   const workspaceLabel = document.createElement('label'); workspaceLabel.append(workspaceOnly, document.createTextNode('Apply changes to this workspace only'));
   profile.addEventListener('change', () => void updateInspectionProfile(profile.value, workspaceOnly.checked));
-  profileLabel.append(profile); host.append(profileLabel, workspaceLabel);
+  profileLabel.append(profile); host.append(profileLabel, createProfile, workspaceLabel);
   if (!configuration.rules.length) {
     const note = document.createElement('p'); note.className = 'subtle'; note.textContent = 'Enable and activate an inspection extension to configure its rules.'; host.append(note); return;
   }
@@ -1162,6 +1312,13 @@ function renderInspectionSettings(configuration: InspectionConfigurationSummary)
 async function updateInspectionProfile(profileName: string, workspaceSpecific: boolean): Promise<void> {
   try {
     const value = expect(await client.call({ method: 'select_inspection_profile', params: { profile_name: profileName, workspace_specific: workspaceSpecific } }), 'inspection_configuration').value;
+    renderInspectionSettings(value); refreshInspectionsForOpenDocuments();
+  } catch (error) { showError(error); }
+}
+
+async function createInspectionProfile(profileName: string, workspaceSpecific: boolean): Promise<void> {
+  try {
+    const value = expect(await client.call({ method: 'create_inspection_profile', params: { profile_name: profileName, workspace_specific: workspaceSpecific } }), 'inspection_configuration').value;
     renderInspectionSettings(value); refreshInspectionsForOpenDocuments();
   } catch (error) { showError(error); }
 }
@@ -1246,7 +1403,7 @@ async function stopLanguageServer(key: string, id: number): Promise<void> {
 async function changeExtension(extension: ExtensionSummary, enabled: boolean): Promise<void> {
   try {
     await client.call({ method: 'set_extension_enabled', params: { extension_id: extension.id, enabled } });
-    if (!enabled) clearDiagnosticProviders(extension.id);
+    if (!enabled) { clearDiagnosticProviders(extension.id); refreshInspectionsForOpenDocuments(); }
     const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value;
     renderExtensions(catalog); setStatus(`${extension.name} ${enabled ? 'enabled' : 'disabled'}`);
   } catch (error) { showError(error); }
@@ -1330,6 +1487,8 @@ function handleAction(action: string, target: HTMLElement): void {
     case 'refresh': if (workspaceRoot) void refreshDirectory(''); else setStatus('Open a workspace first'); break;
     case 'command-palette': void openCommandPalette(); break;
     case 'extensions': void openExtensions(); break;
+    case 'import-sarif': void importSarif(); break;
+    case 'export-sarif': void exportSarif(); break;
     case 'copy-path': void copyCurrentPath(); break;
     case 'shortcuts': showInfo('Keyboard Shortcuts', 'Ctrl+O  Open Folder\nCtrl+Shift+O  Open File\nCtrl+S  Save\nCtrl+W  Close Active Tab\nCtrl+Shift+P  Command Palette\nCtrl+B  Toggle Project Explorer\nCtrl+J  Toggle Bottom Panel\nAlt+T  Toggle Theme\nCtrl+Tab / Ctrl+Shift+Tab  Change Tab\nF6  Focus Editor\nF5  Cancel Active Task'); break;
     case 'about': showInfo('Koren Code Editor', 'A lightweight, universal code editor powered by Koren IDE Platform.\n\nVersion 0.1.0'); break;
@@ -1432,11 +1591,16 @@ document.querySelector<HTMLInputElement>('#command-search')!.addEventListener('i
 });
 
 document.querySelectorAll<HTMLButtonElement>('[data-panel]').forEach((button) => button.addEventListener('click', () => showPanel(button.dataset.panel as 'output' | 'problems' | 'tasks' | 'projects')));
+document.querySelector<HTMLButtonElement>('[data-action="start-project-analysis"]')!.addEventListener('click', () => void startProjectInspection());
+document.querySelector<HTMLButtonElement>('[data-action="cancel-project-analysis"]')!.addEventListener('click', () => void cancelProjectInspection());
+document.querySelector<HTMLButtonElement>('[data-action="load-project-findings"]')!.addEventListener('click', () => {
+  if (latestProjectInspectionId !== null && projectInspectionOffset !== null) void loadProjectInspectionFindings(latestProjectInspectionId, projectInspectionOffset);
+});
 document.querySelector<HTMLSelectElement>('#problem-severity-filter')!.addEventListener('change', (event) => {
-  problemSeverityFilter = (event.currentTarget as HTMLSelectElement).value; renderProblems();
+  problemSeverityFilter = (event.currentTarget as HTMLSelectElement).value as InspectionSeverityFilter; renderProblems();
 });
 document.querySelector<HTMLSelectElement>('#problem-grouping')!.addEventListener('change', (event) => {
-  problemGrouping = (event.currentTarget as HTMLSelectElement).value; renderProblems();
+  problemGrouping = (event.currentTarget as HTMLSelectElement).value as InspectionGrouping; renderProblems();
 });
 document.querySelector<HTMLSelectElement>('#theme-setting')!.addEventListener('change', (event) => {
   const value = (event.currentTarget as HTMLSelectElement).value;

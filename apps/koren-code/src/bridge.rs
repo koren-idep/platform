@@ -7,8 +7,9 @@ use koren_extensions::{
     SettingValue, ThemeBase, UiDocument, UiElement,
 };
 use koren_inspections::{
-    CancellationToken, FindingOrigin, InspectionProfile, InspectionProfiles, InspectionProvider,
-    InspectionService, RuleProfile, Severity,
+    CancellationToken, Finding, FindingOrigin, InspectionProfile, InspectionProfiles,
+    InspectionProvider, InspectionService, MAX_SARIF_BYTES, RuleProfile, Severity, export_sarif,
+    import_sarif,
 };
 use koren_lsp::{
     DiagnosticSet, FormattingOptions, LspActorEvent, LspDocumentSync, LspRequest, LspResponse,
@@ -26,8 +27,9 @@ use koren_protocol::{
     ExtensionToolWindowSummary, ExtensionUiDocument, ExtensionUiElement, InspectionCodeAction,
     InspectionConfigurationSummary, InspectionFinding, InspectionProposedTextEdit,
     InspectionRelatedLocation, InspectionRuleSummary, LanguageServerApprovalSummary,
-    LanguageServerSummary, ProjectLifecycle, ProjectSummary, ProtocolError, Request, RequestMethod,
-    Response, ResponseValue, TaskLifecycle, TaskSummary, TextEdit, validate_version,
+    LanguageServerSummary, ProjectInspectionFindingPage, ProjectInspectionSummary,
+    ProjectLifecycle, ProjectSummary, ProtocolError, Request, RequestMethod, Response,
+    ResponseValue, TaskLifecycle, TaskSummary, TextEdit, validate_version,
 };
 use koren_tasks::{
     ExecutionRequestId, TaskApprovalManager, TaskAuthorizationDecision, TaskCaller, TaskDefinition,
@@ -38,6 +40,7 @@ use koren_workspace::{EntryKind, WorkspaceManager};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -45,7 +48,7 @@ use std::{
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const LANGUAGE_FEATURE_TIMEOUT: Duration = Duration::from_millis(150);
@@ -243,6 +246,9 @@ struct DesktopBackend {
     open_documents: BTreeSet<DocumentId>,
     document_cancellations: BTreeMap<DocumentId, Arc<AtomicBool>>,
     inspection_cancellations: Arc<Mutex<BTreeMap<(u64, u64), CancellationToken>>>,
+    inspection_results: InspectionResultStore,
+    project_inspection_jobs: Arc<Mutex<BTreeMap<u64, ProjectInspectionState>>>,
+    next_project_inspection_id: u64,
     pending_language_servers: BTreeMap<u64, PendingLanguageServer>,
     next_language_server_approval: u64,
 }
@@ -252,6 +258,19 @@ struct PendingLanguageServer {
     configuration_id: String,
     configuration: ServerConfig,
 }
+
+struct ProjectInspectionState {
+    state: String,
+    completed_documents: usize,
+    total_documents: usize,
+    current_path: Option<String>,
+    findings: Vec<Finding>,
+    error: Option<String>,
+    cancellation: CancellationToken,
+}
+
+type InspectionResultKey = (u64, u64);
+type InspectionResultStore = Arc<Mutex<BTreeMap<InspectionResultKey, Vec<Finding>>>>;
 
 struct DenyLanguageServer;
 impl ServerAuthorizer for DenyLanguageServer {
@@ -322,6 +341,9 @@ impl DesktopBackend {
             open_documents: BTreeSet::new(),
             document_cancellations: BTreeMap::new(),
             inspection_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
+            inspection_results: Arc::new(Mutex::new(BTreeMap::new())),
+            project_inspection_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            next_project_inspection_id: 0,
             pending_language_servers: BTreeMap::new(),
             next_language_server_approval: 0,
         })
@@ -564,6 +586,7 @@ impl DesktopBackend {
         let document_id = *document_id;
         let revision = *expected_revision;
         let cancellation_map = self.inspection_cancellations.clone();
+        let result_store = self.inspection_results.clone();
         let token = job.cancellation_token();
         let mut active = match cancellation_map.lock() {
             Ok(active) => active,
@@ -605,11 +628,16 @@ impl DesktopBackend {
                                     .into(),
                             });
                         }
+                        if let Ok(mut stored) = result_store.lock() {
+                            stored.insert((document_id, revision), findings.clone());
+                        }
                         Ok(ResponseValue::InspectionFindings {
                             document_revision: revision,
                             findings: findings
                                 .into_iter()
-                                .map(|finding| inspection_finding(finding, &path, revision))
+                                .map(|finding| {
+                                    inspection_finding(finding, path.as_deref(), Some(revision))
+                                })
                                 .collect(),
                         })
                     });
@@ -646,6 +674,30 @@ impl DesktopBackend {
         }
     }
 
+    fn cancel_all_document_inspections(&self) {
+        if let Ok(mut active) = self.inspection_cancellations.lock() {
+            for token in active.values() {
+                token.cancel();
+            }
+            active.clear();
+        }
+    }
+
+    fn cancel_active_project_jobs(&self) {
+        if let Ok(mut jobs) = self.project_inspection_jobs.lock() {
+            for state in jobs.values_mut().filter(|state| state.state == "running") {
+                state.state = "cancelling".into();
+                state.cancellation.cancel();
+            }
+        }
+    }
+
+    fn clear_document_inspection_results(&self, document_id: u64) {
+        if let Ok(mut stored) = self.inspection_results.lock() {
+            stored.retain(|(stored_document, _), _| *stored_document != document_id);
+        }
+    }
+
     fn method(&mut self, method: RequestMethod) -> Result<ResponseValue, ProtocolError> {
         match method {
             RequestMethod::Ping => Ok(ResponseValue::Pong),
@@ -671,6 +723,10 @@ impl DesktopBackend {
                 profile_name,
                 workspace_specific,
             } => self.select_inspection_profile(&profile_name, workspace_specific),
+            RequestMethod::CreateInspectionProfile {
+                profile_name,
+                workspace_specific,
+            } => self.create_inspection_profile(&profile_name, workspace_specific),
             RequestMethod::SetInspectionRule {
                 rule_id,
                 enabled,
@@ -684,6 +740,20 @@ impl DesktopBackend {
                 workspace_specific,
                 reset,
             ),
+            RequestMethod::ImportSarif { path } => self.import_sarif_file(&path),
+            RequestMethod::ExportSarif => self.export_sarif_report(),
+            RequestMethod::StartProjectInspection => self.start_project_inspection(),
+            RequestMethod::ProjectInspectionStatus { job_id } => {
+                self.project_inspection_status(job_id)
+            }
+            RequestMethod::CancelProjectInspection { job_id } => {
+                self.cancel_project_inspection(job_id)
+            }
+            RequestMethod::ProjectInspectionFindings {
+                job_id,
+                offset,
+                limit,
+            } => self.project_inspection_findings(job_id, offset, limit),
             RequestMethod::SetExtensionSetting { setting_id, value } => {
                 self.set_extension_setting(&setting_id, value)
             }
@@ -745,6 +815,7 @@ impl DesktopBackend {
                         "close open documents before closing this workspace",
                     ));
                 }
+                self.cancel_active_project_jobs();
                 self.approvals.invalidate_workspace(&root);
                 self.language_servers
                     .close_workspace(&root)
@@ -839,6 +910,7 @@ impl DesktopBackend {
                     .documents
                     .apply_edits(DocumentId(document_id), expected_revision, &edits)
                     .map_err(document_error)?;
+                self.clear_document_inspection_results(document_id);
                 self.sync_document_change(DocumentId(document_id));
                 Ok(ResponseValue::DocumentChanged {
                     document_id,
@@ -869,6 +941,7 @@ impl DesktopBackend {
                     .documents
                     .resolve_conflict(DocumentId(document_id), expected_revision, decision)
                     .map_err(document_error)?;
+                self.clear_document_inspection_results(document_id);
                 Ok(ResponseValue::DocumentSaved {
                     document_id,
                     revision: info.revision,
@@ -883,6 +956,7 @@ impl DesktopBackend {
                 self.documents
                     .close(DocumentId(document_id), discard_unsaved_changes)
                     .map_err(document_error)?;
+                self.clear_document_inspection_results(document_id);
                 if let Some(cancelled) =
                     self.document_cancellations.remove(&DocumentId(document_id))
                 {
@@ -1171,6 +1245,44 @@ impl DesktopBackend {
         self.list_inspection_rules()
     }
 
+    fn create_inspection_profile(
+        &mut self,
+        profile_name: &str,
+        workspace_specific: bool,
+    ) -> Result<ResponseValue, ProtocolError> {
+        let name = profile_name.trim();
+        if name.is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
+            return Err(invalid(
+                "inspection profile name must be 1–64 printable characters",
+            ));
+        }
+        if self.inspection_profiles.profiles.contains_key(name) {
+            return Err(invalid(
+                "an inspection profile with this name already exists",
+            ));
+        }
+        let workspace = if workspace_specific {
+            Some(root_string(&self.workspace)?)
+        } else {
+            None
+        };
+        let previous = self.inspection_profiles.clone();
+        self.inspection_profiles
+            .insert(InspectionProfile::new(name));
+        self.inspection_profiles
+            .select(workspace.as_deref(), name)
+            .map_err(inspection_error)?;
+        if let Err(error) = persist_desktop_settings(
+            self.settings_path.as_deref(),
+            &self.extension_setting_values,
+            &self.inspection_profiles,
+        ) {
+            self.inspection_profiles = previous;
+            return Err(settings_error(error));
+        }
+        self.list_inspection_rules()
+    }
+
     fn set_inspection_rule(
         &mut self,
         rule_id: &str,
@@ -1236,6 +1348,300 @@ impl DesktopBackend {
             return Err(settings_error(error));
         }
         self.list_inspection_rules()
+    }
+
+    fn import_sarif_file(&self, path: &str) -> Result<ResponseValue, ProtocolError> {
+        let selected = Path::new(path);
+        if !selected.is_absolute() {
+            return Err(invalid(
+                "SARIF import requires the absolute path from the native file picker",
+            ));
+        }
+        let canonical = std::fs::canonicalize(selected)
+            .map_err(|error| invalid(format!("cannot open selected SARIF report: {error}")))?;
+        let metadata = std::fs::metadata(&canonical)
+            .map_err(|error| invalid(format!("cannot inspect selected SARIF report: {error}")))?;
+        if !metadata.is_file() {
+            return Err(invalid("selected SARIF path is not a regular file"));
+        }
+        if metadata.len() > MAX_SARIF_BYTES as u64 {
+            return Err(inspection_error(
+                koren_inspections::InspectionError::SarifSize(MAX_SARIF_BYTES),
+            ));
+        }
+        let mut bytes = Vec::new();
+        std::fs::File::open(canonical)
+            .and_then(|file| {
+                file.take((MAX_SARIF_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+            })
+            .map_err(|error| invalid(format!("cannot read selected SARIF report: {error}")))?;
+        if bytes.len() > MAX_SARIF_BYTES {
+            return Err(inspection_error(
+                koren_inspections::InspectionError::SarifSize(MAX_SARIF_BYTES),
+            ));
+        }
+        let report = String::from_utf8(bytes)
+            .map_err(|error| invalid(format!("SARIF report is not UTF-8: {error}")))?;
+        let report_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_string();
+        let imported = import_sarif(&report, &report_id, None).map_err(inspection_error)?;
+        Ok(ResponseValue::ImportedSarif {
+            report_id,
+            findings: imported
+                .findings
+                .into_iter()
+                .map(|finding| inspection_finding(finding, None, None))
+                .collect(),
+            warnings: imported.warnings,
+        })
+    }
+
+    fn export_sarif_report(&self) -> Result<ResponseValue, ProtocolError> {
+        let mut findings = Vec::new();
+        let stored = self
+            .inspection_results
+            .lock()
+            .map_err(|_| invalid("inspection result cache is unavailable"))?;
+        for document_id in &self.open_documents {
+            let snapshot = self
+                .documents
+                .snapshot(*document_id)
+                .map_err(document_error)?;
+            if let Some(current) = stored.get(&(document_id.0, snapshot.info.revision)) {
+                findings.extend(current.iter().cloned());
+            }
+        }
+        let report = export_sarif("Koren Code Editor", &findings).map_err(inspection_error)?;
+        Ok(ResponseValue::SarifReport {
+            document: report.document,
+            warnings: report.warnings,
+        })
+    }
+
+    fn start_project_inspection(&mut self) -> Result<ResponseValue, ProtocolError> {
+        let workspace = self
+            .workspace
+            .root()
+            .map_err(workspace_error)?
+            .to_path_buf();
+        let workspace_id = workspace.to_string_lossy().into_owned();
+        let mut documents = Vec::new();
+        for id in &self.open_documents {
+            let snapshot = self.documents.snapshot(*id).map_err(document_error)?;
+            let Some(path) = snapshot.info.path else {
+                continue;
+            };
+            documents.push(koren_inspections::InspectionDocument {
+                path: path.to_string_lossy().into_owned(),
+                document_id: Some(id.0),
+                revision: Some(snapshot.info.revision),
+                language: self.inspection_language_for_path(&path),
+                text: Arc::from(snapshot.text),
+            });
+        }
+        if documents.is_empty() {
+            return Err(invalid(
+                "open at least one project document before starting inspection",
+            ));
+        }
+        let profile = self
+            .inspection_profiles
+            .selected_for(Some(&workspace_id))
+            .cloned()
+            .ok_or_else(|| invalid("no inspection profile is selected"))?;
+        let total_documents = documents.len();
+        self.next_project_inspection_id = self
+            .next_project_inspection_id
+            .checked_add(1)
+            .ok_or_else(|| invalid("project inspection ID space is exhausted"))?;
+        let job_id = self.next_project_inspection_id;
+        let snapshot_id = format!("project-{job_id}");
+        let job = self
+            .inspections
+            .inspect_project(snapshot_id, documents, profile, Some(workspace_id))
+            .map_err(inspection_error)?;
+        let cancellation = job.cancellation_token();
+        self.project_inspection_jobs
+            .lock()
+            .map_err(|_| invalid("project inspection job registry is unavailable"))?
+            .insert(
+                job_id,
+                ProjectInspectionState {
+                    state: "running".into(),
+                    completed_documents: 0,
+                    total_documents,
+                    current_path: None,
+                    findings: Vec::new(),
+                    error: None,
+                    cancellation,
+                },
+            );
+        let jobs = self.project_inspection_jobs.clone();
+        let results = self.inspection_results.clone();
+        let worker = thread::Builder::new()
+            .name(format!("koren-project-inspection-{job_id}"))
+            .spawn(move || {
+                loop {
+                    if let Some(progress) = job.try_progress() {
+                        if let Ok(mut states) = jobs.lock() {
+                            if let Some(state) = states.get_mut(&job_id) {
+                                state.completed_documents = progress.completed_documents;
+                                state.total_documents = progress.total_documents;
+                                state.current_path = Some(progress.current_path);
+                            }
+                        }
+                    }
+                    match job.try_result() {
+                        Ok(Some(findings)) => {
+                            if let Ok(mut stored) = results.lock() {
+                                for finding in &findings {
+                                    if let (Some(document_id), Some(revision)) =
+                                        (finding.document_id, finding.document_revision)
+                                    {
+                                        stored
+                                            .entry((document_id, revision))
+                                            .or_default()
+                                            .push(finding.clone());
+                                    }
+                                }
+                            }
+                            if let Ok(mut states) = jobs.lock() {
+                                if let Some(state) = states.get_mut(&job_id) {
+                                    state.state = "completed".into();
+                                    state.findings = findings;
+                                }
+                            }
+                            break;
+                        }
+                        Err(error) => {
+                            if let Ok(mut states) = jobs.lock() {
+                                if let Some(state) = states.get_mut(&job_id) {
+                                    state.state =
+                                        if error == koren_inspections::InspectionError::Cancelled {
+                                            "cancelled"
+                                        } else {
+                                            "failed"
+                                        }
+                                        .into();
+                                    state.error = Some(error.to_string());
+                                }
+                            }
+                            break;
+                        }
+                        Ok(None) => thread::sleep(Duration::from_millis(25)),
+                    }
+                }
+            });
+        if let Err(error) = worker {
+            if let Ok(mut jobs) = self.project_inspection_jobs.lock() {
+                jobs.remove(&job_id);
+            }
+            return Err(ProtocolError {
+                code: ErrorCode::Internal,
+                message: format!("could not start project inspection monitor: {error}"),
+            });
+        }
+        Ok(ResponseValue::ProjectInspectionStarted { job_id })
+    }
+
+    fn project_inspection_status(&self, job_id: u64) -> Result<ResponseValue, ProtocolError> {
+        let jobs = self
+            .project_inspection_jobs
+            .lock()
+            .map_err(|_| invalid("project inspection job registry is unavailable"))?;
+        let state = jobs
+            .get(&job_id)
+            .ok_or_else(|| not_found(format!("project inspection job '{job_id}' was not found")))?;
+        Ok(ResponseValue::ProjectInspectionStatus(
+            ProjectInspectionSummary {
+                job_id,
+                state: state.state.clone(),
+                completed_documents: state.completed_documents,
+                total_documents: state.total_documents,
+                current_path: state.current_path.clone(),
+                result_count: state.findings.len(),
+                error: state.error.clone(),
+            },
+        ))
+    }
+
+    fn cancel_project_inspection(&self, job_id: u64) -> Result<ResponseValue, ProtocolError> {
+        let mut jobs = self
+            .project_inspection_jobs
+            .lock()
+            .map_err(|_| invalid("project inspection job registry is unavailable"))?;
+        let state = jobs
+            .get_mut(&job_id)
+            .ok_or_else(|| not_found(format!("project inspection job '{job_id}' was not found")))?;
+        if state.state == "running" {
+            state.state = "cancelling".into();
+            state.cancellation.cancel();
+        }
+        Ok(ResponseValue::ProjectInspectionCancelled { job_id })
+    }
+
+    fn project_inspection_findings(
+        &self,
+        job_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ResponseValue, ProtocolError> {
+        let jobs = self
+            .project_inspection_jobs
+            .lock()
+            .map_err(|_| invalid("project inspection job registry is unavailable"))?;
+        let state = jobs
+            .get(&job_id)
+            .ok_or_else(|| not_found(format!("project inspection job '{job_id}' was not found")))?;
+        if state.state != "completed" {
+            return Err(invalid("project inspection results are not ready"));
+        }
+        let limit = limit.clamp(1, 100);
+        let end = offset.saturating_add(limit).min(state.findings.len());
+        let findings = state
+            .findings
+            .get(offset.min(state.findings.len())..end)
+            .unwrap_or_default()
+            .iter()
+            .cloned()
+            .map(|finding| inspection_finding(finding, None, None))
+            .collect();
+        Ok(ResponseValue::ProjectInspectionFindings(
+            ProjectInspectionFindingPage {
+                job_id,
+                offset,
+                next_offset: (end < state.findings.len()).then_some(end),
+                findings,
+            },
+        ))
+    }
+
+    fn inspection_language_for_path(&self, path: &Path) -> String {
+        let suffix = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        for extension in self
+            .extensions
+            .list()
+            .into_iter()
+            .filter(|item| item.state == ExtensionState::Active)
+        {
+            if let Ok(contributions) = self.extensions.contributions(&extension.id) {
+                if let Some(language) = contributions
+                    .languages
+                    .iter()
+                    .find(|language| language.extensions.iter().any(|value| value == suffix))
+                {
+                    return language.id.clone();
+                }
+            }
+        }
+        "plaintext".into()
     }
 
     fn active_tool_windows(&self) -> Vec<ExtensionToolWindowSummary> {
@@ -1489,7 +1895,15 @@ impl DesktopBackend {
         if enabled {
             self.extensions.enable(id).map_err(extension_error)?;
         } else {
+            self.cancel_all_document_inspections();
+            self.cancel_active_project_jobs();
             self.inspections.unregister(id);
+            if let Ok(mut stored) = self.inspection_results.lock() {
+                stored.retain(|_, findings| {
+                    findings.retain(|finding| finding.provider_id != id);
+                    !findings.is_empty()
+                });
+            }
             if let Some(runtime) = self.lua_runtimes.remove(id) {
                 let _ = runtime.deactivate();
             }
@@ -3104,11 +3518,10 @@ fn inspection_error(error: koren_inspections::InspectionError) -> ProtocolError 
 
 fn inspection_finding(
     finding: koren_inspections::Finding,
-    active_path: &Option<PathBuf>,
-    expected_revision: u64,
+    active_path: Option<&Path>,
+    expected_revision: Option<u64>,
 ) -> InspectionFinding {
     let active_path = active_path
-        .as_ref()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default();
     let actions = finding
@@ -3118,7 +3531,8 @@ fn inspection_finding(
             let supported = action.command.is_none()
                 && action.edits.len() == 1
                 && action.edits.first().is_some_and(|edit| {
-                    edit.path == active_path && edit.expected_revision == Some(expected_revision)
+                    edit.path == active_path
+                        && edit.expected_revision == expected_revision
                 });
             let edits = if supported {
                 action
@@ -3149,10 +3563,12 @@ fn inspection_finding(
             }
         })
         .collect();
-    let origin = match finding.origin {
-        FindingOrigin::Document => "document".into(),
-        FindingOrigin::ProjectSnapshot { .. } => "project_snapshot".into(),
-        FindingOrigin::Imported { .. } => "imported".into(),
+    let (origin, source_id) = match finding.origin {
+        FindingOrigin::Document => ("document".into(), None),
+        FindingOrigin::ProjectSnapshot { snapshot_id } => {
+            ("project_snapshot".into(), Some(snapshot_id))
+        }
+        FindingOrigin::Imported { report_id, .. } => ("imported".into(), Some(report_id)),
     };
     InspectionFinding {
         id: finding.id,
@@ -3182,6 +3598,8 @@ fn inspection_finding(
             .collect(),
         actions,
         origin,
+        source_id,
+        source_revision: finding.source_revision,
     }
 }
 
@@ -3477,11 +3895,73 @@ mod tests {
 
         fn inspect(
             &self,
-            _document: &koren_inspections::InspectionDocument,
+            document: &koren_inspections::InspectionDocument,
             _profile: &InspectionProfile,
             _workspace: Option<&str>,
             _cancellation: &CancellationToken,
         ) -> Result<Vec<koren_inspections::Finding>, String> {
+            Ok(vec![koren_inspections::Finding {
+                id: format!("{}:fixture", document.path),
+                provider_id: self.id().into(),
+                rule_id: "org.example.rules.todo".into(),
+                path: document.path.clone(),
+                document_id: document.document_id,
+                document_revision: document.revision,
+                source_revision: None,
+                range: koren_protocol::TextRange {
+                    start: koren_protocol::TextPosition {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: koren_protocol::TextPosition {
+                        line: 0,
+                        character: 0,
+                    },
+                },
+                severity: Severity::Warning,
+                message: "fixture finding".into(),
+                explanation: None,
+                category: Some("maintenance".into()),
+                related: Vec::new(),
+                actions: Vec::new(),
+                documentation: None,
+                origin: FindingOrigin::Document,
+            }])
+        }
+    }
+
+    struct SlowInspectionProvider;
+
+    impl InspectionProvider for SlowInspectionProvider {
+        fn id(&self) -> &str {
+            "org.example.slow"
+        }
+        fn rules(&self) -> Vec<koren_inspections::RuleMetadata> {
+            vec![koren_inspections::RuleMetadata {
+                id: "org.example.slow.wait".into(),
+                provider_id: self.id().into(),
+                title: "Slow rule".into(),
+                description: "Cancellation fixture".into(),
+                category: "test".into(),
+                languages: BTreeSet::new(),
+                default_severity: Severity::Information,
+                supports_fixes: false,
+                options: BTreeMap::new(),
+            }]
+        }
+        fn inspect(
+            &self,
+            _document: &koren_inspections::InspectionDocument,
+            _profile: &InspectionProfile,
+            _workspace: Option<&str>,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<koren_inspections::Finding>, String> {
+            for _ in 0..100 {
+                cancellation
+                    .checkpoint()
+                    .map_err(|error| error.to_string())?;
+                thread::sleep(Duration::from_millis(5));
+            }
             Ok(Vec::new())
         }
     }
@@ -3585,6 +4065,174 @@ mod tests {
             .unwrap();
         assert!(!rule.enabled);
         assert_eq!(rule.severity, Some(Severity::Error));
+        backend.shutdown();
+    }
+
+    #[test]
+    fn desktop_profile_api_creates_and_selects_workspace_profile() {
+        let temp = Temp::new();
+        let config_path = temp.0.join("settings.json");
+        let workspace = temp.0.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend.settings_path = Some(config_path.clone());
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: workspace.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            backend
+                .method(RequestMethod::CreateInspectionProfile {
+                    profile_name: "Team Strict".into(),
+                    workspace_specific: true,
+                })
+                .unwrap(),
+            ResponseValue::InspectionConfiguration(config)
+                if config.selected_profile == "Team Strict" && config.workspace_specific
+        ));
+        let persisted = load_desktop_settings(Some(&config_path));
+        assert!(
+            persisted
+                .inspection_profiles
+                .profiles
+                .contains_key("Team Strict")
+        );
+        assert!(
+            persisted
+                .inspection_profiles
+                .workspace_selection
+                .contains_key(
+                    &workspace
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                )
+        );
+    }
+
+    #[test]
+    fn sarif_desktop_commands_import_validated_reports_and_export_fresh_results() {
+        let temp = Temp::new();
+        let report_path = temp.0.join("input.sarif");
+        fs::write(
+            &report_path,
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CI"}},"results":[{"ruleId":"SAMPLE1","level":"warning","message":{"text":"Review this line"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/main.rs"},"region":{"startLine":2,"startColumn":1,"endLine":2,"endColumn":3}}}]}]}]}"#,
+        )
+        .unwrap();
+        let mut backend = DesktopBackend::new().unwrap();
+        let imported = backend
+            .method(RequestMethod::ImportSarif {
+                path: report_path.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert!(matches!(imported,
+            ResponseValue::ImportedSarif { findings, .. }
+                if findings.len() == 1 && findings[0].origin == "imported" &&
+                   findings[0].source_id.is_some() && findings[0].source_revision.is_none() &&
+                   findings[0].path == "src/main.rs"
+        ));
+        assert!(
+            backend
+                .method(RequestMethod::ExportSarif)
+                .is_ok_and(|response| matches!(response, ResponseValue::SarifReport { .. }))
+        );
+
+        fs::write(&report_path, r#"{"version":"1.0.0","runs":[]}"#).unwrap();
+        assert!(
+            backend
+                .method(RequestMethod::ImportSarif {
+                    path: report_path.to_string_lossy().into_owned(),
+                })
+                .is_err()
+        );
+        fs::write(&report_path, vec![b' '; MAX_SARIF_BYTES + 1]).unwrap();
+        assert!(
+            backend
+                .method(RequestMethod::ImportSarif {
+                    path: report_path.to_string_lossy().into_owned(),
+                })
+                .is_err()
+        );
+        backend.shutdown();
+    }
+
+    #[test]
+    fn project_inspection_exposes_progress_results_and_cancellation() {
+        let temp = Temp::new();
+        fs::write(temp.0.join("notes.txt"), "TODO").unwrap();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend
+            .inspections
+            .register(Arc::new(TestInspectionProvider))
+            .unwrap();
+        backend
+            .inspections
+            .register(Arc::new(SlowInspectionProvider))
+            .unwrap();
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: temp.0.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        backend
+            .method(RequestMethod::OpenDocument {
+                path: "notes.txt".into(),
+            })
+            .unwrap();
+        let job_id = match backend
+            .method(RequestMethod::StartProjectInspection)
+            .unwrap()
+        {
+            ResponseValue::ProjectInspectionStarted { job_id } => job_id,
+            other => panic!("unexpected response {other:?}"),
+        };
+        let mut completed = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if matches!(backend.method(RequestMethod::ProjectInspectionStatus { job_id }).unwrap(),
+                ResponseValue::ProjectInspectionStatus(summary) if summary.state == "completed" && summary.completed_documents == 1 && summary.result_count == 1)
+            {
+                completed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(completed, "project inspection did not complete");
+        assert!(
+            matches!(backend.method(RequestMethod::ProjectInspectionFindings { job_id, offset: 0, limit: 10 }).unwrap(),
+            ResponseValue::ProjectInspectionFindings(page) if page.findings.len() == 1 && page.next_offset.is_none() &&
+                page.findings[0].origin == "project_snapshot" && page.findings[0].source_id.is_some())
+        );
+
+        let cancelled_job = match backend
+            .method(RequestMethod::StartProjectInspection)
+            .unwrap()
+        {
+            ResponseValue::ProjectInspectionStarted { job_id } => job_id,
+            other => panic!("unexpected response {other:?}"),
+        };
+        backend
+            .method(RequestMethod::CancelProjectInspection {
+                job_id: cancelled_job,
+            })
+            .unwrap();
+        let mut cancelled = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if matches!(backend.method(RequestMethod::ProjectInspectionStatus { job_id: cancelled_job }).unwrap(),
+                ResponseValue::ProjectInspectionStatus(summary) if summary.state == "cancelled")
+            {
+                cancelled = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            cancelled,
+            "project inspection cancellation was not observed"
+        );
         backend.shutdown();
     }
 
@@ -3792,6 +4440,21 @@ mod tests {
         assert_eq!(findings[0].provider_id, "org.example.text-inspection");
         assert_eq!(findings[0].rule_id, "org.example.text-inspection.todo");
         assert_eq!(findings[0].actions[0].edits[0].new_text, "DONE");
+        let sarif =
+            match call_backend(&backend, &mut request_id, RequestMethod::ExportSarif).unwrap() {
+                ResponseValue::SarifReport { document, .. } => document,
+                other => panic!("unexpected response {other:?}"),
+            };
+        let sarif: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+        assert_eq!(
+            sarif
+                .pointer("/runs/0/results")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         call_backend(
             &backend,
@@ -3855,6 +4518,21 @@ mod tests {
             .unwrap(),
             ResponseValue::DocumentContents { contents, revision: 1, .. } if contents == "LATER"
         ));
+        let after_edit =
+            match call_backend(&backend, &mut request_id, RequestMethod::ExportSarif).unwrap() {
+                ResponseValue::SarifReport { document, .. } => document,
+                other => panic!("unexpected response {other:?}"),
+            };
+        let after_edit: serde_json::Value = serde_json::from_str(&after_edit).unwrap();
+        assert_eq!(
+            after_edit
+                .pointer("/runs/0/results")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
         call_backend(
             &backend,
             &mut request_id,

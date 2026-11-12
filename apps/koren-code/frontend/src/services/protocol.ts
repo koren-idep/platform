@@ -123,6 +123,8 @@ export interface InspectionFinding {
     edits: Array<{ path: string; expected_revision: number | null; range: TextRange; new_text: string }>;
     disabled_reason: string | null }>;
   origin: string;
+  source_id: string | null;
+  source_revision: string | null;
 }
 export interface InspectionRuleSummary {
   id: string; provider_id: string; title: string; description: string; category: string;
@@ -131,6 +133,10 @@ export interface InspectionRuleSummary {
 }
 export interface InspectionConfigurationSummary {
   profiles: string[]; selected_profile: string; workspace_specific: boolean; rules: InspectionRuleSummary[];
+}
+export interface ProjectInspectionSummary {
+  job_id: number; state: string; completed_documents: number; total_documents: number;
+  current_path: string | null; result_count: number; error: string | null;
 }
 
 export type RequestMethod =
@@ -141,7 +147,14 @@ export type RequestMethod =
   | { method: 'set_extension_setting'; params: { setting_id: string; value: ExtensionSettingValue } }
   | { method: 'list_inspection_rules' }
   | { method: 'select_inspection_profile'; params: { profile_name: string; workspace_specific: boolean } }
+  | { method: 'create_inspection_profile'; params: { profile_name: string; workspace_specific: boolean } }
   | { method: 'set_inspection_rule'; params: { rule_id: string; enabled: boolean; severity: string | null; workspace_specific: boolean; reset: boolean } }
+  | { method: 'import_sarif'; params: { path: string } }
+  | { method: 'export_sarif' }
+  | { method: 'start_project_inspection' }
+  | { method: 'project_inspection_status'; params: { job_id: number } }
+  | { method: 'cancel_project_inspection'; params: { job_id: number } }
+  | { method: 'project_inspection_findings'; params: { job_id: number; offset: number; limit: number } }
   | { method: 'set_extension_enabled'; params: { extension_id: string; enabled: boolean } }
   | { method: 'activate_extension'; params: { extension_id: string } }
   | { method: 'start_language_server'; params: { extension_id: string; configuration_id: string } }
@@ -196,6 +209,12 @@ export type ResponseValue =
   | { kind: 'extensions'; value: ExtensionCatalog }
   | { kind: 'extension_setting_updated'; value: { setting_id: string } }
   | { kind: 'inspection_configuration'; value: InspectionConfigurationSummary }
+  | { kind: 'imported_sarif'; value: { report_id: string; findings: InspectionFinding[]; warnings: string[] } }
+  | { kind: 'sarif_report'; value: { document: string; warnings: string[] } }
+  | { kind: 'project_inspection_started'; value: { job_id: number } }
+  | { kind: 'project_inspection_status'; value: ProjectInspectionSummary }
+  | { kind: 'project_inspection_findings'; value: { job_id: number; offset: number; next_offset: number | null; findings: InspectionFinding[] } }
+  | { kind: 'project_inspection_cancelled'; value: { job_id: number } }
   | { kind: 'extension_changed'; value: ExtensionSummary }
   | { kind: 'language_servers'; value: LanguageServerSummary[] }
   | { kind: 'language_server_approval_required'; value: LanguageServerApprovalSummary }

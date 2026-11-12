@@ -797,6 +797,17 @@ impl InspectionJob {
     pub fn try_progress(&self) -> Option<InspectionProgress> {
         self.progress_receiver.try_iter().last()
     }
+    /// Checks whether the job has completed without cancelling it when still pending.
+    ///
+    /// # Errors
+    /// Returns [`InspectionError::WorkerTerminated`] if the worker exited without a result.
+    pub fn try_result(&self) -> Result<Option<Vec<Finding>>, InspectionError> {
+        match self.receiver.try_recv() {
+            Ok(result) => result.map(Some),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(InspectionError::WorkerTerminated),
+        }
+    }
     /// Waits up to a caller-selected timeout for the completed findings.
     ///
     /// # Errors
@@ -1643,5 +1654,27 @@ mod tests {
             import_sarif(&" ".repeat(MAX_SARIF_BYTES + 1), "report", None),
             Err(InspectionError::SarifSize(_))
         ));
+    }
+
+    #[test]
+    fn project_job_result_can_be_polled_without_cancelling_pending_work() {
+        let service = InspectionService::default();
+        let job = service
+            .inspect_project(
+                "polling",
+                Vec::new(),
+                InspectionProfile::new("Default"),
+                None,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(findings) = job.try_result().unwrap() {
+                assert_eq!(findings, [] as [Finding; 0]);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }

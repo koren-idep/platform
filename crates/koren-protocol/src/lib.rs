@@ -74,6 +74,13 @@ pub enum RequestMethod {
         /// Apply this choice only to the current workspace.
         workspace_specific: bool,
     },
+    /// Create and select a named inspection profile.
+    CreateInspectionProfile {
+        /// New profile display name.
+        profile_name: String,
+        /// Select this profile only for the active workspace.
+        workspace_specific: bool,
+    },
     /// Update one registered rule in the selected profile, or reset it to provider defaults.
     SetInspectionRule {
         /// Stable registered rule ID.
@@ -86,6 +93,34 @@ pub enum RequestMethod {
         workspace_specific: bool,
         /// Remove the override and restore provider defaults.
         reset: bool,
+    },
+    /// Import a user-selected local SARIF file.
+    ImportSarif {
+        /// Absolute path returned by the native file chooser.
+        path: String,
+    },
+    /// Export the currently fresh inspection results as SARIF 2.1.0.
+    ExportSarif,
+    /// Start an explicit inspection job over the currently open workspace documents.
+    StartProjectInspection,
+    /// Read the progress summary for a started inspection job.
+    ProjectInspectionStatus {
+        /// Job identity.
+        job_id: u64,
+    },
+    /// Request cancellation of an active project inspection job.
+    CancelProjectInspection {
+        /// Job identity.
+        job_id: u64,
+    },
+    /// Read one bounded page of project inspection findings.
+    ProjectInspectionFindings {
+        /// Job identity.
+        job_id: u64,
+        /// First result offset.
+        offset: usize,
+        /// Maximum result count, capped by the host.
+        limit: usize,
     },
     /// Explicitly enable an installed extension without executing its code.
     SetExtensionEnabled {
@@ -476,6 +511,36 @@ pub enum ResponseValue {
     },
     /// Current inspection profile and rule configuration.
     InspectionConfiguration(InspectionConfigurationSummary),
+    /// Imported historical findings from a user-selected SARIF report.
+    ImportedSarif {
+        /// Import report identity.
+        report_id: String,
+        /// Imported findings, clearly marked with imported origin.
+        findings: Vec<InspectionFinding>,
+        /// Adapter warnings for unsupported fields or actions.
+        warnings: Vec<String>,
+    },
+    /// Exported SARIF document and adapter warnings.
+    SarifReport {
+        /// Serialized SARIF 2.1.0 document.
+        document: String,
+        /// Adapter warnings for unsupported fields or actions.
+        warnings: Vec<String>,
+    },
+    /// A project inspection job was accepted.
+    ProjectInspectionStarted {
+        /// Job identity.
+        job_id: u64,
+    },
+    /// Progress summary for a project inspection job.
+    ProjectInspectionStatus(ProjectInspectionSummary),
+    /// One page of project inspection findings.
+    ProjectInspectionFindings(ProjectInspectionFindingPage),
+    /// A cancellation request was recorded.
+    ProjectInspectionCancelled {
+        /// Job identity.
+        job_id: u64,
+    },
     /// Extension lifecycle transition result.
     ExtensionChanged(ExtensionSummary),
     /// Installed extension language-server configurations.
@@ -1118,6 +1183,10 @@ pub struct InspectionFinding {
     pub actions: Vec<InspectionCodeAction>,
     /// Distinguishes imported/project/document results.
     pub origin: String,
+    /// Imported report or project snapshot identifier, when available.
+    pub source_id: Option<String>,
+    /// Source revision attached to a historical imported result, when known.
+    pub source_revision: Option<String>,
 }
 
 /// Inspection profile settings exposed to a desktop host.
@@ -1131,6 +1200,38 @@ pub struct InspectionConfigurationSummary {
     pub workspace_specific: bool,
     /// Registered rules and effective values.
     pub rules: Vec<InspectionRuleSummary>,
+}
+
+/// Progress and lifecycle state for one explicit project snapshot job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectInspectionSummary {
+    /// Job identity.
+    pub job_id: u64,
+    /// Current state: queued, running, completed, cancelled, or failed.
+    pub state: String,
+    /// Documents completed by providers.
+    pub completed_documents: usize,
+    /// Documents captured in the snapshot.
+    pub total_documents: usize,
+    /// Most recently analyzed workspace-relative path.
+    pub current_path: Option<String>,
+    /// Findings retained from the completed job.
+    pub result_count: usize,
+    /// Provider or worker failure, if any.
+    pub error: Option<String>,
+}
+
+/// Bounded page of a completed project analysis.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectInspectionFindingPage {
+    /// Job identity.
+    pub job_id: u64,
+    /// Starting result offset.
+    pub offset: usize,
+    /// Next result offset, or none at the end.
+    pub next_offset: Option<usize>,
+    /// Current page of findings.
+    pub findings: Vec<InspectionFinding>,
 }
 
 /// Registered inspection rule plus the currently effective settings.

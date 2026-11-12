@@ -276,3 +276,5 @@ kbd {
 .inspection-rule { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
 .inspection-rule-description { display: grid; gap: 2px; min-width: 0; }
 .inspection-rule-description small { color: var(--muted); overflow-wrap: anywhere; }
+.project-analysis-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 8px; border-bottom: 1px solid var(--border); }
+.project-analysis-controls span { color: var(--muted); font-size: 11px; flex-basis: 100%; }

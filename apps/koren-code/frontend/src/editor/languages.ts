@@ -18,7 +18,7 @@ function findLanguage(path: string): LanguageIntegration | undefined {
   return [...integrations.values()].find((item) => item.extensions.includes(suffix ?? ''));
 }
 registerLanguage({
-  id: 'rust-basic',
+  id: 'rust',
   label: 'Rust',
   extensions: ['rs'],
   async create() {
