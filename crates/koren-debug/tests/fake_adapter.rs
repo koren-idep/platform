@@ -6,7 +6,7 @@ use koren_debug::{
 };
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -35,19 +35,19 @@ fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
     );
 }
 
-#[test]
-fn fake_adapter_initializes_stops_inspects_and_disconnects() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let adapter_script = root.join("tests/fake_adapter.py");
-    let python = if cfg!(windows) { "python" } else { "python3" };
+fn manager_with_fake_adapter(root: &Path) -> DebugManager {
     let mut manager = DebugManager::new();
     manager
         .register_adapter(DebugAdapterDefinition {
             id: "fake".into(),
             name: "Fake DAP".into(),
-            command: python.into(),
-            arguments: vec![adapter_script.to_string_lossy().into_owned()],
-            working_directory: root.clone(),
+            command: if cfg!(windows) { "python" } else { "python3" }.into(),
+            arguments: vec![
+                root.join("tests/fake_adapter.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            working_directory: root.to_path_buf(),
             environment: BTreeMap::new(),
         })
         .unwrap();
@@ -60,12 +60,39 @@ fn fake_adapter_initializes_stops_inspects_and_disconnects() {
             program: Some(root.join("fixture")),
             process_id: None,
             arguments: vec![],
-            working_directory: root.clone(),
+            working_directory: root.to_path_buf(),
             environment: BTreeMap::new(),
             adapter_settings: serde_json::Map::new(),
             stop_on_entry: false,
         })
         .unwrap();
+    manager
+}
+
+fn wait_for_response(
+    manager: &DebugManager,
+    session: &koren_debug::DebugSessionHandle,
+    request_id: u64,
+    command: &str,
+) {
+    let mut observed = Vec::new();
+    wait_until(command, || {
+        observed.extend(manager.drain_events());
+        assert_ne!(
+            session.info().state,
+            DebugSessionState::Failed,
+            "{observed:?}"
+        );
+        observed.iter().any(|event| matches!(event,
+            koren_debug::DebugEvent::Response { request_id: response_id, command: response_command, success: true, .. }
+                if *response_id == request_id && response_command == command))
+    });
+}
+
+#[test]
+fn fake_adapter_initializes_stops_inspects_and_disconnects() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut manager = manager_with_fake_adapter(&root);
     let source = root.join("fixture.src");
     manager
         .set_source_breakpoints(
@@ -94,48 +121,18 @@ fn fake_adapter_initializes_stops_inspects_and_disconnects() {
     );
 
     let thread_request = session.threads().unwrap();
-    let mut observed = Vec::new();
-    wait_until("threads response", || {
-        observed.extend(manager.drain_events());
-        if session.info().state == DebugSessionState::Failed {
-            panic!("session failed: {:?}; events: {observed:?}", session.info());
-        }
-        observed.iter().any(|event| {
-            matches!(event,
-        koren_debug::DebugEvent::Response { request_id, command, success: true, .. }
-            if *request_id == thread_request && command == "threads")
-        })
-    });
-    observed.clear();
+    wait_for_response(&manager, &session, thread_request, "threads");
     let stack_request = session.stack_trace(1, 0, 10).unwrap();
-    wait_until("stack response", || {
-        manager.drain_events().iter().any(|event| {
-            matches!(event,
-        koren_debug::DebugEvent::Response { request_id, command, success: true, .. }
-            if *request_id == stack_request && command == "stackTrace")
-        })
-    });
+    wait_for_response(&manager, &session, stack_request, "stackTrace");
     let scope_request = session.scopes(7).unwrap();
-    wait_until("scopes response", || {
-        manager.drain_events().iter().any(|event| {
-            matches!(event,
-        koren_debug::DebugEvent::Response { request_id, command, success: true, .. }
-            if *request_id == scope_request && command == "scopes")
-        })
-    });
+    wait_for_response(&manager, &session, scope_request, "scopes");
     let reference = koren_debug::VariableReference {
         session_id: started.session_id,
         stop_generation: session.info().stop_generation,
         adapter_reference: 11,
     };
     let variables_request = session.variables(reference, None, 0, 20).unwrap();
-    wait_until("variables response", || {
-        manager.drain_events().iter().any(|event| {
-            matches!(event,
-        koren_debug::DebugEvent::Response { request_id, command, success: true, .. }
-            if *request_id == variables_request && command == "variables")
-        })
-    });
+    wait_for_response(&manager, &session, variables_request, "variables");
     session.continue_execution().unwrap();
     wait_until("continue state", || {
         session.info().state == DebugSessionState::Running

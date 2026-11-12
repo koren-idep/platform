@@ -124,6 +124,10 @@ pub struct DebugConfiguration {
 
 impl DebugConfiguration {
     /// Validates common fields and rejects adapter settings that could override host-reviewed fields.
+    ///
+    /// # Errors
+    /// Returns an error when a common field is invalid, an adapter setting is reserved, or the
+    /// adapter-specific settings exceed the configured bound.
     pub fn validate(&self) -> Result<(), DebugError> {
         if self.id.trim().is_empty()
             || self.id.len() > 128
@@ -236,18 +240,42 @@ pub enum DebugSessionState {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DebugCapabilities {
+    /// Optional initialization and session-management requests.
+    pub requests: DebugRequestCapabilities,
+    /// Program lifecycle features.
+    pub execution: DebugExecutionCapabilities,
+    /// Bounded inspection features.
+    pub inspection: DebugInspectionCapabilities,
+}
+
+/// Optional DAP requests advertised by an adapter.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebugRequestCapabilities {
     /// Adapter accepts the optional `configurationDone` request.
-    pub supports_configuration_done_request: bool,
-    /// Adapter supports graceful `terminate` before disconnecting a launched target.
-    pub supports_terminate_request: bool,
+    pub configuration_done: bool,
     /// Adapter supports restart requests.
-    pub supports_restart_request: bool,
-    /// Adapter supports paging variable collections.
-    pub supports_variable_paging: bool,
-    /// Adapter can evaluate expressions. Evaluation is not exposed by this phase.
-    pub supports_evaluate_for_hovers: bool,
+    pub restart: bool,
     /// Adapter supports cancel requests.
-    pub supports_cancel_request: bool,
+    pub cancel: bool,
+}
+
+/// DAP debuggee execution capabilities.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebugExecutionCapabilities {
+    /// Adapter supports graceful `terminate` before disconnecting a launched target.
+    pub terminate: bool,
+}
+
+/// DAP inspection capabilities.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebugInspectionCapabilities {
+    /// Adapter supports paging variable collections.
+    pub variable_paging: bool,
+    /// Adapter can evaluate expressions. Evaluation is not exposed by this phase.
+    pub evaluate_for_hovers: bool,
 }
 
 /// Current immutable public view of a debug session.
@@ -487,6 +515,9 @@ impl DebugSessionHandle {
     }
 
     /// Requests continue in the stopped thread.
+    ///
+    /// # Errors
+    /// Returns an error when the session is not paused or its bounded command queue is full.
     pub fn continue_execution(&self) -> Result<u64, DebugError> {
         let info = self.info();
         if info.state != DebugSessionState::Paused {
@@ -499,6 +530,9 @@ impl DebugSessionHandle {
     }
 
     /// Requests pause in the current execution.
+    ///
+    /// # Errors
+    /// Returns an error when the session is not running or its bounded command queue is full.
     pub fn pause(&self, thread_id: i64) -> Result<u64, DebugError> {
         let info = self.info();
         if info.state != DebugSessionState::Running {
@@ -508,6 +542,9 @@ impl DebugSessionHandle {
     }
 
     /// Requests step over in a stopped thread.
+    ///
+    /// # Errors
+    /// Returns an error when the session is not paused or its bounded command queue is full.
     pub fn step_over(&self, thread_id: i64) -> Result<u64, DebugError> {
         self.require_paused()?;
         self.request(
@@ -517,6 +554,9 @@ impl DebugSessionHandle {
     }
 
     /// Requests step into in a stopped thread.
+    ///
+    /// # Errors
+    /// Returns an error when the session is not paused or its bounded command queue is full.
     pub fn step_into(&self, thread_id: i64) -> Result<u64, DebugError> {
         self.require_paused()?;
         self.request(
@@ -526,6 +566,9 @@ impl DebugSessionHandle {
     }
 
     /// Requests step out in a stopped thread.
+    ///
+    /// # Errors
+    /// Returns an error when the session is not paused or its bounded command queue is full.
     pub fn step_out(&self, thread_id: i64) -> Result<u64, DebugError> {
         self.require_paused()?;
         self.request(
@@ -535,12 +578,18 @@ impl DebugSessionHandle {
     }
 
     /// Requests the current thread list.
+    ///
+    /// # Errors
+    /// Returns an error when the session is finished or its bounded command queue is full.
     pub fn threads(&self) -> Result<u64, DebugError> {
         self.require_live()?;
         self.request("threads", json!({}))
     }
 
     /// Requests one bounded stack-trace page.
+    ///
+    /// # Errors
+    /// Returns an error when the session is not paused or its bounded command queue is full.
     pub fn stack_trace(
         &self,
         thread_id: i64,
@@ -556,12 +605,19 @@ impl DebugSessionHandle {
     }
 
     /// Requests scopes for a current stack frame.
+    ///
+    /// # Errors
+    /// Returns an error when the session is not paused or its bounded command queue is full.
     pub fn scopes(&self, frame_id: i64) -> Result<u64, DebugError> {
         self.require_paused()?;
         self.request("scopes", json!({"frameId": frame_id}))
     }
 
     /// Requests one bounded variable page, rejecting references from older stops.
+    ///
+    /// # Errors
+    /// Returns an error when the reference is stale, the session is not paused, or its command
+    /// queue is full.
     pub fn variables(
         &self,
         reference: VariableReference,
@@ -585,17 +641,23 @@ impl DebugSessionHandle {
                 arguments["filter"] = Value::String(filter.to_owned());
             }
         }
-        if !info.capabilities.supports_variable_paging {
-            arguments.as_object_mut().unwrap().remove("start");
-            arguments.as_object_mut().unwrap().remove("count");
+        if !info.capabilities.inspection.variable_paging {
+            if let Some(object) = arguments.as_object_mut() {
+                object.remove("start");
+                object.remove("count");
+            }
         }
         self.request("variables", arguments)
     }
 
     /// Requests restart only when the adapter advertised that capability.
+    ///
+    /// # Errors
+    /// Returns an error when restart is unsupported, the session is finished, or the command
+    /// queue is full.
     pub fn restart(&self) -> Result<u64, DebugError> {
         let info = self.info();
-        if !info.capabilities.supports_restart_request {
+        if !info.capabilities.requests.restart {
             return Err(DebugError::Unsupported("restart".into()));
         }
         self.require_live()?;
@@ -603,6 +665,9 @@ impl DebugSessionHandle {
     }
 
     /// Stops or disconnects the adapter. Attached targets are always left running.
+    ///
+    /// # Errors
+    /// Returns an error when the session is already finished or its bounded command queue is full.
     pub fn stop(&self) -> Result<(), DebugError> {
         let mut info = lock(&self.info);
         if matches!(
@@ -613,7 +678,7 @@ impl DebugSessionHandle {
         }
         self.commands
             .try_send(SessionCommand::Stop)
-            .map_err(map_send_error)?;
+            .map_err(|error| map_send_error(&error))?;
         info.state = DebugSessionState::Terminating;
         info.stop_generation = info.stop_generation.saturating_add(1);
         Ok(())
@@ -648,14 +713,14 @@ impl DebugSessionHandle {
                 command: command.to_owned(),
                 arguments,
             })
-            .map_err(map_send_error)?;
+            .map_err(|error| map_send_error(&error))?;
         Ok(request_id)
     }
 
     fn replace_breakpoints(&self, source: PathBuf) -> Result<(), DebugError> {
         self.commands
             .try_send(SessionCommand::ReplaceBreakpoints { source })
-            .map_err(map_send_error)
+            .map_err(|error| map_send_error(&error))
     }
 }
 
@@ -710,6 +775,9 @@ impl DebugManager {
     }
 
     /// Registers a local adapter definition without starting it.
+    ///
+    /// # Errors
+    /// Returns an error for invalid definitions or an identifier that is already registered.
     pub fn register_adapter(&mut self, adapter: DebugAdapterDefinition) -> Result<(), DebugError> {
         validate_adapter(&adapter)?;
         if self.adapters.contains_key(&adapter.id) {
@@ -722,6 +790,9 @@ impl DebugManager {
     }
 
     /// Registers a validated configuration for an existing adapter.
+    ///
+    /// # Errors
+    /// Returns an error when validation fails, the adapter is missing, or the identifier is used.
     pub fn register_configuration(
         &mut self,
         configuration: DebugConfiguration,
@@ -753,6 +824,9 @@ impl DebugManager {
     }
 
     /// Returns exact adapter and target details for a configuration approval prompt.
+    ///
+    /// # Errors
+    /// Returns [`DebugError::NotFound`] when the configuration or adapter is not registered.
     pub fn authorization_details(
         &self,
         configuration_id: &str,
@@ -777,6 +851,10 @@ impl DebugManager {
     ///
     /// The method only spawns the actor thread; process startup and DAP initialization happen on
     /// that independent thread. A failed adapter cannot block this caller or other sessions.
+    ///
+    /// # Errors
+    /// Returns an error when the session limit is reached, either authorization is denied, the
+    /// identifier space is exhausted, or the session actor cannot be created.
     pub fn start_session(
         &mut self,
         configuration_id: &str,
@@ -845,6 +923,9 @@ impl DebugManager {
     }
 
     /// Returns a handle to one active, initializing, or completed session.
+    ///
+    /// # Errors
+    /// Returns [`DebugError::NotFound`] when no session has that identifier.
     pub fn session(&self, session_id: u64) -> Result<DebugSessionHandle, DebugError> {
         self.sessions
             .get(&session_id)
@@ -862,6 +943,10 @@ impl DebugManager {
     }
 
     /// Replaces all requested breakpoints for one source and synchronizes active sessions.
+    ///
+    /// # Errors
+    /// Returns an error when the source path is not absolute, requested coordinates exceed DAP
+    /// limits, the breakpoint count exceeds the limit, or an active session queue is full.
     pub fn set_source_breakpoints(
         &mut self,
         source: &Path,
@@ -965,7 +1050,9 @@ impl DebugManager {
     }
 
     fn publish(&self, event: DebugEvent) -> Result<(), DebugError> {
-        self.event_tx.try_send(event).map_err(map_send_error)
+        self.event_tx
+            .try_send(event)
+            .map_err(|error| map_send_error(&error))
     }
 }
 
@@ -1013,7 +1100,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn map_send_error<T>(error: TrySendError<T>) -> DebugError {
+fn map_send_error<T>(error: &TrySendError<T>) -> DebugError {
     match error {
         TrySendError::Full(_) => DebugError::Backpressure,
         TrySendError::Disconnected(_) => {
@@ -1137,9 +1224,7 @@ fn run_session(startup: SessionStartup) {
         next_sequence: 1,
         next_event_sequence: 0,
         pending: BTreeMap::new(),
-        initialized_event: false,
-        initialized_response: false,
-        launch_response: false,
+        startup_progress: StartupProgress::default(),
         stopped: false,
         stop_deadline: None,
         last_activity: Instant::now(),
@@ -1157,12 +1242,17 @@ struct SessionActor {
     next_sequence: u64,
     next_event_sequence: u64,
     pending: BTreeMap<u64, PendingRequest>,
-    initialized_event: bool,
-    initialized_response: bool,
-    launch_response: bool,
+    startup_progress: StartupProgress,
     stopped: bool,
     stop_deadline: Option<Instant>,
     last_activity: Instant,
+}
+
+#[derive(Default)]
+struct StartupProgress {
+    initialized_event: bool,
+    initialized_response: bool,
+    launch_response: bool,
 }
 
 impl SessionActor {
@@ -1197,7 +1287,7 @@ impl SessionActor {
                 }
             }
             match self.adapter_rx.try_recv() {
-                Ok(AdapterInput::Message(message)) => self.handle_message(message),
+                Ok(AdapterInput::Message(message)) => self.handle_message(&message),
                 Ok(AdapterInput::Failed(message)) => {
                     self.fail(message);
                     break;
@@ -1253,7 +1343,7 @@ impl SessionActor {
     }
 
     fn initialize(&mut self) -> Result<(), DebugError> {
-        let initialize = self.send_request(
+        let sequence = self.send_request(
             "initialize",
             json!({
                 "clientID": "koren-code",
@@ -1270,41 +1360,29 @@ impl SessionActor {
                 "supportsInvalidatedEvent": true
             }),
         )?;
+        self.await_initialization(sequence)?;
+        self.set_state(DebugSessionState::Configuring, None);
+        self.configure_sources()?;
+        self.await_launch()?;
+        if self.info().state == DebugSessionState::Configuring {
+            self.set_state(DebugSessionState::Running, None);
+        }
+        Ok(())
+    }
+
+    fn await_initialization(&mut self, initialize_sequence: u64) -> Result<(), DebugError> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
-        while Instant::now() < deadline && (!self.initialized_response || !self.initialized_event) {
-            match self.adapter_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(AdapterInput::Message(message)) => {
-                    self.handle_initialize_message(message, initialize)
-                }
-                Ok(AdapterInput::Failed(message)) => return Err(DebugError::Transport(message)),
-                Ok(AdapterInput::Closed) => {
-                    return Err(DebugError::Transport(
-                        "debug adapter closed during initialization".into(),
-                    ));
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    if let Some(status) = self
-                        .child
-                        .try_wait()
-                        .map_err(|error| DebugError::Transport(error.to_string()))?
-                    {
-                        return Err(DebugError::Transport(format!(
-                            "debug adapter exited during initialization ({status})"
-                        )));
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(DebugError::Transport(
-                        "debug adapter reader stopped during initialization".into(),
-                    ));
-                }
-            }
-            if self.initialized_response
-                && !self.launch_response
+        while Instant::now() < deadline
+            && (!self.startup_progress.initialized_response
+                || !self.startup_progress.initialized_event)
+        {
+            self.receive_startup_message("initialization", Some(initialize_sequence))?;
+            if self.startup_progress.initialized_response
+                && !self.startup_progress.launch_response
                 && !self
                     .pending
                     .values()
-                    .any(|p| p.command == "launch" || p.command == "attach")
+                    .any(|pending| pending.command == "launch" || pending.command == "attach")
             {
                 let command = match self.startup.configuration.request {
                     DebugRequestType::Launch => "launch",
@@ -1321,64 +1399,82 @@ impl SessionActor {
                 ));
             }
         }
-        if !self.initialized_response || !self.initialized_event {
-            return Err(DebugError::Transport(
-                "debug adapter initialization timed out".into(),
-            ));
-        }
-        self.set_state(DebugSessionState::Configuring, None);
-        let sources = lock(&self.startup.breakpoints)
-            .iter()
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-        for source in sources {
-            self.sync_source(&source);
-        }
-        if self.info().capabilities.supports_configuration_done_request {
-            let request_id = self.alloc_event_id();
-            let _ =
-                self.send_operation(request_id, "configurationDone", json!({}), None, Vec::new());
-        }
-        let deadline = Instant::now() + STARTUP_TIMEOUT;
-        while Instant::now() < deadline && !self.launch_response {
-            match self.adapter_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(AdapterInput::Message(message)) => self.handle_message(message),
-                Ok(AdapterInput::Failed(message)) => return Err(DebugError::Transport(message)),
-                Ok(AdapterInput::Closed) => {
-                    return Err(DebugError::Transport(
-                        "debug adapter closed before launch completed".into(),
-                    ));
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    if let Some(status) = self
-                        .child
-                        .try_wait()
-                        .map_err(|error| DebugError::Transport(error.to_string()))?
-                    {
-                        return Err(DebugError::Transport(format!(
-                            "debug adapter exited during launch ({status})"
-                        )));
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(DebugError::Transport(
-                        "debug adapter reader stopped during launch".into(),
-                    ));
-                }
-            }
-        }
-        if !self.launch_response {
-            return Err(DebugError::Transport(
-                "debug adapter launch timed out".into(),
-            ));
-        }
-        if self.info().state == DebugSessionState::Configuring {
-            self.set_state(DebugSessionState::Running, None);
+        if !self.startup_progress.initialized_response || !self.startup_progress.initialized_event {
+            return Err(DebugError::Transport(format!(
+                "debug adapter did not complete initialization request {initialize_sequence}"
+            )));
         }
         Ok(())
     }
 
-    fn handle_initialize_message(&mut self, message: Value, initialize_sequence: u64) {
+    fn receive_startup_message(
+        &mut self,
+        phase: &str,
+        initialize_sequence: Option<u64>,
+    ) -> Result<(), DebugError> {
+        match self.adapter_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(AdapterInput::Message(message)) => {
+                if let Some(sequence) = initialize_sequence {
+                    self.handle_initialize_message(&message, sequence);
+                } else {
+                    self.handle_message(&message);
+                }
+            }
+            Ok(AdapterInput::Failed(message)) => return Err(DebugError::Transport(message)),
+            Ok(AdapterInput::Closed) => {
+                return Err(DebugError::Transport(format!(
+                    "debug adapter closed during {phase}"
+                )));
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(status) = self
+                    .child
+                    .try_wait()
+                    .map_err(|error| DebugError::Transport(error.to_string()))?
+                {
+                    return Err(DebugError::Transport(format!(
+                        "debug adapter exited during {phase} ({status})"
+                    )));
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(DebugError::Transport(format!(
+                    "debug adapter reader stopped during {phase}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn configure_sources(&mut self) -> Result<(), DebugError> {
+        let sources = lock(&self.startup.breakpoints)
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for source in sources {
+            self.sync_source(&source);
+        }
+        if self.info().capabilities.requests.configuration_done {
+            let request_id = self.alloc_event_id();
+            self.send_operation(request_id, "configurationDone", json!({}), None, Vec::new())?;
+        }
+        Ok(())
+    }
+
+    fn await_launch(&mut self) -> Result<(), DebugError> {
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        while Instant::now() < deadline && !self.startup_progress.launch_response {
+            self.receive_startup_message("launch", None)?;
+        }
+        if !self.startup_progress.launch_response {
+            return Err(DebugError::Transport(
+                "debug adapter launch timed out".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn handle_initialize_message(&mut self, message: &Value, initialize_sequence: u64) {
         match message.get("type").and_then(Value::as_str) {
             Some("response")
                 if message.get("request_seq").and_then(Value::as_u64)
@@ -1396,21 +1492,21 @@ impl SessionActor {
                             .unwrap_or("DAP initialize request failed")
                             .to_owned(),
                     );
-                    self.initialized_response = true;
+                    self.startup_progress.initialized_response = true;
                     return;
                 }
                 let body = message.get("body").and_then(Value::as_object);
                 if let Some(body) = body {
                     lock(&self.startup.info).capabilities = parse_capabilities(body);
                 }
-                self.initialized_response = true;
+                self.startup_progress.initialized_response = true;
                 self.last_activity = Instant::now();
             }
             _ => self.handle_message(message),
         }
     }
 
-    fn handle_message(&mut self, message: Value) {
+    fn handle_message(&mut self, message: &Value) {
         self.last_activity = Instant::now();
         match message.get("type").and_then(Value::as_str) {
             Some("response") => self.handle_response(message),
@@ -1420,7 +1516,7 @@ impl SessionActor {
         }
     }
 
-    fn handle_response(&mut self, message: Value) {
+    fn handle_response(&mut self, message: &Value) {
         let Some(sequence) = message.get("request_seq").and_then(Value::as_u64) else {
             self.fail("DAP response omitted request_seq".into());
             return;
@@ -1438,7 +1534,7 @@ impl SessionActor {
             .and_then(Value::as_str)
             .map(str::to_owned);
         if pending.command == "launch" || pending.command == "attach" {
-            self.launch_response = success;
+            self.startup_progress.launch_response = success;
         }
         if pending.command == "setBreakpoints" {
             if let Some(source) = pending.source.as_ref() {
@@ -1472,7 +1568,7 @@ impl SessionActor {
         }
     }
 
-    fn handle_event(&mut self, message: Value) {
+    fn handle_event(&mut self, message: &Value) {
         let Some(event) = message.get("event").and_then(Value::as_str) else {
             self.fail("DAP event omitted its event name".into());
             return;
@@ -1480,7 +1576,7 @@ impl SessionActor {
         let body = message.get("body").cloned();
         match event {
             "initialized" => {
-                self.initialized_event = true;
+                self.startup_progress.initialized_event = true;
                 self.set_state(DebugSessionState::Configuring, None);
             }
             "stopped" => {
@@ -1573,7 +1669,7 @@ impl SessionActor {
         }
     }
 
-    fn reject_reverse_request(&mut self, message: Value) {
+    fn reject_reverse_request(&mut self, message: &Value) {
         let request_seq = message.get("seq").and_then(Value::as_u64).unwrap_or(0);
         let command = message
             .get("command")
@@ -1620,8 +1716,12 @@ impl SessionActor {
 
     fn send_request(&mut self, command: &str, arguments: Value) -> Result<u64, DebugError> {
         let sequence = self.alloc_sequence();
-        let message =
-            json!({"seq":sequence,"type":"request","command":command,"arguments":arguments});
+        let mut message = Map::new();
+        message.insert("seq".into(), json!(sequence));
+        message.insert("type".into(), json!("request"));
+        message.insert("command".into(), json!(command));
+        message.insert("arguments".into(), arguments);
+        let message = Value::Object(message);
         write_message(&mut self.stdin, &message)
             .map_err(|error| DebugError::Transport(error.to_string()))?;
         self.last_activity = Instant::now();
@@ -1723,7 +1823,7 @@ impl SessionActor {
         self.stopped = true;
         let launched = self.info().request == DebugRequestType::Launch;
         let capabilities = self.info().capabilities;
-        if launched && capabilities.supports_terminate_request {
+        if launched && capabilities.execution.terminate {
             let _ = self.send_operation(0, "terminate", json!({"restart":false}), None, Vec::new());
             let _ = self.send_operation(
                 0,
@@ -1880,12 +1980,18 @@ fn configuration_arguments(configuration: &DebugConfiguration) -> Value {
 fn parse_capabilities(body: &Map<String, Value>) -> DebugCapabilities {
     let supported = |name: &str| body.get(name).and_then(Value::as_bool).unwrap_or(false);
     DebugCapabilities {
-        supports_configuration_done_request: supported("supportsConfigurationDoneRequest"),
-        supports_terminate_request: supported("supportsTerminateRequest"),
-        supports_restart_request: supported("supportsRestartRequest"),
-        supports_variable_paging: supported("supportsVariablePaging"),
-        supports_evaluate_for_hovers: supported("supportsEvaluateForHovers"),
-        supports_cancel_request: supported("supportsCancelRequest"),
+        requests: DebugRequestCapabilities {
+            configuration_done: supported("supportsConfigurationDoneRequest"),
+            restart: supported("supportsRestartRequest"),
+            cancel: supported("supportsCancelRequest"),
+        },
+        execution: DebugExecutionCapabilities {
+            terminate: supported("supportsTerminateRequest"),
+        },
+        inspection: DebugInspectionCapabilities {
+            variable_paging: supported("supportsVariablePaging"),
+            evaluate_for_hovers: supported("supportsEvaluateForHovers"),
+        },
     }
 }
 
@@ -2075,13 +2181,13 @@ mod tests {
         manager
             .register_configuration(configuration(&root))
             .unwrap();
-        assert!(manager.sessions().is_empty());
+        assert_eq!(manager.sessions().len(), 0);
         assert!(
             manager
                 .start_session("fake.launch", &mut DenyTarget)
                 .is_err()
         );
-        assert!(manager.sessions().is_empty());
+        assert_eq!(manager.sessions().len(), 0);
         assert!(!pid_file.exists());
         fs::remove_dir_all(root).unwrap();
     }
