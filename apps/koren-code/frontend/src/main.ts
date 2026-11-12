@@ -1,15 +1,17 @@
 import { redo, redoDepth, selectAll, undo, undoDepth } from '@codemirror/commands';
-import { EditorState } from '@codemirror/state';
+import { Compartment, EditorState } from '@codemirror/state';
 import { basicSetup, EditorView } from 'codemirror';
 import { linter, setDiagnostics, type Diagnostic as CodeMirrorDiagnostic } from '@codemirror/lint';
 import { KorenClient, KorenError, createDesktopTransport } from './services/client';
-import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary, ExtensionSettingSummary, ExtensionSettingValue, ExtensionSummary, ExtensionThemeSummary, ExtensionToolWindowSummary, ExtensionUiDocument, InspectionConfigurationSummary, InspectionFinding, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ProjectInspectionSummary, ResponseValue, TaskSummary, TextRange } from './services/protocol';
+import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary, ExtensionSettingSummary, ExtensionSettingValue, ExtensionSummary, ExtensionThemeSummary, ExtensionToolWindowSummary, ExtensionUiDocument, GitRepositorySummary, GitStatusSummary, InspectionConfigurationSummary, InspectionFinding, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ProjectInspectionSummary, ResponseValue, TaskSummary, TextRange } from './services/protocol';
+import type { SearchMatch } from './services/protocol';
 import { approvalChoice, conflictChoice } from './app/dialogs';
 import { commandShortcutMatches, filterCommands, nextCommandSelection } from './app/commands';
 import { activePanelLayout, diagnosticDetailMatches, extensionMenusAt, safeThemeVariables, validExtensionSettingValue } from './app/extensions';
 import { readLayout, persistLayout, type LayoutPreferences } from './app/layout';
 import { formatCursorPosition, lineEndingFor } from './app/status';
 import { runConfigurationTasks, selectedRunTask } from './app/toolbar';
+import { groupSearchMatches, normalizedCommitMessage, partitionGitFiles, searchSummaryText } from './app/developerTools';
 import { nextTheme, persistTheme, readTheme } from './app/theme';
 import { taskStatus, visibleOutput } from './app/taskPresentation';
 import { extensionCanActivate, extensionToggleLabel, languageServerEnabled } from './app/extensions';
@@ -33,7 +35,7 @@ app.innerHTML = `
       <details class="menu-group"><summary>File</summary><div class="menu-popup" role="menu">
         <button role="menuitem" data-action="open">Open Folder… <kbd>Ctrl+O</kbd></button>
         <button role="menuitem" data-action="open-file" id="menu-open-file" disabled>Open File… <kbd>Ctrl+Shift+O</kbd></button>
-        <button role="menuitem" disabled title="New file creation is not available yet">New File</button>
+        <button role="menuitem" data-action="new-file">New File <kbd>Ctrl+N</kbd></button>
         <div class="menu-separator"></div>
         <button role="menuitem" data-action="save">Save <kbd>Ctrl+S</kbd></button>
         <button role="menuitem" data-action="save-all">Save All</button>
@@ -53,6 +55,8 @@ app.innerHTML = `
         <button role="menuitem" data-action="show-panel" data-panel-target="tasks">Tasks</button>
         <button role="menuitem" data-action="show-panel" data-panel-target="problems">Problems</button>
         <button role="menuitem" data-action="show-panel" data-panel-target="projects">Projects</button>
+        <button role="menuitem" data-action="show-panel" data-panel-target="search">Search <kbd>Ctrl+Shift+F</kbd></button>
+        <button role="menuitem" data-action="source-control">Source Control</button>
         <div id="extension-panel-menu-items"></div>
         <div id="extension-wizard-menu-items"></div>
       </div></details>
@@ -90,7 +94,7 @@ app.innerHTML = `
   </header>
   <div class="toolbar" role="toolbar" aria-label="Editor actions">
     <div class="toolbar-group">
-      <button class="toolbar-button" disabled title="New file creation is not available yet" aria-label="New File">＋</button>
+      <button class="toolbar-button" data-action="new-file" title="New File (Ctrl+N)" aria-label="New File">＋</button>
       <button class="toolbar-button" data-action="open" title="Open Folder (Ctrl+O)" aria-label="Open Folder">▱</button>
       <button class="toolbar-button" data-action="save" id="toolbar-save" disabled title="Save (Ctrl+S)" aria-label="Save">▣</button>
     </div>
@@ -100,7 +104,7 @@ app.innerHTML = `
       <button class="toolbar-button" data-action="redo" id="toolbar-redo" disabled title="Redo (Ctrl+Y)" aria-label="Redo">↷</button>
     </div>
     <span class="toolbar-divider" aria-hidden="true"></span>
-    <button class="toolbar-button" disabled title="Source control integration is not available" aria-label="Source Control">⑂</button>
+    <button class="toolbar-button" data-action="source-control" title="Source Control" aria-label="Source Control">⑂</button>
     <div class="run-controls">
       <button class="run-button" data-action="run-selected" id="toolbar-run" disabled title="Run selected configuration after approval"><span aria-hidden="true">▶</span><span>Run</span></button>
       <select id="run-configuration" aria-label="Run configuration" disabled><option value="">No run configuration</option></select>
@@ -130,12 +134,14 @@ app.innerHTML = `
       <div class="bottom-resizer" id="bottom-resizer" role="separator" aria-label="Resize bottom panel" aria-orientation="horizontal" tabindex="0"></div>
       <section class="bottom-panel" id="bottom-panel">
         <div class="bottom-heading"><div class="tool-tabs" role="tablist" aria-label="Tool panels">
-          <button class="selected" data-panel="output" role="tab" aria-selected="true">Output</button><button data-panel="problems" role="tab" aria-selected="false">Problems <span id="problem-count" class="count-badge">0</span></button><button data-panel="tasks" role="tab" aria-selected="false">Tasks</button><button data-panel="projects" role="tab" aria-selected="false">Projects</button>
+          <button class="selected" data-panel="output" role="tab" aria-selected="true">Output</button><button data-panel="problems" role="tab" aria-selected="false">Problems <span id="problem-count" class="count-badge">0</span></button><button data-panel="tasks" role="tab" aria-selected="false">Tasks</button><button data-panel="projects" role="tab" aria-selected="false">Projects</button><button data-panel="search" role="tab" aria-selected="false">Search</button>
         </div><span id="bottom-task-state" class="task-state"></span><span class="panel-actions"><button data-action="cancel-task" title="Cancel active task" aria-label="Cancel active task" disabled>■</button><button data-action="toggle-bottom" title="Collapse bottom panel" aria-label="Collapse bottom panel">⌄</button></span></div>
         <div id="output" class="panel-content output"><div class="panel-empty">Task output will appear here.</div></div>
         <div id="problems" class="panel-content problem-list hidden"><div class="problem-filters"><label>Severity <select id="problem-severity-filter"><option value="all">All</option><option value="error">Errors</option><option value="warning">Warnings</option><option value="information">Information</option><option value="hint">Hints</option></select></label><label>Group by <select id="problem-grouping"><option value="file">File</option><option value="provider">Provider</option><option value="category">Category</option><option value="severity">Severity</option></select></label></div><div id="problem-entries"><div class="panel-empty">No problems reported by installed language integrations.</div></div></div>
         <div id="tasks" class="panel-content task-list hidden"><div class="panel-empty">Discover Cargo projects to see available tasks.</div></div>
         <div id="projects" class="panel-content project-list hidden"><div class="project-analysis-controls"><button data-action="start-project-analysis">Analyze Open Documents</button><button data-action="cancel-project-analysis" disabled>Cancel</button><button data-action="load-project-findings" hidden>Load More Findings</button><span id="project-analysis-status">Uses a bounded snapshot of currently open documents.</span></div><div id="project-list"><div class="panel-empty">Project information will appear here.</div></div></div>
+        <div id="search" class="panel-content developer-panel hidden"><form id="search-form" class="developer-controls"><input id="search-query" type="search" placeholder="Search workspace" aria-label="Search workspace"><input id="search-filter" type="text" placeholder="Files to include (glob)" aria-label="File name filter"><label><input id="search-case" type="checkbox"> Match case</label><label><input id="search-regex" type="checkbox"> Regex</label><button type="submit">Search</button><button type="button" data-action="cancel-search" disabled>Cancel</button></form><div id="search-status" class="subtle">Search starts only when requested. Results are limited to 5,000.</div><div id="search-results" class="developer-results"></div></div>
+        <div id="source-control" class="panel-content developer-panel hidden"><div class="developer-controls"><select id="git-repository" aria-label="Git repository"><option value="">No repository selected</option></select><button data-action="refresh-git">↻ Refresh</button></div><div id="git-branch" class="subtle"></div><div class="git-columns"><section><h3>Changes</h3><div id="git-unstaged" class="developer-results"></div></section><section><h3>Staged</h3><div id="git-staged" class="developer-results"></div></section></div><pre id="git-diff" class="git-diff" aria-label="Git diff preview"></pre><form id="git-commit-form" class="developer-controls"><input id="git-commit-message" type="text" placeholder="Commit message" aria-label="Commit message"><button type="submit">Commit staged</button></form></div>
         <div id="extension-panel-content"></div>
       </section>
     </section>
@@ -155,6 +161,8 @@ app.innerHTML = `
   <dialog id="language-server-approval-dialog" class="dialog"><form method="dialog"><header>Start language server?</header><p class="subtle">This starts an external program with your user account permissions. Approval is not a sandbox. Review the exact command and workspace.</p><dl id="language-server-approval-details"></dl><div class="dialog-actions"><button value="deny" class="secondary">Deny</button><button value="approve" class="primary">Approve and start</button></div></form></dialog>
   <dialog id="settings-dialog" class="dialog settings-dialog"><form method="dialog"><header>Settings</header><label for="theme-setting">Color theme</label><select id="theme-setting"><option value="dark">OLED Black</option><option value="light">Light</option></select><div id="extension-settings" class="extension-settings"></div><section class="inspection-settings"><h3>Inspections</h3><div id="inspection-settings"></div></section><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="info-dialog" class="dialog"><form method="dialog"><header id="info-title"></header><div id="info-content" class="info-content"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
+  <dialog id="workspace-input-dialog" class="dialog"><form id="workspace-input-form"><header id="workspace-input-title"></header><label id="workspace-input-label" for="workspace-input"></label><input id="workspace-input" type="text" autocomplete="off"><div class="dialog-actions"><button type="button" value="cancel" class="secondary">Cancel</button><button type="submit" class="primary">Continue</button></div></form></dialog>
+  <dialog id="workspace-delete-dialog" class="dialog"><form method="dialog"><header>Delete workspace entry?</header><p id="workspace-delete-path"></p><p class="subtle">This permanently deletes the selected entry from disk. Open dirty documents are protected.</p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="delete" class="danger">Delete</button></div></form></dialog>
   <dialog id="project-wizard-dialog" class="dialog"><form id="project-wizard-form"><header id="project-wizard-title"></header><div id="project-wizard-fields" class="extension-panel-view"></div><p class="subtle">Submitting validates these fields only. Project creation must be performed by a host-authorized extension operation.</p><div class="dialog-actions"><button type="button" class="secondary" data-action="close-wizard">Cancel</button><button type="submit" class="primary">Validate form</button></div></form></dialog>
   <div id="status-toast" role="status" aria-live="polite"></div>`;
 
@@ -175,7 +183,7 @@ const rootLabel = document.querySelector<HTMLElement>('#status-workspace')!;
 let workspaceRoot = '';
 let selectedPath = '';
 let runId: number | null = null;
-const documentViews = new Map<number, { state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF' }>();
+const documentViews = new Map<number, { state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment }>();
 const taskById = new Map<number, TaskSummary>();
 const activeLanguageServers = new Map<string, number>();
 const diagnosticsByDocument = new Map<number, Map<string, LanguageDiagnosticSet>>();
@@ -202,6 +210,13 @@ let latestProjectInspectionId: number | null = null;
 let projectInspectionTimer = 0;
 let projectInspectionOffset: number | null = null;
 let projectSnapshotFindings: InspectionFinding[] = [];
+let gitRepositories: GitRepositorySummary[] = [];
+let gitStatus: GitStatusSummary | null = null;
+let gitRepositoryPath = '';
+let activeSearchJob: number | null = null;
+let searchPollTimer = 0;
+let searchMatches: SearchMatch[] = [];
+let searchPollingJob: number | null = null;
 
 function expect<T extends ResponseValue['kind']>(response: ResponseValue, kind: T): Extract<ResponseValue, { kind: T }> {
   if (response.kind !== kind) throw new Error(`Expected ${kind}, received ${response.kind}`);
@@ -261,6 +276,95 @@ async function refreshDirectory(path: string): Promise<void> {
     treeState.setEntries(path, entries);
   } catch (error) { treeState.setError(path, error instanceof Error ? error.message : String(error)); }
   renderTree();
+}
+
+async function refreshWorkspacePath(path: string): Promise<void> {
+  if (!path) { await refreshDirectory(''); return; }
+  const parts = path.split('/').filter(Boolean); let current = '';
+  await refreshDirectory('');
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    const node = treeState.child(current); node.expanded = true;
+    await refreshDirectory(current);
+  }
+}
+
+function askWorkspacePath(title: string, label: string, initial = ''): Promise<string | null> {
+  const dialog = document.querySelector<HTMLDialogElement>('#workspace-input-dialog')!;
+  const form = document.querySelector<HTMLFormElement>('#workspace-input-form')!;
+  const input = document.querySelector<HTMLInputElement>('#workspace-input')!;
+  document.querySelector('#workspace-input-title')!.textContent = title;
+  document.querySelector('#workspace-input-label')!.textContent = label;
+  input.value = initial;
+  return new Promise((resolve) => {
+    const cancelButton = form.querySelector<HTMLButtonElement>('[value="cancel"]')!;
+    const cancel = () => finish(null);
+    const submit = (event: SubmitEvent) => { event.preventDefault(); finish(input.value.trim() || null); };
+    const finish = (value: string | null) => {
+      form.removeEventListener('submit', submit); cancelButton.removeEventListener('click', cancel); dialog.removeEventListener('cancel', cancel);
+      dialog.close(); resolve(value);
+    };
+    form.addEventListener('submit', submit); cancelButton.addEventListener('click', cancel); dialog.addEventListener('cancel', cancel);
+    dialog.showModal(); input.focus(); input.select();
+  });
+}
+
+function parentPath(path: string): string { return path.split('/').slice(0, -1).join('/'); }
+async function createWorkspaceEntry(directory: string, isDirectory: boolean): Promise<void> {
+  if (!workspaceRoot) { setStatus('Open a workspace first'); return; }
+  const path = await askWorkspacePath(isDirectory ? 'New folder' : 'New file', 'Workspace-relative path', directory ? `${directory}/` : '');
+  if (!path) return;
+  try {
+    const response = await client.call({ method: isDirectory ? 'create_workspace_directory' : 'create_workspace_file', params: { path } });
+    if (response.kind !== 'workspace_entry') throw new Error('The workspace did not create the entry.');
+    await refreshWorkspacePath(parentPath(path)); setStatus(`${isDirectory ? 'Folder' : 'File'} created`);
+    if (!isDirectory) await openDocument(response.value.path);
+  } catch (error) { showError(error); }
+}
+
+async function renameWorkspaceEntry(path: string): Promise<void> {
+  const destination = await askWorkspacePath('Rename or move', 'New workspace-relative path', path);
+  if (!destination || destination === path) return;
+  try {
+    const result = expect(await client.call({ method: 'rename_workspace_entry', params: { source: path, destination } }), 'workspace_entry_changed').value;
+    for (const tab of tabs.tabs) if (tab.path === path || tab.path.startsWith(`${path}/`)) {
+      tab.path = `${destination}${tab.path.slice(path.length)}`; tab.title = baseName(tab.path); tab.language = languageNameForPath(tab.path);
+      void refreshDocumentLanguage(tab.id);
+    }
+    if (selectedPath === path || selectedPath.startsWith(`${path}/`)) selectedPath = `${destination}${selectedPath.slice(path.length)}`;
+    await refreshWorkspacePath(parentPath(path)); if (parentPath(destination) !== parentPath(path)) await refreshWorkspacePath(parentPath(destination));
+    renderTabs(); renderTree(); updateStatusDocument(); setStatus(`Renamed ${result.previous_path ?? path}`);
+  } catch (error) { showError(error); }
+}
+
+async function deleteWorkspaceEntry(path: string, isDirectory: boolean): Promise<void> {
+  const dialog = document.querySelector<HTMLDialogElement>('#workspace-delete-dialog')!;
+  document.querySelector('#workspace-delete-path')!.textContent = path;
+  const choice = await new Promise<boolean>((resolve) => {
+    const form = dialog.querySelector('form')!;
+    const cancel = () => finish(false);
+    const submit = (event: SubmitEvent) => { event.preventDefault(); const value = (event.submitter as HTMLButtonElement | null)?.value === 'delete'; finish(value); };
+    const finish = (value: boolean) => { form.removeEventListener('submit', submit); dialog.removeEventListener('cancel', cancel); dialog.close(); resolve(value); };
+    form.addEventListener('submit', submit); dialog.addEventListener('cancel', cancel); dialog.showModal();
+  });
+  if (!choice) return;
+  try {
+    expect(await client.call({ method: 'delete_workspace_entry', params: { path, recursive: isDirectory, confirmed: true } }), 'workspace_entry_changed');
+    await refreshWorkspacePath(parentPath(path)); renderTree(); setStatus('Workspace entry deleted');
+  } catch (error) { showError(error); }
+}
+
+function showWorkspaceContextMenu(event: MouseEvent, path: string, isDirectory: boolean): void {
+  event.preventDefault(); document.querySelector('#editor-context-menu')?.remove();
+  const menu = document.createElement('div'); menu.id = 'editor-context-menu'; menu.className = 'editor-context-menu'; menu.setAttribute('role', 'menu');
+  const options: Array<[string, () => void]> = [
+    ['New File', () => void createWorkspaceEntry(isDirectory ? path : parentPath(path), false)],
+    ['New Folder', () => void createWorkspaceEntry(isDirectory ? path : parentPath(path), true)],
+    ...(path ? [['Rename / Move', () => void renameWorkspaceEntry(path)], ['Delete…', () => void deleteWorkspaceEntry(path, isDirectory)]] as Array<[string, () => void]> : []),
+    ['Refresh', () => void refreshDirectory(path)],
+  ];
+  for (const [label, action] of options) { const button = document.createElement('button'); button.setAttribute('role', 'menuitem'); button.textContent = label; button.addEventListener('click', () => { menu.remove(); action(); }); menu.append(button); }
+  menu.style.left = `${event.clientX}px`; menu.style.top = `${event.clientY}px`; document.body.append(menu);
 }
 
 function appendIcon(parent: HTMLElement, kind: string, expanded = false): void {
@@ -345,8 +449,8 @@ async function openDocument(path: string): Promise<void> {
       dirty: content.dirty, language: languageNameForPath(path), lineEnding: lineEndingFor(content.contents),
     };
     tabs.open(tab); selectedPath = path;
-    const { state, pipeline, lineEnding } = await createDocumentState(tab, content.contents, content.revision);
-    documentViews.set(tab.id, { state, pipeline, lineEnding });
+    const { state, pipeline, lineEnding, languageConfig } = await createDocumentState(tab, content.contents, content.revision);
+    documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig });
     if (!editor) editor = new EditorView({ state, parent: editorHost }); else editor.setState(state);
     welcome.classList.add('hidden'); editorHost.classList.remove('hidden');
     renderTree(); renderTabs(); updateStatusDocument(); editor.focus();
@@ -354,10 +458,11 @@ async function openDocument(path: string): Promise<void> {
   } catch (error) { showError(error); }
 }
 
-async function createDocumentState(tab: EditorTab, contents: string, revision: number): Promise<{ state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF' }> {
+async function createDocumentState(tab: EditorTab, contents: string, revision: number): Promise<{ state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment }> {
   const lineEnding = lineEndingFor(contents);
   const lineSeparator = lineEnding === 'CRLF' ? '\r\n' : '\n';
   const languageExtensions = await languageForPath(tab.path);
+  const languageConfig = new Compartment();
   const serviceExtensions = languageServiceExtensions(client, {
     documentId: tab.id,
     revision: () => documentViews.get(tab.id)?.pipeline.currentRevision ?? revision,
@@ -375,7 +480,7 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
   });
   const state = EditorState.create({
     doc: contents,
-    extensions: [basicSetup, linter(() => []), theme, EditorState.tabSize.of(4), EditorState.lineSeparator.of(lineSeparator), EditorView.lineWrapping, ...languageExtensions, ...serviceExtensions,
+    extensions: [basicSetup, linter(() => []), theme, EditorState.tabSize.of(4), EditorState.lineSeparator.of(lineSeparator), EditorView.lineWrapping, languageConfig.of(languageExtensions), ...serviceExtensions,
       EditorView.updateListener.of((update) => {
         const entry = documentViews.get(tab.id);
         if (!entry) return;
@@ -398,7 +503,15 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
     },
   }, () => documentViews.get(tab.id)?.state.doc.toString() ?? contents,
   (newRevision, dirty) => { tabs.update(tab.id, { revision: newRevision, dirty }); renderTabs(); updateStatusDocument(); }, showError);
-  return { state, pipeline, lineEnding };
+  return { state, pipeline, lineEnding, languageConfig };
+}
+
+async function refreshDocumentLanguage(documentId: number): Promise<void> {
+  const tab = tabs.tabs.find((item) => item.id === documentId); const view = documentViews.get(documentId);
+  if (!tab || !view) return;
+  const language = await languageForPath(tab.path);
+  view.state = view.state.update({ effects: view.languageConfig.reconfigure(language) }).state;
+  if (tabs.activeId === documentId && editor) editor.setState(view.state);
 }
 
 function renderTabs(): void {
@@ -526,9 +639,9 @@ async function showConflict(tab: EditorTab): Promise<void> {
     tabs.update(tab.id, { revision: decision.revision, dirty: decision.dirty });
     if (action === 'reload') {
       const content = expect(await client.call({ method: 'read_document', params: { document_id: tab.id } }), 'document_contents').value;
-      const { state, pipeline, lineEnding } = await createDocumentState(tab, content.contents, content.revision);
+      const { state, pipeline, lineEnding, languageConfig } = await createDocumentState(tab, content.contents, content.revision);
       tabs.update(tab.id, { lineEnding });
-      documentViews.set(tab.id, { state, pipeline, lineEnding });
+      documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig });
       if (tabs.activeId === tab.id && editor) editor.setState(state);
     }
     renderTabs(); updateStatusDocument();
@@ -727,6 +840,27 @@ function queueOutputRefresh(id: number): void {
   outputRefreshTimer = window.setTimeout(() => { outputRefreshTimer = 0; void updateTaskOutput(id); }, 100);
 }
 function handlePlatformEvent(event: PlatformEvent): void {
+  if (event.kind === 'git_status_changed' && gitStatus?.root === event.root) void refreshGitStatus();
+  if (event.kind === 'git_operation_completed' && event.operation) setStatus(`Git ${event.operation}${event.commit ? ` · ${event.commit.slice(0, 8)}` : ''}`);
+  if (event.kind.startsWith('workspace_entry_') && event.path) {
+    const parent = parentPath(event.path); void refreshWorkspacePath(parent);
+    if (event.operation === 'renamed' && event.previous_path) {
+      for (const tab of tabs.tabs) if (tab.path === event.previous_path || tab.path.startsWith(`${event.previous_path}/`)) {
+        tab.path = `${event.path}${tab.path.slice(event.previous_path.length)}`; tab.title = baseName(tab.path); tab.language = languageNameForPath(tab.path);
+        void refreshDocumentLanguage(tab.id);
+      }
+      renderTabs(); updateStatusDocument();
+    }
+  }
+  if (event.kind === 'document_path_changed' && event.document_id && event.path) {
+    const tab = tabs.tabs.find((item) => item.id === event.document_id);
+    if (tab) { tab.path = event.path; tab.title = baseName(event.path); tab.language = languageNameForPath(event.path); void refreshDocumentLanguage(tab.id); renderTabs(); updateStatusDocument(); }
+    if (event.document_id) { diagnosticsByDocument.delete(event.document_id); inspectionFindingsByDocument.delete(event.document_id); renderProblems(); scheduleInspection(event.document_id); }
+  }
+  if (event.kind === 'document_closed' && event.document_id && tabs.tabs.some((tab) => tab.id === event.document_id)) {
+    documentViews.delete(event.document_id); tabs.close(event.document_id); renderTabs();
+    if (tabs.active) selectTab(tabs.active.id); else { editorHost.classList.add('hidden'); welcome.classList.remove('hidden'); editor = null; updateStatusDocument(); }
+  }
   if (event.kind === 'task_output_available' && event.run_id) queueOutputRefresh(event.run_id);
   if (event.kind === 'task_finished' && event.run_id) void updateTaskOutput(event.run_id);
   if (event.kind === 'save_conflict_detected') setStatus('File changed outside Koren; review the save conflict.');
@@ -777,7 +911,7 @@ function showPanel(panel: 'output' | 'problems' | 'tasks' | 'projects' | string)
     const selected = button.dataset.panel === panel;
     button.classList.toggle('selected', selected); button.setAttribute('aria-selected', String(selected));
   }
-  for (const id of ['output', 'problems', 'tasks', 'projects']) document.querySelector(`#${id}`)!.classList.toggle('hidden', id !== panel);
+  for (const id of ['output', 'problems', 'tasks', 'projects', 'search', 'source-control']) document.querySelector(`#${id}`)!.classList.toggle('hidden', id !== panel);
   for (const host of document.querySelectorAll<HTMLElement>('[data-extension-panel]')) host.classList.toggle('hidden', host.dataset.extensionPanel !== panel);
   if (panel.startsWith('org.') || panel.includes('.')) { activeDynamicPanel = panel; localStorage.setItem('koren.activeExtensionPanel', panel); }
   setBottomCollapsed(false);
@@ -1453,6 +1587,9 @@ async function executeCommand(command: string): Promise<void> {
       await client.call({ method: 'read_document', params: { document_id: active.id } });
     }
     const result = expect(await client.call({ method: 'execute_command', params: { command_id: command } }), 'command_output').value;
+    if (result === 'editor.new_file') { void createWorkspaceEntry(parentPath(selectedPath), false); return; }
+    if (result === 'editor.search') { showPanel('search'); document.querySelector<HTMLInputElement>('#search-query')!.focus(); return; }
+    if (result === 'editor.source_control') { showPanel('source-control'); void refreshGitRepositories(); return; }
     renderExtensions(expect(await client.call({ method: 'list_extensions' }), 'extensions').value);
     setStatus(`${command}: ${result}`);
   } catch (error) { showError(error); }
@@ -1462,6 +1599,10 @@ function handleAction(action: string, target: HTMLElement): void {
   switch (action) {
     case 'open': void chooseWorkspace(); break;
     case 'open-file': void chooseFile(); break;
+    case 'new-file': void createWorkspaceEntry(parentPath(selectedPath), false); break;
+    case 'source-control': showPanel('source-control'); void refreshGitRepositories(); break;
+    case 'refresh-git': void refreshGitRepositories(); break;
+    case 'cancel-search': cancelWorkspaceSearch(); break;
     case 'save': void saveActive(); break;
     case 'save-all': void saveAll(); break;
     case 'close-active': if (tabs.active) void closeTab(tabs.active); else setStatus('No open tab to close'); break;
@@ -1471,7 +1612,11 @@ function handleAction(action: string, target: HTMLElement): void {
     case 'toggle-theme': toggleTheme(); break;
     case 'toggle-explorer': setExplorerCollapsed(!layout.explorerCollapsed); break;
     case 'toggle-bottom': setBottomCollapsed(!layout.bottomCollapsed); break;
-    case 'show-panel': showPanel(target.dataset.panelTarget as 'output' | 'problems' | 'tasks' | 'projects'); break;
+    case 'show-panel': {
+      const panel = target.dataset.panelTarget ?? 'output'; showPanel(panel);
+      if (panel === 'search') document.querySelector<HTMLInputElement>('#search-query')!.focus();
+      break;
+    }
     case 'run-selected': void runSelectedConfiguration(); break;
     case 'settings': {
       void openSettings(); break;
@@ -1490,7 +1635,7 @@ function handleAction(action: string, target: HTMLElement): void {
     case 'import-sarif': void importSarif(); break;
     case 'export-sarif': void exportSarif(); break;
     case 'copy-path': void copyCurrentPath(); break;
-    case 'shortcuts': showInfo('Keyboard Shortcuts', 'Ctrl+O  Open Folder\nCtrl+Shift+O  Open File\nCtrl+S  Save\nCtrl+W  Close Active Tab\nCtrl+Shift+P  Command Palette\nCtrl+B  Toggle Project Explorer\nCtrl+J  Toggle Bottom Panel\nAlt+T  Toggle Theme\nCtrl+Tab / Ctrl+Shift+Tab  Change Tab\nF6  Focus Editor\nF5  Cancel Active Task'); break;
+    case 'shortcuts': showInfo('Keyboard Shortcuts', 'Ctrl+O  Open Folder\nCtrl+Shift+O  Open File\nCtrl+N  New File\nCtrl+Shift+F  Search Workspace\nCtrl+S  Save\nCtrl+W  Close Active Tab\nCtrl+Shift+P  Command Palette\nCtrl+B  Toggle Project Explorer\nCtrl+J  Toggle Bottom Panel\nAlt+T  Toggle Theme\nCtrl+Tab / Ctrl+Shift+Tab  Change Tab\nF6  Focus Editor\nF5  Cancel Active Task'); break;
     case 'about': showInfo('Koren Code Editor', 'A lightweight, universal code editor powered by Koren IDE Platform.\n\nVersion 0.1.0'); break;
   }
 }
@@ -1508,6 +1653,172 @@ async function copyCurrentPath(): Promise<void> {
     await navigator.clipboard.writeText(`${workspaceRoot.replace(/[\\/]+$/, '')}/${tab.path}`);
     setStatus('File path copied');
   } catch { setStatus('Clipboard access is unavailable'); }
+}
+
+async function refreshGitRepositories(): Promise<void> {
+  if (!workspaceRoot) { setStatus('Open a workspace first'); return; }
+  try {
+    gitRepositories = expect(await client.call({ method: 'discover_git_repositories' }), 'git_repositories').value;
+    const select = document.querySelector<HTMLSelectElement>('#git-repository')!;
+    const workspace = workspaceRoot.replaceAll('\\', '/').replace(/\/$/, '');
+    const choices = gitRepositories.map((repo) => ({ repo, path: repo.root.replaceAll('\\', '/').replace(/\/$/, '').slice(workspace.length).replace(/^\//, '') }));
+    select.replaceChildren(new Option('Select repository', ''));
+    for (const { repo, path } of choices) select.add(new Option(`${path ? `${path}/` : ''}${repo.branch ?? '(detached)'}`, path));
+    if (!choices.some(({ path }) => path === gitRepositoryPath)) gitRepositoryPath = choices[0]?.path ?? '';
+    select.value = gitRepositoryPath;
+    if (gitRepositoryPath) await refreshGitStatus();
+    else { gitStatus = null; renderGitStatus(); }
+  } catch (error) { showError(error); }
+}
+
+async function refreshGitStatus(): Promise<void> {
+  if (!gitRepositoryPath) { renderGitStatus(); return; }
+  try {
+    gitStatus = expect(await client.call({ method: 'git_status', params: { path: gitRepositoryPath } }), 'git_status').value;
+    renderGitStatus();
+  } catch (error) { gitStatus = null; renderGitStatus(); showError(error); }
+}
+
+function renderGitStatus(): void {
+  document.querySelector('#git-branch')!.textContent = gitStatus ? `${gitStatus.root} · ${gitStatus.branch ?? 'detached HEAD'}` : 'No local Git repository selected.';
+  const renderFiles = (hostId: string, staged: boolean) => {
+    const host = document.querySelector<HTMLDivElement>(`#${hostId}`)!; host.replaceChildren();
+    const partition = partitionGitFiles(gitStatus?.files ?? []);
+    const files = staged ? partition.staged : partition.unstaged;
+    if (!files.length) { const empty = document.createElement('div'); empty.className = 'panel-empty'; empty.textContent = staged ? 'No staged changes.' : 'No unstaged changes.'; host.append(empty); return; }
+    for (const file of files) {
+      const row = document.createElement('div'); row.className = `git-file ${staged ? 'staged' : 'unstaged'}`;
+      const path = document.createElement('button'); path.className = 'git-file-path'; path.textContent = `${file.deleted ? 'D' : file.untracked ? '?' : file.staged ? 'M' : 'M'}  ${file.path}`; path.title = file.path;
+      path.addEventListener('click', () => void loadGitDiff(file.path, staged)); row.append(path);
+      const action = document.createElement('button'); action.className = 'git-file-action'; action.textContent = staged ? 'Unstage' : 'Stage'; action.disabled = file.conflicted;
+      action.addEventListener('click', () => void mutateGitPath(staged ? 'git_unstage' : 'git_stage', file.path)); row.append(action); host.append(row);
+    }
+  };
+  renderFiles('git-unstaged', false); renderFiles('git-staged', true);
+}
+
+async function loadGitDiff(path: string, staged: boolean): Promise<void> {
+  try {
+    const diff = expect(await client.call({ method: 'git_diff', params: { repository: gitRepositoryPath, path, staged } }), 'git_diff').value;
+    const host = document.querySelector<HTMLPreElement>('#git-diff')!; host.replaceChildren();
+    const lines = diff.text.split('\n'); const visible = lines.slice(0, 5000);
+    if (!diff.text) host.textContent = '(No text diff available.)';
+    else visible.forEach((line, index) => {
+      const row = document.createElement('span');
+      row.className = line.startsWith('+') && !line.startsWith('+++') ? 'diff-add' : line.startsWith('-') && !line.startsWith('---') ? 'diff-delete' : line.startsWith('@@') ? 'diff-hunk' : line.startsWith('diff ') || line.startsWith('index ') ? 'diff-header' : '';
+      row.textContent = line; host.append(row);
+      if (index < visible.length - 1) host.append(document.createTextNode('\n'));
+    });
+    if (lines.length > 5000) { const note = document.createElement('span'); note.className = 'diff-limit'; note.textContent = `\n… ${lines.length - 5000} further lines hidden`; host.append(note); }
+    host.dataset.path = path; host.dataset.staged = String(staged);
+    host.classList.toggle('has-diff', diff.text.length > 0);
+  } catch (error) { showError(error); }
+}
+
+async function mutateGitPath(method: 'git_stage' | 'git_unstage', path: string): Promise<void> {
+  try {
+    expect(await client.call({ method, params: { repository: gitRepositoryPath, path } }), 'git_operation');
+    await refreshGitStatus();
+    const diff = document.querySelector<HTMLPreElement>('#git-diff')!;
+    if (diff.dataset.path === path) await loadGitDiff(path, diff.dataset.staged === 'true');
+  } catch (error) { showError(error); }
+}
+
+async function createGitCommit(message: string): Promise<void> {
+  if (!gitRepositoryPath) { setStatus('Select a Git repository first'); return; }
+  try {
+    const result = expect(await client.call({ method: 'git_commit', params: { repository: gitRepositoryPath, message } }), 'git_operation').value;
+    setStatus(`Commit created ${result.commit?.slice(0, 8) ?? ''}`.trim()); await refreshGitStatus();
+  } catch (error) { showError(error); }
+}
+
+async function startWorkspaceSearch(): Promise<void> {
+  if (!workspaceRoot) { setStatus('Open a workspace first'); return; }
+  if (activeSearchJob !== null) {
+    await cancelWorkspaceSearch();
+    if (activeSearchJob !== null) { setStatus('Waiting for the previous search to stop'); return; }
+  }
+  const query = document.querySelector<HTMLInputElement>('#search-query')!.value;
+  const filter = document.querySelector<HTMLInputElement>('#search-filter')!.value.trim();
+  const results = document.querySelector<HTMLDivElement>('#search-results')!; results.replaceChildren(); searchMatches = [];
+  document.querySelector('#search-status')!.textContent = 'Searching…';
+  const cancel = document.querySelector<HTMLButtonElement>('[data-action="cancel-search"]')!; cancel.disabled = false;
+  try {
+    const started = expect(await client.call({ method: 'start_workspace_search', params: {
+      query, case_sensitive: document.querySelector<HTMLInputElement>('#search-case')!.checked,
+      regular_expression: document.querySelector<HTMLInputElement>('#search-regex')!.checked,
+      file_filter: filter || null,
+    } }), 'search_started').value;
+    activeSearchJob = started.job_id; void pollWorkspaceSearch(started.job_id);
+  } catch (error) { activeSearchJob = null; cancel.disabled = true; showError(error); }
+}
+
+async function pollWorkspaceSearch(jobId: number): Promise<void> {
+  if (activeSearchJob !== jobId || searchPollingJob === jobId) return;
+  searchPollingJob = jobId;
+  try {
+    const batch = expect(await client.call({ method: 'poll_workspace_search', params: { job_id: jobId } }), 'search_batch').value;
+    searchMatches.push(...batch.matches); renderSearchResults();
+    if (batch.error) setStatus(batch.error);
+    if (batch.complete) {
+      activeSearchJob = null; document.querySelector<HTMLButtonElement>('[data-action="cancel-search"]')!.disabled = true;
+      const summary = batch.summary;
+      document.querySelector('#search-status')!.textContent = summary
+        ? searchSummaryText(summary)
+        : 'Search complete.';
+      return;
+    }
+    const progress = batch.progress;
+    if (progress) document.querySelector('#search-status')!.textContent = `${progress.matches_found} matches · ${progress.files_scanned} files${progress.current_path ? ` · ${progress.current_path}` : ''}`;
+    searchPollTimer = window.setTimeout(() => void pollWorkspaceSearch(jobId), 75);
+  } catch (error) { activeSearchJob = null; document.querySelector<HTMLButtonElement>('[data-action="cancel-search"]')!.disabled = true; showError(error); }
+  finally { searchPollingJob = null; }
+}
+
+async function cancelWorkspaceSearch(): Promise<void> {
+  if (activeSearchJob === null) return;
+  const jobId = activeSearchJob; window.clearTimeout(searchPollTimer);
+  try { await client.call({ method: 'cancel_workspace_search', params: { job_id: jobId } }); setStatus('Search cancellation requested'); }
+  catch (error) { showError(error); }
+  for (let attempt = 0; attempt < 100 && activeSearchJob === jobId; attempt++) {
+    while (searchPollingJob === jobId) await new Promise((resolve) => window.setTimeout(resolve, 10));
+    if (activeSearchJob !== jobId) break;
+    try {
+      const batch = expect(await client.call({ method: 'poll_workspace_search', params: { job_id: jobId } }), 'search_batch').value;
+      searchMatches.push(...batch.matches); renderSearchResults();
+      if (batch.complete) {
+        activeSearchJob = null; document.querySelector<HTMLButtonElement>('[data-action="cancel-search"]')!.disabled = true;
+        if (batch.summary) document.querySelector('#search-status')!.textContent = searchSummaryText(batch.summary);
+        break;
+      }
+    } catch (error) { activeSearchJob = null; showError(error); break; }
+    await new Promise((resolve) => window.setTimeout(resolve, 40));
+  }
+  if (activeSearchJob === jobId) searchPollTimer = window.setTimeout(() => void pollWorkspaceSearch(jobId), 50);
+}
+
+function renderSearchResults(): void {
+  const host = document.querySelector<HTMLDivElement>('#search-results')!; host.replaceChildren();
+  const visible = searchMatches.slice(0, 1000);
+  const groups = groupSearchMatches(visible);
+  for (const [path, matches] of groups) {
+    const heading = document.createElement('div'); heading.className = 'problem-group'; heading.textContent = `${path} · ${matches.length}`; host.append(heading);
+    for (const match of matches) {
+      const button = document.createElement('button'); button.className = 'search-result'; button.title = `${path}:${match.line}`;
+      const location = document.createElement('span'); location.className = 'search-result-path'; location.textContent = `:${match.line}:${match.column_utf16 + 1}`;
+      const preview = document.createElement('span'); preview.className = 'search-result-preview'; preview.textContent = match.preview;
+      button.append(location, preview); button.addEventListener('click', () => void navigateToSearchMatch(match)); host.append(button);
+    }
+  }
+  if (searchMatches.length > visible.length) { const note = document.createElement('div'); note.className = 'panel-empty'; note.textContent = `Showing ${visible.length} of ${searchMatches.length} matches.`; host.append(note); }
+}
+
+async function navigateToSearchMatch(match: SearchMatch): Promise<void> {
+  await openDocument(match.path);
+  if (!editor) return;
+  const line = editor.state.doc.line(Math.max(1, Math.min(editor.state.doc.lines, match.line)));
+  const position = Math.max(line.from, Math.min(line.to, line.from + match.column_utf16));
+  editor.dispatch({ selection: { anchor: position, head: Math.min(line.to, position + match.match_length_utf16) }, scrollIntoView: true }); editor.focus();
 }
 
 async function navigateToDefinition(uri: string, range: TextRange): Promise<void> {
@@ -1532,7 +1843,18 @@ async function navigateToDefinition(uri: string, range: TextRange): Promise<void
 
 document.addEventListener('contextmenu', (event) => {
   const target = event.target as HTMLElement;
-  const items = target.closest('#editor') ? editorContextMenus : target.closest('#tree') ? projectExplorerMenus : [];
+  if (target.closest('#tree')) {
+    const row = target.closest<HTMLButtonElement>('.tree-row');
+    const path = row?.title ?? '';
+    showWorkspaceContextMenu(event, path, !row || row.classList.contains('directory'));
+    const items = projectExplorerMenus;
+    if (items.length) {
+      const menu = document.querySelector<HTMLDivElement>('#editor-context-menu')!;
+      for (const item of items) { const button = document.createElement('button'); button.setAttribute('role', 'menuitem'); button.textContent = item.label; button.disabled = !item.enabled; button.addEventListener('click', () => { menu.remove(); void executeCommand(item.command_id); }); menu.append(button); }
+    }
+    return;
+  }
+  const items = target.closest('#editor') ? editorContextMenus : [];
   if (!items.length) return;
   event.preventDefault();
   document.querySelector('#editor-context-menu')?.remove();
@@ -1574,6 +1896,8 @@ document.addEventListener('keydown', (event) => {
     if (shortcut) { event.preventDefault(); void executeCommand(shortcut[0]); return; }
   }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'o') { event.preventDefault(); event.shiftKey ? void chooseFile() : void chooseWorkspace(); }
+  else if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'n') { event.preventDefault(); void createWorkspaceEntry(parentPath(selectedPath), false); }
+  else if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'f') { event.preventDefault(); showPanel('search'); document.querySelector<HTMLInputElement>('#search-query')!.focus(); }
   else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); void saveActive(); }
   else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'w' && tabs.active) { event.preventDefault(); void closeTab(tabs.active); }
   else if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'p') { event.preventDefault(); void openCommandPalette(); }
@@ -1591,6 +1915,17 @@ document.querySelector<HTMLInputElement>('#command-search')!.addEventListener('i
 });
 
 document.querySelectorAll<HTMLButtonElement>('[data-panel]').forEach((button) => button.addEventListener('click', () => showPanel(button.dataset.panel as 'output' | 'problems' | 'tasks' | 'projects')));
+document.querySelector<HTMLSelectElement>('#git-repository')!.addEventListener('change', (event) => {
+  gitRepositoryPath = (event.currentTarget as HTMLSelectElement).value; void refreshGitStatus();
+});
+document.querySelector<HTMLButtonElement>('[data-action="refresh-git"]')!.addEventListener('click', () => void refreshGitRepositories());
+document.querySelector<HTMLFormElement>('#git-commit-form')!.addEventListener('submit', (event) => {
+  event.preventDefault(); const input = document.querySelector<HTMLInputElement>('#git-commit-message')!;
+  const message = normalizedCommitMessage(input.value);
+  if (!message) { setStatus('Enter a commit message'); input.focus(); return; }
+  void createGitCommit(message).then(() => { input.value = ''; });
+});
+document.querySelector<HTMLFormElement>('#search-form')!.addEventListener('submit', (event) => { event.preventDefault(); void startWorkspaceSearch(); });
 document.querySelector<HTMLButtonElement>('[data-action="start-project-analysis"]')!.addEventListener('click', () => void startProjectInspection());
 document.querySelector<HTMLButtonElement>('[data-action="cancel-project-analysis"]')!.addEventListener('click', () => void cancelProjectInspection());
 document.querySelector<HTMLButtonElement>('[data-action="load-project-findings"]')!.addEventListener('click', () => {

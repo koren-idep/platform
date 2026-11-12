@@ -11,7 +11,8 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "lint": "biome lint --only correctness --skip correctness/useImportExtensions --skip correctness/useQwikValidLexicalScope src",
-    "test": "vitest run"
+    "test": "vitest run",
+    "benchmark:phase9a": "vitest run src/app/developerTools.perf.test.ts"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.4",

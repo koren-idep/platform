@@ -1,11 +1,12 @@
 use koren_cargo::CargoProvider;
 use koren_commands::{CommandError, CommandRegistry};
-use koren_core::{Platform, PlatformEvent};
+use koren_core::{EventQueue, Platform, PlatformEvent};
 use koren_documents::{DocumentId, DocumentManager};
 use koren_extensions::{
     CommandContext, CommandEnablement, ExtensionManager, ExtensionState, MenuLocation, SettingKind,
     SettingValue, ThemeBase, UiDocument, UiElement,
 };
+use koren_git::GitService;
 use koren_inspections::{
     CancellationToken, Finding, FindingOrigin, InspectionProfile, InspectionProfiles,
     InspectionProvider, InspectionService, MAX_SARIF_BYTES, RuleProfile, Severity, export_sarif,
@@ -24,13 +25,16 @@ use koren_protocol::{
     ExtensionCommandSummary, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary,
     ExtensionProjectWizardSummary, ExtensionSettingKind, ExtensionSettingSummary,
     ExtensionSettingValue, ExtensionSummary as ProtocolExtensionSummary, ExtensionThemeSummary,
-    ExtensionToolWindowSummary, ExtensionUiDocument, ExtensionUiElement, InspectionCodeAction,
-    InspectionConfigurationSummary, InspectionFinding, InspectionProposedTextEdit,
-    InspectionRelatedLocation, InspectionRuleSummary, LanguageServerApprovalSummary,
-    LanguageServerSummary, ProjectInspectionFindingPage, ProjectInspectionSummary,
-    ProjectLifecycle, ProjectSummary, ProtocolError, Request, RequestMethod, Response,
-    ResponseValue, TaskLifecycle, TaskSummary, TextEdit, validate_version,
+    ExtensionToolWindowSummary, ExtensionUiDocument, ExtensionUiElement, GitChangedFile,
+    GitRepositorySummary, GitStatusSummary, InspectionCodeAction, InspectionConfigurationSummary,
+    InspectionFinding, InspectionProposedTextEdit, InspectionRelatedLocation,
+    InspectionRuleSummary, LanguageServerApprovalSummary, LanguageServerSummary,
+    ProjectInspectionFindingPage, ProjectInspectionSummary, ProjectLifecycle, ProjectSummary,
+    ProtocolError, Request, RequestMethod, Response, ResponseValue, SearchMatch,
+    SearchProgress as ProtocolSearchProgress, SearchSummary as ProtocolSearchSummary,
+    TaskLifecycle, TaskSummary, TextEdit, validate_version,
 };
+use koren_search::{SearchEvent, SearchJob, SearchOptions, SearchService};
 use koren_tasks::{
     ExecutionRequestId, TaskApprovalManager, TaskAuthorizationDecision, TaskCaller, TaskDefinition,
     TaskExecutionPolicy, TaskExecutionRequest, TaskExecutionRequestOutcome, TaskId, TaskManager,
@@ -105,6 +109,14 @@ pub struct DesktopEvent {
     pub revision: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<DiagnosticSet>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,6 +263,10 @@ struct DesktopBackend {
     next_project_inspection_id: u64,
     pending_language_servers: BTreeMap<u64, PendingLanguageServer>,
     next_language_server_approval: u64,
+    search_jobs: BTreeMap<u64, SearchJob>,
+    next_search_job_id: u64,
+    search_service: Option<SearchService>,
+    git_events: EventQueue,
 }
 
 struct PendingLanguageServer {
@@ -296,6 +312,27 @@ impl DesktopBackend {
                 "core.ping",
                 "Check that the platform is running",
                 command_ping,
+            )
+            .map_err(|error| error.to_string())?;
+        commands
+            .register(
+                "editor.new_file",
+                "Create a file in the active workspace",
+                command_new_file,
+            )
+            .map_err(|error| error.to_string())?;
+        commands
+            .register(
+                "editor.search",
+                "Search text across the active workspace",
+                command_search,
+            )
+            .map_err(|error| error.to_string())?;
+        commands
+            .register(
+                "editor.source_control",
+                "Open local Git source control",
+                command_source_control,
             )
             .map_err(|error| error.to_string())?;
         let mut projects = ProjectManager::new();
@@ -346,10 +383,19 @@ impl DesktopBackend {
             next_project_inspection_id: 0,
             pending_language_servers: BTreeMap::new(),
             next_language_server_approval: 0,
+            search_jobs: BTreeMap::new(),
+            next_search_job_id: 0,
+            search_service: None,
+            git_events: EventQueue::new(),
         })
     }
 
     fn shutdown(&mut self) {
+        for job in self.search_jobs.values() {
+            job.cancel();
+        }
+        self.search_jobs.clear();
+        self.search_service = None;
         self.approvals.shutdown();
         self.language_servers.shutdown();
         self.tasks.shutdown();
@@ -816,6 +862,11 @@ impl DesktopBackend {
                     ));
                 }
                 self.cancel_active_project_jobs();
+                for job in self.search_jobs.values() {
+                    job.cancel();
+                }
+                self.search_jobs.clear();
+                self.search_service = None;
                 self.approvals.invalidate_workspace(&root);
                 self.language_servers
                     .close_workspace(&root)
@@ -838,21 +889,276 @@ impl DesktopBackend {
             RequestMethod::ListDirectory { path } => {
                 let entries = self.workspace.list_dir(path).map_err(workspace_error)?;
                 Ok(ResponseValue::DirectoryEntries(
-                    entries
+                    entries.into_iter().map(protocol_directory_entry).collect(),
+                ))
+            }
+            RequestMethod::CreateWorkspaceFile { path } => {
+                let entry = self.workspace.create_file(&path).map_err(workspace_error)?;
+                Ok(ResponseValue::WorkspaceEntry(protocol_directory_entry(
+                    entry,
+                )))
+            }
+            RequestMethod::CreateWorkspaceDirectory { path } => {
+                let entry = self
+                    .workspace
+                    .create_directory(&path)
+                    .map_err(workspace_error)?;
+                Ok(ResponseValue::WorkspaceEntry(protocol_directory_entry(
+                    entry,
+                )))
+            }
+            RequestMethod::WorkspaceEntryMetadata { path } => {
+                let entry = self
+                    .workspace
+                    .entry_metadata(&path)
+                    .map_err(workspace_error)?;
+                Ok(ResponseValue::WorkspaceEntry(protocol_directory_entry(
+                    entry,
+                )))
+            }
+            RequestMethod::DiscoverGitRepositories => {
+                let root = self
+                    .workspace
+                    .root()
+                    .map_err(workspace_error)?
+                    .to_path_buf();
+                let repositories = GitService::new(&root)
+                    .and_then(|service| service.discover())
+                    .map_err(git_error)?;
+                Ok(ResponseValue::GitRepositories(
+                    repositories
                         .into_iter()
-                        .map(|entry| DirectoryEntry {
-                            name: entry.name.to_string_lossy().into_owned(),
-                            path: entry.path.to_string_lossy().into_owned(),
-                            kind: match entry.kind {
-                                EntryKind::File => DirectoryEntryKind::File,
-                                EntryKind::Directory => DirectoryEntryKind::Directory,
-                                EntryKind::Symlink => DirectoryEntryKind::Symlink,
-                                EntryKind::Other => DirectoryEntryKind::Other,
-                            },
-                            size_bytes: entry.size_bytes,
+                        .map(|repo| GitRepositorySummary {
+                            root: repo.root.display().to_string(),
+                            branch: repo.branch,
+                            has_head: repo.has_head,
                         })
                         .collect(),
                 ))
+            }
+            RequestMethod::GitStatus { path } => {
+                let root = self
+                    .workspace
+                    .root()
+                    .map_err(workspace_error)?
+                    .to_path_buf();
+                let service = GitService::new(&root).map_err(git_error)?;
+                let repository = service.open(&path).map_err(git_error)?;
+                let info = repository.info();
+                let files = repository
+                    .status()
+                    .map_err(git_error)?
+                    .into_iter()
+                    .map(|file| GitChangedFile {
+                        path: file.path,
+                        staged: file.staged,
+                        unstaged: file.unstaged,
+                        untracked: file.untracked,
+                        deleted: file.deleted,
+                        conflicted: file.conflicted,
+                    })
+                    .collect();
+                Ok(ResponseValue::GitStatus(GitStatusSummary {
+                    root: info.root.display().to_string(),
+                    branch: info.branch,
+                    has_head: info.has_head,
+                    files,
+                }))
+            }
+            RequestMethod::GitDiff {
+                repository,
+                path,
+                staged,
+            } => {
+                let root = self
+                    .workspace
+                    .root()
+                    .map_err(workspace_error)?
+                    .to_path_buf();
+                let repository = GitService::new(&root)
+                    .and_then(|service| service.open(&repository))
+                    .map_err(git_error)?;
+                let text = repository.diff(&path, staged).map_err(git_error)?;
+                Ok(ResponseValue::GitDiff { path, staged, text })
+            }
+            RequestMethod::GitStage { repository, path } => {
+                let root = self
+                    .workspace
+                    .root()
+                    .map_err(workspace_error)?
+                    .to_path_buf();
+                let repository = GitService::new(&root)
+                    .and_then(|service| service.open(&repository))
+                    .map_err(git_error)?;
+                repository.stage(&path).map_err(git_error)?;
+                self.git_events.push(PlatformEvent::GitStatusChanged {
+                    root: repository.info().root.clone(),
+                });
+                self.git_events.push(PlatformEvent::GitOperationCompleted {
+                    root: repository.info().root,
+                    operation: "staged".into(),
+                    commit: None,
+                });
+                Ok(ResponseValue::GitOperation {
+                    operation: "staged".into(),
+                    commit: None,
+                })
+            }
+            RequestMethod::GitUnstage { repository, path } => {
+                let root = self
+                    .workspace
+                    .root()
+                    .map_err(workspace_error)?
+                    .to_path_buf();
+                let repository = GitService::new(&root)
+                    .and_then(|service| service.open(&repository))
+                    .map_err(git_error)?;
+                repository.unstage(&path).map_err(git_error)?;
+                self.git_events.push(PlatformEvent::GitStatusChanged {
+                    root: repository.info().root.clone(),
+                });
+                self.git_events.push(PlatformEvent::GitOperationCompleted {
+                    root: repository.info().root,
+                    operation: "unstaged".into(),
+                    commit: None,
+                });
+                Ok(ResponseValue::GitOperation {
+                    operation: "unstaged".into(),
+                    commit: None,
+                })
+            }
+            RequestMethod::GitCommit {
+                repository,
+                message,
+            } => {
+                let root = self
+                    .workspace
+                    .root()
+                    .map_err(workspace_error)?
+                    .to_path_buf();
+                let repository = GitService::new(&root)
+                    .and_then(|service| service.open(&repository))
+                    .map_err(git_error)?;
+                let commit = repository.commit(&message).map_err(git_error)?;
+                self.git_events.push(PlatformEvent::GitStatusChanged {
+                    root: repository.info().root.clone(),
+                });
+                self.git_events.push(PlatformEvent::GitOperationCompleted {
+                    root: repository.info().root,
+                    operation: "committed".into(),
+                    commit: Some(commit.clone()),
+                });
+                Ok(ResponseValue::GitOperation {
+                    operation: "committed".into(),
+                    commit: Some(commit),
+                })
+            }
+            RequestMethod::StartWorkspaceSearch {
+                query,
+                case_sensitive,
+                regular_expression,
+                file_filter,
+            } => {
+                if self.search_service.is_none() {
+                    let root = self
+                        .workspace
+                        .root()
+                        .map_err(workspace_error)?
+                        .to_path_buf();
+                    self.search_service = Some(SearchService::new(root).map_err(search_error)?);
+                }
+                let job = self
+                    .search_service
+                    .as_ref()
+                    .expect("service initialized")
+                    .search(
+                        &query,
+                        SearchOptions {
+                            case_sensitive,
+                            regular_expression,
+                            file_filter,
+                            ..SearchOptions::default()
+                        },
+                    )
+                    .map_err(search_error)?;
+                self.next_search_job_id = self.next_search_job_id.saturating_add(1);
+                let job_id = self.next_search_job_id;
+                self.search_jobs.insert(job_id, job);
+                Ok(ResponseValue::SearchStarted { job_id })
+            }
+            RequestMethod::CancelWorkspaceSearch { job_id } => {
+                let job = self
+                    .search_jobs
+                    .get(&job_id)
+                    .ok_or_else(|| not_found(format!("search job {job_id} was not found")))?;
+                job.cancel();
+                Ok(ResponseValue::SearchCancelled { job_id })
+            }
+            RequestMethod::PollWorkspaceSearch { job_id } => self.poll_workspace_search(job_id),
+            RequestMethod::RenameWorkspaceEntry {
+                source,
+                destination,
+            } => {
+                self.documents
+                    .ensure_workspace_path_clean(&self.workspace, &source)
+                    .map_err(document_error)?;
+                self.documents
+                    .ensure_workspace_path_relocation_available(
+                        &self.workspace,
+                        &source,
+                        &destination,
+                    )
+                    .map_err(document_error)?;
+                let entry = self
+                    .workspace
+                    .rename(&source, &destination)
+                    .map_err(workspace_error)?;
+                let moved_documents = self
+                    .documents
+                    .relocate_workspace_path(&self.workspace, &source, &destination)
+                    .map_err(document_error)?;
+                for info in moved_documents {
+                    self.sync_document_close(info.id);
+                    self.sync_document_open(info.id);
+                }
+                Ok(ResponseValue::WorkspaceEntryChanged {
+                    operation: "renamed".into(),
+                    path: entry.path.to_string_lossy().into_owned(),
+                    previous_path: Some(source),
+                })
+            }
+            RequestMethod::DeleteWorkspaceEntry {
+                path,
+                recursive,
+                confirmed,
+            } => {
+                self.documents
+                    .ensure_workspace_path_clean(&self.workspace, &path)
+                    .map_err(document_error)?;
+                self.workspace
+                    .delete(&path, recursive, confirmed)
+                    .map_err(workspace_error)?;
+                let closed_documents = self
+                    .documents
+                    .close_workspace_path(&self.workspace, &path)
+                    .map_err(document_error)?;
+                for id in closed_documents {
+                    self.cancel_document_inspections(id.0);
+                    self.clear_document_inspection_results(id.0);
+                    if let Some(cancelled) = self.document_cancellations.remove(&id) {
+                        cancelled.store(true, Ordering::Release);
+                    }
+                    self.sync_document_close(id);
+                    if self.active_document == Some(id) {
+                        self.active_document = None;
+                    }
+                    self.open_documents.remove(&id);
+                }
+                Ok(ResponseValue::WorkspaceEntryChanged {
+                    operation: "deleted".into(),
+                    path,
+                    previous_path: None,
+                })
             }
             RequestMethod::OpenDocument { path } => {
                 let id = self
@@ -1148,6 +1454,64 @@ impl DesktopBackend {
                 .map_err(task_error),
             _ => Err(invalid("operation is not supported by Koren Code Editor")),
         }
+    }
+
+    fn poll_workspace_search(&mut self, job_id: u64) -> Result<ResponseValue, ProtocolError> {
+        let job = self
+            .search_jobs
+            .remove(&job_id)
+            .ok_or_else(|| not_found(format!("search job {job_id} was not found")))?;
+        let mut matches = Vec::new();
+        let mut progress = None;
+        let mut summary = None;
+        let mut error = None;
+        let mut complete = false;
+        for _ in 0..256 {
+            match job.try_recv() {
+                Some(SearchEvent::Match(found)) => matches.push(SearchMatch {
+                    path: found.path,
+                    line: found.line,
+                    column_utf16: found.column_utf16,
+                    match_length_utf16: found.match_length_utf16,
+                    preview: found.preview,
+                }),
+                Some(SearchEvent::Progress(update)) => {
+                    progress = Some(ProtocolSearchProgress {
+                        files_scanned: update.files_scanned,
+                        matches_found: update.matches_found,
+                        current_path: update.current_path,
+                    })
+                }
+                Some(SearchEvent::Completed(done)) => {
+                    complete = true;
+                    summary = Some(ProtocolSearchSummary {
+                        files_scanned: done.files_scanned,
+                        matches_found: done.matches_found,
+                        skipped_binary_files: done.skipped_binary_files,
+                        truncated: done.truncated,
+                        cancelled: done.cancelled,
+                    });
+                    break;
+                }
+                Some(SearchEvent::Error(message)) => {
+                    complete = true;
+                    error = Some(message);
+                    break;
+                }
+                None => break,
+            }
+        }
+        if !complete {
+            self.search_jobs.insert(job_id, job);
+        }
+        Ok(ResponseValue::SearchBatch {
+            job_id,
+            matches,
+            progress,
+            complete,
+            summary,
+            error,
+        })
     }
 
     fn list_extensions(&mut self) -> Result<ResponseValue, ProtocolError> {
@@ -2589,6 +2953,7 @@ impl DesktopBackend {
                 .into_iter()
                 .map(event_from_platform),
         );
+        events.extend(self.git_events.drain().into_iter().map(event_from_platform));
         let _ = self.tasks.drain_events();
         for actor_event in self.language_servers.drain_events() {
             match actor_event {
@@ -3184,6 +3549,24 @@ fn command_ping(arguments: &[String]) -> Result<String, CommandError> {
     Ok("pong".into())
 }
 
+fn command_new_file(arguments: &[String]) -> Result<String, CommandError> {
+    command_ui_action(arguments, "editor.new_file")
+}
+fn command_search(arguments: &[String]) -> Result<String, CommandError> {
+    command_ui_action(arguments, "editor.search")
+}
+fn command_source_control(arguments: &[String]) -> Result<String, CommandError> {
+    command_ui_action(arguments, "editor.source_control")
+}
+fn command_ui_action(arguments: &[String], action: &str) -> Result<String, CommandError> {
+    if !arguments.is_empty() {
+        return Err(CommandError::Execution(format!(
+            "{action} takes no arguments"
+        )));
+    }
+    Ok(action.into())
+}
+
 fn command_error(error: CommandError) -> ProtocolError {
     ProtocolError {
         code: match error {
@@ -3204,6 +3587,17 @@ fn event_from_platform(event: PlatformEvent) -> DesktopEvent {
         PlatformEvent::WorkspaceClosed { root } => DesktopEvent {
             kind: "workspace_closed".into(),
             root: Some(root.to_string_lossy().into_owned()),
+            ..empty_event()
+        },
+        PlatformEvent::WorkspaceEntryChanged {
+            operation,
+            path,
+            previous_path,
+        } => DesktopEvent {
+            kind: format!("workspace_entry_{operation}"),
+            path: Some(path.to_string_lossy().into_owned()),
+            previous_path: previous_path.map(|value| value.to_string_lossy().into_owned()),
+            operation: Some(operation),
             ..empty_event()
         },
         PlatformEvent::DocumentOpened {
@@ -3237,6 +3631,28 @@ fn event_from_platform(event: PlatformEvent) -> DesktopEvent {
         PlatformEvent::DocumentClosed { document_id } => DesktopEvent {
             kind: "document_closed".into(),
             document_id: Some(document_id),
+            ..empty_event()
+        },
+        PlatformEvent::DocumentPathChanged { document_id, path } => DesktopEvent {
+            kind: "document_path_changed".into(),
+            document_id: Some(document_id),
+            path: Some(path.to_string_lossy().into_owned()),
+            ..empty_event()
+        },
+        PlatformEvent::GitStatusChanged { root } => DesktopEvent {
+            kind: "git_status_changed".into(),
+            root: Some(root.to_string_lossy().into_owned()),
+            ..empty_event()
+        },
+        PlatformEvent::GitOperationCompleted {
+            root,
+            operation,
+            commit,
+        } => DesktopEvent {
+            kind: "git_operation_completed".into(),
+            root: Some(root.to_string_lossy().into_owned()),
+            operation: Some(operation),
+            commit,
             ..empty_event()
         },
         PlatformEvent::SaveConflictDetected {
@@ -3294,8 +3710,26 @@ fn empty_event() -> DesktopEvent {
         server_id: None,
         revision: None,
         root: None,
+        path: None,
+        previous_path: None,
+        operation: None,
+        commit: None,
         diagnostics: None,
         message: None,
+    }
+}
+
+fn protocol_directory_entry(entry: koren_workspace::WorkspaceEntry) -> DirectoryEntry {
+    DirectoryEntry {
+        name: entry.name.to_string_lossy().into_owned(),
+        path: entry.path.to_string_lossy().into_owned(),
+        kind: match entry.kind {
+            EntryKind::File => DirectoryEntryKind::File,
+            EntryKind::Directory => DirectoryEntryKind::Directory,
+            EntryKind::Symlink => DirectoryEntryKind::Symlink,
+            EntryKind::Other => DirectoryEntryKind::Other,
+        },
+        size_bytes: entry.size_bytes,
     }
 }
 
@@ -3435,11 +3869,35 @@ fn workspace_error(error: koren_workspace::WorkspaceError) -> ProtocolError {
         message: error.to_string(),
     }
 }
+fn git_error(error: koren_git::GitError) -> ProtocolError {
+    let code = match error {
+        koren_git::GitError::InvalidPath => ErrorCode::InvalidPath,
+        koren_git::GitError::NotFound => ErrorCode::NotFound,
+        koren_git::GitError::Conflict(_) => ErrorCode::Conflict,
+        koren_git::GitError::Git(_)
+        | koren_git::GitError::DiffTooLarge
+        | koren_git::GitError::EmptyCommitMessage
+        | koren_git::GitError::NothingToCommit
+        | koren_git::GitError::RepositoryLimit => ErrorCode::InvalidRequest,
+    };
+    ProtocolError {
+        code,
+        message: error.to_string(),
+    }
+}
+fn search_error(error: koren_search::SearchError) -> ProtocolError {
+    ProtocolError {
+        code: ErrorCode::InvalidRequest,
+        message: error.to_string(),
+    }
+}
 fn document_error(error: koren_documents::DocumentError) -> ProtocolError {
     let code = match error {
         koren_documents::DocumentError::Conflict(_)
         | koren_documents::DocumentError::ConflictChangedAgain(_)
-        | koren_documents::DocumentError::StaleRevision { .. } => ErrorCode::Conflict,
+        | koren_documents::DocumentError::StaleRevision { .. }
+        | koren_documents::DocumentError::UnsavedChanges(_)
+        | koren_documents::DocumentError::PathAlreadyOpen(_) => ErrorCode::Conflict,
         koren_documents::DocumentError::NotOpen(_) => ErrorCode::NotOpen,
         koren_documents::DocumentError::Workspace(_) => ErrorCode::InvalidPath,
         _ => ErrorCode::InvalidRequest,
@@ -4663,11 +5121,172 @@ mod tests {
     }
 
     #[test]
+    fn public_workspace_mutations_protect_dirty_buffers_and_search_is_incremental() {
+        let temp = Temp::new();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: temp.0.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            backend.method(RequestMethod::CreateWorkspaceDirectory { path: "src".into() }),
+            Ok(ResponseValue::WorkspaceEntry(_))
+        ));
+        assert!(matches!(
+            backend.method(RequestMethod::CreateWorkspaceFile {
+                path: "src/main.rs".into()
+            }),
+            Ok(ResponseValue::WorkspaceEntry(_))
+        ));
+        let document_id = match backend
+            .method(RequestMethod::OpenDocument {
+                path: "src/main.rs".into(),
+            })
+            .unwrap()
+        {
+            ResponseValue::DocumentOpened { document_id, .. } => document_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        backend
+            .method(RequestMethod::ApplyDocumentEdits {
+                document_id,
+                expected_revision: 0,
+                edits: vec![TextEdit {
+                    range: koren_protocol::TextRange {
+                        start: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                    },
+                    new_text: "unsaved".into(),
+                }],
+            })
+            .unwrap();
+        assert!(matches!(
+            backend.method(RequestMethod::RenameWorkspaceEntry {
+                source: "src".into(),
+                destination: "code".into()
+            }),
+            Err(ProtocolError {
+                code: ErrorCode::Conflict,
+                ..
+            })
+        ));
+        backend
+            .method(RequestMethod::CloseDocument {
+                document_id,
+                discard_unsaved_changes: true,
+            })
+            .unwrap();
+        backend
+            .method(RequestMethod::RenameWorkspaceEntry {
+                source: "src".into(),
+                destination: "code".into(),
+            })
+            .unwrap();
+        fs::write(temp.0.join("code/search.txt"), "needle 🦀\n").unwrap();
+        let job_id = match backend
+            .method(RequestMethod::StartWorkspaceSearch {
+                query: "needle".into(),
+                case_sensitive: true,
+                regular_expression: false,
+                file_filter: Some("*.txt".into()),
+            })
+            .unwrap()
+        {
+            ResponseValue::SearchStarted { job_id } => job_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        let mut found = Vec::new();
+        for _ in 0..500 {
+            match backend
+                .method(RequestMethod::PollWorkspaceSearch { job_id })
+                .unwrap()
+            {
+                ResponseValue::SearchBatch {
+                    matches, complete, ..
+                } => {
+                    found.extend(matches);
+                    if complete {
+                        break;
+                    }
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, "code/search.txt");
+        backend.shutdown();
+    }
+
+    #[test]
+    fn local_git_operations_are_exposed_through_typed_protocol_and_publish_events() {
+        let temp = Temp::new();
+        let repository = git2::Repository::init(&temp.0).unwrap();
+        repository
+            .config()
+            .unwrap()
+            .set_str("user.name", "Koren Test")
+            .unwrap();
+        repository
+            .config()
+            .unwrap()
+            .set_str("user.email", "koren@example.invalid")
+            .unwrap();
+        fs::write(temp.0.join("README.md"), "local change\n").unwrap();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: temp.0.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert!(
+            matches!(backend.method(RequestMethod::DiscoverGitRepositories).unwrap(), ResponseValue::GitRepositories(repositories) if repositories.len() == 1)
+        );
+        assert!(
+            matches!(backend.method(RequestMethod::GitStatus { path: String::new() }).unwrap(), ResponseValue::GitStatus(status) if status.files.iter().any(|file| file.path == "README.md" && file.untracked))
+        );
+        backend
+            .method(RequestMethod::GitStage {
+                repository: String::new(),
+                path: "README.md".into(),
+            })
+            .unwrap();
+        assert!(
+            matches!(backend.method(RequestMethod::GitStatus { path: String::new() }).unwrap(), ResponseValue::GitStatus(status) if status.files.iter().any(|file| file.path == "README.md" && file.staged))
+        );
+        assert!(
+            matches!(backend.method(RequestMethod::GitCommit { repository: String::new(), message: "initial".into() }).unwrap(), ResponseValue::GitOperation { operation, commit: Some(_) } if operation == "committed")
+        );
+        assert!(
+            matches!(backend.method(RequestMethod::GitStatus { path: String::new() }).unwrap(), ResponseValue::GitStatus(status) if status.files.is_empty())
+        );
+        let events = backend.drain_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "git_status_changed")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "git_operation_completed" && event.commit.is_some())
+        );
+        backend.shutdown();
+    }
+
+    #[test]
     fn platform_commands_are_listed_and_invoked_through_the_existing_registry() {
         let mut backend = DesktopBackend::new().unwrap();
         assert!(matches!(
             backend.method(RequestMethod::ListCommands).unwrap(),
-            ResponseValue::Commands(commands) if commands == ["core.ping"]
+            ResponseValue::Commands(commands) if commands == ["core.ping", "editor.new_file", "editor.search", "editor.source_control"]
         ));
         assert!(matches!(
             backend.method(RequestMethod::ExecuteCommand { command_id: "core.ping".into() }).unwrap(),

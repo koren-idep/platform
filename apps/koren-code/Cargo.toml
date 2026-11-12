@@ -29,6 +29,11 @@ koren-extensions = { workspace = true }
 koren-inspections = { workspace = true }
 koren-lua = { workspace = true }
 koren-lsp = { workspace = true }
+koren-git = { workspace = true }
+koren-search = { workspace = true }
+
+[dev-dependencies]
+git2.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"

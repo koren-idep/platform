@@ -4,22 +4,28 @@ use koren_cargo::{CargoProjectMetadata, CargoProvider, CargoTargetKind};
 use koren_commands::{CommandError, CommandRegistry};
 use koren_core::Platform;
 use koren_documents::{DocumentError, DocumentId, DocumentManager};
+use koren_git::GitService;
 use koren_projects::{
     DiscoveryLimits, MarkerFileProvider, ProjectId, ProjectManager, ProjectSpec, ProviderId,
 };
 use koren_protocol::{
     CargoPackageSummary, CargoProjectSummary, CargoTargetSummary, DirectoryEntry,
-    DirectoryEntryKind, ErrorCode, ExecutionApprovalSummary, ProjectLifecycle, ProjectSummary,
-    ProtocolError, Request, RequestMethod, Response, ResponseValue, TaskLifecycle, TaskSummary,
-    validate_version,
+    DirectoryEntryKind, ErrorCode, ExecutionApprovalSummary, GitChangedFile, GitRepositorySummary,
+    GitStatusSummary, ProjectLifecycle, ProjectSummary, ProtocolError, Request, RequestMethod,
+    Response, ResponseValue, SearchMatch, SearchProgress as ProtocolSearchProgress,
+    SearchSummary as ProtocolSearchSummary, TaskLifecycle, TaskSummary, validate_version,
 };
+use koren_search::{SearchEvent, SearchJob, SearchOptions, SearchService};
 use koren_tasks::{
     ExecutionRequestId, TaskApprovalManager, TaskAuthorizationDecision, TaskAuthorizer, TaskCaller,
     TaskCategory, TaskDefinition, TaskError, TaskExecutionPolicy, TaskExecutionRequest,
     TaskExecutionRequestOutcome, TaskId, TaskManager, TaskOptions, TaskRunId,
 };
 use koren_workspace::{EntryKind, WorkspaceError, WorkspaceManager};
-use std::io::{BufRead, Write};
+use std::{
+    collections::BTreeMap,
+    io::{BufRead, Write},
+};
 
 fn ping(args: &[String]) -> Result<String, CommandError> {
     if !args.is_empty() {
@@ -173,6 +179,9 @@ fn run_session<R: BufRead, W: Write>(
     let authorizer = SessionTaskAuthorizer {
         enabled: allow_tasks,
     };
+    let mut search_service = None;
+    let mut search_jobs = BTreeMap::new();
+    let mut next_search_job_id = 0u64;
     let mut line = String::new();
     loop {
         line.clear();
@@ -192,6 +201,9 @@ fn run_session<R: BufRead, W: Write>(
                     approvals: &mut approvals,
                     authorizer: &authorizer,
                     cargo_provider: &cargo_provider,
+                    search_service: &mut search_service,
+                    search_jobs: &mut search_jobs,
+                    next_search_job_id: &mut next_search_job_id,
                 };
                 handle_request(request, &mut session)
             }
@@ -234,6 +246,9 @@ struct SessionContext<'a> {
     approvals: &'a mut TaskApprovalManager,
     authorizer: &'a SessionTaskAuthorizer,
     cargo_provider: &'a CargoProvider,
+    search_service: &'a mut Option<SearchService>,
+    search_jobs: &'a mut BTreeMap<u64, SearchJob>,
+    next_search_job_id: &'a mut u64,
 }
 
 fn handle_request(request: Request, session: &mut SessionContext<'_>) -> Response {
@@ -249,6 +264,9 @@ fn handle_method(
     method: RequestMethod,
     session: &mut SessionContext<'_>,
 ) -> Result<ResponseValue, ProtocolError> {
+    if is_phase9a_method(&method) {
+        return handle_phase9a_method(method, session);
+    }
     match method {
         RequestMethod::Ping => Ok(ResponseValue::Pong),
         RequestMethod::ListCommands => registry()
@@ -283,13 +301,31 @@ fn handle_method(
                 })
         }
         RequestMethod::OpenWorkspace { path } => open_workspace(session.workspace, path),
-        RequestMethod::CloseWorkspace => close_workspace(
-            session.workspace,
-            session.documents,
-            session.projects,
-            session.tasks,
-            session.approvals,
-        ),
+        RequestMethod::CloseWorkspace => {
+            let root = session
+                .workspace
+                .root()
+                .map_err(|error| workspace_error(&error))?
+                .to_path_buf();
+            if session.documents.has_documents_for_workspace(&root) {
+                return Err(ProtocolError {
+                    code: ErrorCode::InvalidRequest,
+                    message: "close open documents before closing this workspace".into(),
+                });
+            }
+            for job in session.search_jobs.values() {
+                job.cancel();
+            }
+            session.search_jobs.clear();
+            *session.search_service = None;
+            close_workspace(
+                session.workspace,
+                session.documents,
+                session.projects,
+                session.tasks,
+                session.approvals,
+            )
+        }
         RequestMethod::ListDirectory { path } => list_directory(session.workspace, path),
         method @ (RequestMethod::OpenDocument { .. }
         | RequestMethod::ReadDocument { .. }
@@ -309,6 +345,304 @@ fn handle_method(
             session.authorizer,
             session.cargo_provider,
         ),
+    }
+}
+
+fn is_phase9a_method(method: &RequestMethod) -> bool {
+    matches!(
+        method,
+        RequestMethod::CreateWorkspaceFile { .. }
+            | RequestMethod::CreateWorkspaceDirectory { .. }
+            | RequestMethod::WorkspaceEntryMetadata { .. }
+            | RequestMethod::RenameWorkspaceEntry { .. }
+            | RequestMethod::DeleteWorkspaceEntry { .. }
+            | RequestMethod::DiscoverGitRepositories
+            | RequestMethod::GitStatus { .. }
+            | RequestMethod::GitDiff { .. }
+            | RequestMethod::GitStage { .. }
+            | RequestMethod::GitUnstage { .. }
+            | RequestMethod::GitCommit { .. }
+            | RequestMethod::StartWorkspaceSearch { .. }
+            | RequestMethod::CancelWorkspaceSearch { .. }
+            | RequestMethod::PollWorkspaceSearch { .. }
+    )
+}
+
+fn handle_phase9a_method(
+    method: RequestMethod,
+    session: &mut SessionContext<'_>,
+) -> Result<ResponseValue, ProtocolError> {
+    match method {
+        RequestMethod::CreateWorkspaceFile { .. }
+        | RequestMethod::CreateWorkspaceDirectory { .. }
+        | RequestMethod::WorkspaceEntryMetadata { .. }
+        | RequestMethod::RenameWorkspaceEntry { .. }
+        | RequestMethod::DeleteWorkspaceEntry { .. } => handle_workspace_mutation(method, session),
+        RequestMethod::DiscoverGitRepositories | RequestMethod::GitStatus { .. } => {
+            handle_git_status(method, session)
+        }
+        RequestMethod::GitDiff { .. }
+        | RequestMethod::GitStage { .. }
+        | RequestMethod::GitUnstage { .. }
+        | RequestMethod::GitCommit { .. } => handle_git_operation(method, session),
+        RequestMethod::StartWorkspaceSearch { .. }
+        | RequestMethod::CancelWorkspaceSearch { .. }
+        | RequestMethod::PollWorkspaceSearch { .. } => handle_search_method(method, session),
+        _ => Err(ProtocolError {
+            code: ErrorCode::InvalidRequest,
+            message: "unsupported Phase 9A request".into(),
+        }),
+    }
+}
+
+fn handle_workspace_mutation(
+    method: RequestMethod,
+    session: &mut SessionContext<'_>,
+) -> Result<ResponseValue, ProtocolError> {
+    match method {
+        RequestMethod::CreateWorkspaceFile { path } => session
+            .workspace
+            .create_file(path)
+            .map(|entry| ResponseValue::WorkspaceEntry(protocol_entry(&entry)))
+            .map_err(|error| workspace_error(&error)),
+        RequestMethod::CreateWorkspaceDirectory { path } => session
+            .workspace
+            .create_directory(path)
+            .map(|entry| ResponseValue::WorkspaceEntry(protocol_entry(&entry)))
+            .map_err(|error| workspace_error(&error)),
+        RequestMethod::WorkspaceEntryMetadata { path } => session
+            .workspace
+            .entry_metadata(path)
+            .map(|entry| ResponseValue::WorkspaceEntry(protocol_entry(&entry)))
+            .map_err(|error| workspace_error(&error)),
+        RequestMethod::RenameWorkspaceEntry {
+            source,
+            destination,
+        } => {
+            session
+                .documents
+                .ensure_workspace_path_clean(session.workspace, &source)
+                .map_err(|error| document_error(&error))?;
+            session
+                .documents
+                .ensure_workspace_path_relocation_available(
+                    session.workspace,
+                    &source,
+                    &destination,
+                )
+                .map_err(|error| document_error(&error))?;
+            let entry = session
+                .workspace
+                .rename(&source, &destination)
+                .map_err(|error| workspace_error(&error))?;
+            session
+                .documents
+                .relocate_workspace_path(session.workspace, &source, &destination)
+                .map_err(|error| document_error(&error))?;
+            Ok(ResponseValue::WorkspaceEntryChanged {
+                operation: "renamed".into(),
+                path: entry.path.to_string_lossy().into_owned(),
+                previous_path: Some(source),
+            })
+        }
+        RequestMethod::DeleteWorkspaceEntry {
+            path,
+            recursive,
+            confirmed,
+        } => {
+            session
+                .documents
+                .ensure_workspace_path_clean(session.workspace, &path)
+                .map_err(|error| document_error(&error))?;
+            session
+                .workspace
+                .delete(&path, recursive, confirmed)
+                .map_err(|error| workspace_error(&error))?;
+            session
+                .documents
+                .close_workspace_path(session.workspace, &path)
+                .map_err(|error| document_error(&error))?;
+            Ok(ResponseValue::WorkspaceEntryChanged {
+                operation: "deleted".into(),
+                path,
+                previous_path: None,
+            })
+        }
+        _ => Err(invalid_phase9a_request()),
+    }
+}
+
+fn handle_git_status(
+    method: RequestMethod,
+    session: &SessionContext<'_>,
+) -> Result<ResponseValue, ProtocolError> {
+    let service = git_service(session)?;
+    match method {
+        RequestMethod::DiscoverGitRepositories => Ok(ResponseValue::GitRepositories(
+            service
+                .discover()
+                .map_err(|error| git_protocol_error(&error))?
+                .into_iter()
+                .map(|repo| GitRepositorySummary {
+                    root: repo.root.display().to_string(),
+                    branch: repo.branch,
+                    has_head: repo.has_head,
+                })
+                .collect(),
+        )),
+        RequestMethod::GitStatus { path } => {
+            let repo = service
+                .open(path)
+                .map_err(|error| git_protocol_error(&error))?;
+            let info = repo.info();
+            let files = repo
+                .status()
+                .map_err(|error| git_protocol_error(&error))?
+                .into_iter()
+                .map(protocol_git_file)
+                .collect();
+            Ok(ResponseValue::GitStatus(GitStatusSummary {
+                root: info.root.display().to_string(),
+                branch: info.branch,
+                has_head: info.has_head,
+                files,
+            }))
+        }
+        _ => Err(invalid_phase9a_request()),
+    }
+}
+
+fn handle_git_operation(
+    method: RequestMethod,
+    session: &SessionContext<'_>,
+) -> Result<ResponseValue, ProtocolError> {
+    let service = git_service(session)?;
+    match method {
+        RequestMethod::GitDiff {
+            repository,
+            path,
+            staged,
+        } => {
+            let repo = service
+                .open(repository)
+                .map_err(|error| git_protocol_error(&error))?;
+            let text = repo
+                .diff(&path, staged)
+                .map_err(|error| git_protocol_error(&error))?;
+            Ok(ResponseValue::GitDiff { path, staged, text })
+        }
+        RequestMethod::GitStage { repository, path } => {
+            let repo = service
+                .open(repository)
+                .map_err(|error| git_protocol_error(&error))?;
+            repo.stage(&path)
+                .map_err(|error| git_protocol_error(&error))?;
+            Ok(ResponseValue::GitOperation {
+                operation: "staged".into(),
+                commit: None,
+            })
+        }
+        RequestMethod::GitUnstage { repository, path } => {
+            let repo = service
+                .open(repository)
+                .map_err(|error| git_protocol_error(&error))?;
+            repo.unstage(&path)
+                .map_err(|error| git_protocol_error(&error))?;
+            Ok(ResponseValue::GitOperation {
+                operation: "unstaged".into(),
+                commit: None,
+            })
+        }
+        RequestMethod::GitCommit {
+            repository,
+            message,
+        } => {
+            let repo = service
+                .open(repository)
+                .map_err(|error| git_protocol_error(&error))?;
+            let commit = repo
+                .commit(&message)
+                .map_err(|error| git_protocol_error(&error))?;
+            Ok(ResponseValue::GitOperation {
+                operation: "committed".into(),
+                commit: Some(commit),
+            })
+        }
+        _ => Err(invalid_phase9a_request()),
+    }
+}
+
+fn handle_search_method(
+    method: RequestMethod,
+    session: &mut SessionContext<'_>,
+) -> Result<ResponseValue, ProtocolError> {
+    match method {
+        RequestMethod::StartWorkspaceSearch {
+            query,
+            case_sensitive,
+            regular_expression,
+            file_filter,
+        } => {
+            if session.search_service.is_none() {
+                let root = session
+                    .workspace
+                    .root()
+                    .map_err(|error| workspace_error(&error))?
+                    .to_path_buf();
+                *session.search_service =
+                    Some(SearchService::new(root).map_err(|error| search_protocol_error(&error))?);
+            }
+            let service = session
+                .search_service
+                .as_ref()
+                .ok_or_else(invalid_phase9a_request)?;
+            let job = service
+                .search(
+                    &query,
+                    SearchOptions {
+                        case_sensitive,
+                        regular_expression,
+                        file_filter,
+                        ..SearchOptions::default()
+                    },
+                )
+                .map_err(|error| search_protocol_error(&error))?;
+            *session.next_search_job_id = (*session.next_search_job_id).saturating_add(1);
+            let job_id = *session.next_search_job_id;
+            session.search_jobs.insert(job_id, job);
+            Ok(ResponseValue::SearchStarted { job_id })
+        }
+        RequestMethod::CancelWorkspaceSearch { job_id } => {
+            session
+                .search_jobs
+                .get(&job_id)
+                .ok_or_else(|| ProtocolError {
+                    code: ErrorCode::NotFound,
+                    message: format!("search job {job_id} was not found"),
+                })?
+                .cancel();
+            Ok(ResponseValue::SearchCancelled { job_id })
+        }
+        RequestMethod::PollWorkspaceSearch { job_id } => {
+            poll_search_job(session.search_jobs, job_id)
+        }
+        _ => Err(invalid_phase9a_request()),
+    }
+}
+
+fn git_service(session: &SessionContext<'_>) -> Result<GitService, ProtocolError> {
+    let root = session
+        .workspace
+        .root()
+        .map_err(|error| workspace_error(&error))?
+        .to_path_buf();
+    GitService::new(root).map_err(|error| git_protocol_error(&error))
+}
+
+fn invalid_phase9a_request() -> ProtocolError {
+    ProtocolError {
+        code: ErrorCode::InvalidRequest,
+        message: "unsupported Phase 9A request".into(),
     }
 }
 
@@ -1053,6 +1387,92 @@ fn list_directory(
     Ok(ResponseValue::DirectoryEntries(entries))
 }
 
+fn protocol_entry(entry: &koren_workspace::WorkspaceEntry) -> DirectoryEntry {
+    DirectoryEntry {
+        name: entry.name.to_string_lossy().into_owned(),
+        path: entry.path.to_string_lossy().replace('\\', "/"),
+        kind: match entry.kind {
+            EntryKind::File => DirectoryEntryKind::File,
+            EntryKind::Directory => DirectoryEntryKind::Directory,
+            EntryKind::Symlink => DirectoryEntryKind::Symlink,
+            EntryKind::Other => DirectoryEntryKind::Other,
+        },
+        size_bytes: entry.size_bytes,
+    }
+}
+
+fn protocol_git_file(file: koren_git::ChangedFile) -> GitChangedFile {
+    GitChangedFile {
+        path: file.path,
+        staged: file.staged,
+        unstaged: file.unstaged,
+        untracked: file.untracked,
+        deleted: file.deleted,
+        conflicted: file.conflicted,
+    }
+}
+
+fn poll_search_job(
+    jobs: &mut BTreeMap<u64, SearchJob>,
+    job_id: u64,
+) -> Result<ResponseValue, ProtocolError> {
+    let job = jobs.remove(&job_id).ok_or_else(|| ProtocolError {
+        code: ErrorCode::NotFound,
+        message: format!("search job {job_id} was not found"),
+    })?;
+    let mut matches = Vec::new();
+    let mut progress = None;
+    let mut summary = None;
+    let mut error = None;
+    let mut complete = false;
+    for _ in 0..256 {
+        match job.try_recv() {
+            Some(SearchEvent::Match(found)) => matches.push(SearchMatch {
+                path: found.path,
+                line: found.line,
+                column_utf16: found.column_utf16,
+                match_length_utf16: found.match_length_utf16,
+                preview: found.preview,
+            }),
+            Some(SearchEvent::Progress(value)) => {
+                progress = Some(ProtocolSearchProgress {
+                    files_scanned: value.files_scanned,
+                    matches_found: value.matches_found,
+                    current_path: value.current_path,
+                });
+            }
+            Some(SearchEvent::Completed(value)) => {
+                complete = true;
+                summary = Some(ProtocolSearchSummary {
+                    files_scanned: value.files_scanned,
+                    matches_found: value.matches_found,
+                    skipped_binary_files: value.skipped_binary_files,
+                    truncated: value.truncated,
+                    cancelled: value.cancelled,
+                });
+                break;
+            }
+            Some(SearchEvent::Error(value)) => {
+                complete = true;
+                error = Some(value);
+                break;
+            }
+            None => break,
+        }
+    }
+    if !complete {
+        jobs.insert(job_id, job);
+    }
+    Ok(ResponseValue::SearchBatch {
+        job_id,
+        matches,
+        progress,
+        complete,
+        summary,
+        error,
+    })
+}
+
 fn handle_document_method(
     method: RequestMethod,
     workspace: &WorkspaceManager,
@@ -1176,9 +1596,10 @@ fn workspace_error(error: &WorkspaceError) -> ProtocolError {
         | WorkspaceError::NotFile(_)
         | WorkspaceError::InvalidLimit => ErrorCode::InvalidPath,
         WorkspaceError::NotFound(_) => ErrorCode::NotFound,
-        WorkspaceError::AlreadyOpen | WorkspaceError::DirectoryLimitExceeded { .. } => {
-            ErrorCode::InvalidRequest
-        }
+        WorkspaceError::AlreadyOpen
+        | WorkspaceError::AlreadyExists(_)
+        | WorkspaceError::ConfirmationRequired
+        | WorkspaceError::DirectoryLimitExceeded { .. } => ErrorCode::InvalidRequest,
         WorkspaceError::Io { .. } => ErrorCode::Internal,
     };
     ProtocolError {
@@ -1187,15 +1608,37 @@ fn workspace_error(error: &WorkspaceError) -> ProtocolError {
     }
 }
 
+fn git_protocol_error(error: &koren_git::GitError) -> ProtocolError {
+    let code = match error {
+        koren_git::GitError::InvalidPath => ErrorCode::InvalidPath,
+        koren_git::GitError::NotFound => ErrorCode::NotFound,
+        koren_git::GitError::Conflict(_) => ErrorCode::Conflict,
+        _ => ErrorCode::InvalidRequest,
+    };
+    ProtocolError {
+        code,
+        message: error.to_string(),
+    }
+}
+
+fn search_protocol_error(error: &koren_search::SearchError) -> ProtocolError {
+    ProtocolError {
+        code: ErrorCode::InvalidRequest,
+        message: error.to_string(),
+    }
+}
+
 fn document_error(error: &DocumentError) -> ProtocolError {
     let code = match &error {
-        DocumentError::Conflict(_) | DocumentError::ConflictChangedAgain(_) => ErrorCode::Conflict,
+        DocumentError::Conflict(_)
+        | DocumentError::ConflictChangedAgain(_)
+        | DocumentError::UnsavedChanges(_)
+        | DocumentError::PathAlreadyOpen(_) => ErrorCode::Conflict,
         DocumentError::Workspace(error) => return workspace_error(error),
         DocumentError::NotOpen(_) => ErrorCode::NotOpen,
         DocumentError::ExternalFileMissing(_) => ErrorCode::NotFound,
         DocumentError::NoBackingFile(_)
         | DocumentError::NoPendingConflict(_)
-        | DocumentError::UnsavedChanges(_)
         | DocumentError::InvalidUtf8(_)
         | DocumentError::BinaryFile(_)
         | DocumentError::TooLarge { .. }

@@ -263,7 +263,6 @@ kbd {
 }
 @media (max-width: 640px) {
   .brand-divider { display: none; }
-  .toolbar-button[aria-label="Source Control"] { display: none; }
   .status-message { display: none; }
   .status-item { padding-inline: 4px; }
 }
@@ -278,3 +277,27 @@ kbd {
 .inspection-rule-description small { color: var(--muted); overflow-wrap: anywhere; }
 .project-analysis-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 8px; border-bottom: 1px solid var(--border); }
 .project-analysis-controls span { color: var(--muted); font-size: 11px; flex-basis: 100%; }
+.developer-panel { overflow: auto; padding: 8px 10px; }
+.developer-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 0 0 8px; }
+.developer-controls input[type="search"], .developer-controls input[type="text"], .developer-controls select { min-width: 120px; height: 28px; padding: 0 8px; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 4px; }
+.developer-controls input[type="search"] { flex: 1 1 220px; }
+.developer-controls label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 12px; }
+.developer-results { display: grid; gap: 2px; max-height: 240px; overflow: auto; }
+.search-result { display: grid; grid-template-columns: minmax(130px, 1fr) auto; align-items: center; gap: 10px; width: 100%; padding: 5px 8px; color: var(--text); background: transparent; border: 0; border-radius: 3px; text-align: left; }
+.search-result:hover, .git-file:hover { background: var(--hover); }
+.search-result-path { overflow: hidden; color: var(--accent); text-overflow: ellipsis; white-space: nowrap; }
+.search-result-preview { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+.git-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.git-columns h3 { margin: 6px 0; color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; }
+.git-file { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 2px 4px; border-radius: 3px; }
+.git-file-path { flex: 1; min-width: 0; overflow: hidden; color: var(--text); background: transparent; border: 0; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.git-file.staged .git-file-path { color: var(--success, #67c587); }
+.git-file-action { padding: 2px 6px; color: var(--muted); background: transparent; border: 1px solid var(--border); border-radius: 3px; font-size: 11px; }
+.git-diff { max-height: 190px; overflow: auto; margin: 8px 0; padding: 8px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 4px; font: 12px/1.45 var(--mono); white-space: pre; }
+.git-diff:not(.has-diff) { color: var(--muted); }
+.git-diff .diff-add { color: #70cc89; }
+.git-diff .diff-delete { color: #ed7474; }
+.git-diff .diff-hunk { color: #7cbaff; }
+.git-diff .diff-header { color: var(--muted); }
+.git-diff .diff-limit { color: var(--muted); font-style: italic; }
+.dialog .danger { color: #fff; background: #9d3434; border: 1px solid #b94a4a; }

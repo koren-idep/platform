@@ -113,6 +113,50 @@ def test_session_rejects_unsupported_protocol_version():
     assert response["result"]["Err"]["code"] == "unsupported_version"
 
 
+def test_session_workspace_mutations_and_incremental_search(tmp_path):
+    process = subprocess.Popen([str(BIN), "session", "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    next_id = 0
+
+    def request(method):
+        nonlocal next_id
+        next_id += 1
+        process.stdin.write(json.dumps({"version": 2, "request_id": next_id, "method": method}, ensure_ascii=False) + "\n")
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())
+
+    try:
+        assert "Ok" in request({"method": "open_workspace", "params": {"path": str(tmp_path)}})["result"]
+        created_dir = request({"method": "create_workspace_directory", "params": {"path": "src"}})
+        assert created_dir["result"]["Ok"]["kind"] == "workspace_entry"
+        created_file = request({"method": "create_workspace_file", "params": {"path": "src/hits.txt"}})
+        assert created_file["result"]["Ok"]["value"]["path"] == "src/hits.txt"
+        (tmp_path / "src" / "hits.txt").write_text("x🦀needle\n", encoding="utf-8")
+        started = request({"method": "start_workspace_search", "params": {
+            "query": "needle", "case_sensitive": True, "regular_expression": False, "file_filter": "*.txt"
+        }})["result"]["Ok"]["value"]["job_id"]
+        batches = []
+        for _ in range(100):
+            batch = request({"method": "poll_workspace_search", "params": {"job_id": started}})["result"]["Ok"]["value"]
+            batches.extend(batch["matches"])
+            if batch["complete"]:
+                break
+            time.sleep(0.01)
+        assert len(batches) == 1
+        assert batches[0]["column_utf16"] == 3
+        assert batches[0]["path"] == "src/hits.txt"
+        denied = request({"method": "delete_workspace_entry", "params": {"path": "src/hits.txt", "recursive": False, "confirmed": False}})
+        assert denied["result"]["Err"]["code"] == "invalid_request"
+        deleted = request({"method": "delete_workspace_entry", "params": {"path": "src/hits.txt", "recursive": False, "confirmed": True}})
+        assert deleted["result"]["Ok"]["value"]["operation"] == "deleted"
+        assert not (tmp_path / "src" / "hits.txt").exists()
+        request({"method": "close_workspace"})
+    finally:
+        process.stdin.close()
+        process.wait(timeout=5)
+        stderr = process.stderr.read()
+        assert stderr == ""
+
+
 def test_session_project_registry_and_task_authorization(tmp_path):
     (tmp_path / "src").mkdir()
     process = subprocess.Popen([str(BIN), "session", "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

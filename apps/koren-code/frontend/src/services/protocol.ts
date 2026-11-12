@@ -172,6 +172,20 @@ export type RequestMethod =
   | { method: 'open_workspace'; params: { path: string } }
   | { method: 'close_workspace' }
   | { method: 'list_directory'; params: { path: string } }
+  | { method: 'create_workspace_file'; params: { path: string } }
+  | { method: 'create_workspace_directory'; params: { path: string } }
+  | { method: 'rename_workspace_entry'; params: { source: string; destination: string } }
+  | { method: 'delete_workspace_entry'; params: { path: string; recursive: boolean; confirmed: boolean } }
+  | { method: 'workspace_entry_metadata'; params: { path: string } }
+  | { method: 'discover_git_repositories' }
+  | { method: 'git_status'; params: { path: string } }
+  | { method: 'git_diff'; params: { repository: string; path: string; staged: boolean } }
+  | { method: 'git_stage'; params: { repository: string; path: string } }
+  | { method: 'git_unstage'; params: { repository: string; path: string } }
+  | { method: 'git_commit'; params: { repository: string; message: string } }
+  | { method: 'start_workspace_search'; params: { query: string; case_sensitive: boolean; regular_expression: boolean; file_filter: string | null } }
+  | { method: 'cancel_workspace_search'; params: { job_id: number } }
+  | { method: 'poll_workspace_search'; params: { job_id: number } }
   | { method: 'open_document'; params: { path: string } }
   | { method: 'read_document'; params: { document_id: number } }
   | { method: 'apply_document_edits'; params: { document_id: number; expected_revision: number; edits: TextEdit[] } }
@@ -232,6 +246,15 @@ export type ResponseValue =
   | { kind: 'workspace_opened'; value: { root: string } }
   | { kind: 'workspace_closed'; value: { root: string } }
   | { kind: 'directory_entries'; value: DirectoryEntry[] }
+  | { kind: 'workspace_entry'; value: DirectoryEntry }
+  | { kind: 'workspace_entry_changed'; value: { operation: string; path: string; previous_path: string | null } }
+  | { kind: 'git_repositories'; value: GitRepositorySummary[] }
+  | { kind: 'git_status'; value: GitStatusSummary }
+  | { kind: 'git_diff'; value: { path: string; staged: boolean; text: string } }
+  | { kind: 'git_operation'; value: { operation: string; commit: string | null } }
+  | { kind: 'search_started'; value: { job_id: number } }
+  | { kind: 'search_batch'; value: { job_id: number; matches: SearchMatch[]; progress: SearchProgress | null; complete: boolean; summary: SearchSummary | null; error: string | null } }
+  | { kind: 'search_cancelled'; value: { job_id: number } }
   | { kind: 'document_opened'; value: { document_id: number; path: string | null; revision: number; dirty: boolean } }
   | { kind: 'document_contents'; value: { document_id: number; contents: string; revision: number; dirty: boolean } }
   | { kind: 'document_changed'; value: { document_id: number; revision: number; dirty: boolean } }
@@ -251,4 +274,10 @@ export type ResponseValue =
   | { kind: 'task_cancelled'; value: { run_id: number } }
   | { kind: 'task_cleaned'; value: { run_id: number } };
 
-export interface PlatformEvent { kind: string; document_id?: number; project_id?: number; run_id?: number; server_id?: number; revision?: number; root?: string; diagnostics?: LanguageDiagnosticSet; message?: string }
+export interface GitRepositorySummary { root: string; branch: string | null; has_head: boolean }
+export interface GitChangedFile { path: string; staged: boolean; unstaged: boolean; untracked: boolean; deleted: boolean; conflicted: boolean }
+export interface GitStatusSummary { root: string; branch: string | null; has_head: boolean; files: GitChangedFile[] }
+export interface SearchMatch { path: string; line: number; column_utf16: number; match_length_utf16: number; preview: string }
+export interface SearchProgress { files_scanned: number; matches_found: number; current_path: string | null }
+export interface SearchSummary { files_scanned: number; matches_found: number; skipped_binary_files: number; truncated: boolean; cancelled: boolean }
+export interface PlatformEvent { kind: string; document_id?: number; project_id?: number; run_id?: number; server_id?: number; revision?: number; root?: string; path?: string; previous_path?: string; operation?: string; commit?: string; diagnostics?: LanguageDiagnosticSet; message?: string }
