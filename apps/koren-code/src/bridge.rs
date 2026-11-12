@@ -7,8 +7,9 @@ use koren_extensions::{
     SettingValue, ThemeBase, UiDocument, UiElement,
 };
 use koren_lsp::{
-    DiagnosticSet, LspActorEvent, LspDocumentSync, LspRequest, LspResponse, LspServerActors,
-    LspServerHandle, ServerAuthorizer, ServerConfig, ServerEvent, ServerId, path_to_uri,
+    DiagnosticSet, FormattingOptions, LspActorEvent, LspDocumentSync, LspRequest, LspResponse,
+    LspServerActors, LspServerHandle, ServerAuthorizer, ServerConfig, ServerEvent, ServerId,
+    path_to_uri,
 };
 use koren_lua::{LuaDocumentContext, LuaExtensionRuntime, LuaHostContext, LuaLimits};
 use koren_projects::{DiscoveryLimits, ProjectId, ProjectInfo, ProjectManager};
@@ -329,39 +330,108 @@ impl DesktopBackend {
         reply: Sender<Response>,
         pool: &LanguageFeaturePool,
     ) -> bool {
-        let (kind, document_id, expected_revision, position) = match &request.method {
-            RequestMethod::LanguageHover {
-                document_id,
-                expected_revision,
-                position,
-            } => (
-                FeatureKind::Hover,
-                *document_id,
-                *expected_revision,
-                *position,
-            ),
-            RequestMethod::LanguageCompletion {
-                document_id,
-                expected_revision,
-                position,
-            } => (
-                FeatureKind::Completion,
-                *document_id,
-                *expected_revision,
-                *position,
-            ),
-            RequestMethod::LanguageDefinition {
-                document_id,
-                expected_revision,
-                position,
-            } => (
-                FeatureKind::Definition,
-                *document_id,
-                *expected_revision,
-                *position,
-            ),
-            _ => return false,
-        };
+        let (kind, document_id, expected_revision, position, include_declaration, range, new_name) =
+            match &request.method {
+                RequestMethod::LanguageHover {
+                    document_id,
+                    expected_revision,
+                    position,
+                } => (
+                    FeatureKind::Hover,
+                    *document_id,
+                    *expected_revision,
+                    *position,
+                    false,
+                    single_position_range(*position),
+                    None,
+                ),
+                RequestMethod::LanguageCompletion {
+                    document_id,
+                    expected_revision,
+                    position,
+                } => (
+                    FeatureKind::Completion,
+                    *document_id,
+                    *expected_revision,
+                    *position,
+                    false,
+                    single_position_range(*position),
+                    None,
+                ),
+                RequestMethod::LanguageDefinition {
+                    document_id,
+                    expected_revision,
+                    position,
+                } => (
+                    FeatureKind::Definition,
+                    *document_id,
+                    *expected_revision,
+                    *position,
+                    false,
+                    single_position_range(*position),
+                    None,
+                ),
+                RequestMethod::LanguageReferences {
+                    document_id,
+                    expected_revision,
+                    position,
+                    include_declaration,
+                } => (
+                    FeatureKind::References,
+                    *document_id,
+                    *expected_revision,
+                    *position,
+                    *include_declaration,
+                    single_position_range(*position),
+                    None,
+                ),
+                RequestMethod::LanguageFormat {
+                    document_id,
+                    expected_revision,
+                } => (
+                    FeatureKind::Formatting,
+                    *document_id,
+                    *expected_revision,
+                    koren_protocol::TextPosition {
+                        line: 0,
+                        character: 0,
+                    },
+                    false,
+                    single_position_range(koren_protocol::TextPosition {
+                        line: 0,
+                        character: 0,
+                    }),
+                    None,
+                ),
+                RequestMethod::LanguageCodeActions {
+                    document_id,
+                    expected_revision,
+                    range,
+                } => (
+                    FeatureKind::CodeActions,
+                    *document_id,
+                    *expected_revision,
+                    range.start,
+                    false,
+                    *range,
+                    None,
+                ),
+                RequestMethod::LanguageRename {
+                    document_id,
+                    expected_revision,
+                    position,
+                    new_name,
+                } => (
+                    FeatureKind::Rename,
+                    *document_id,
+                    *expected_revision,
+                    *position,
+                    false,
+                    single_position_range(*position),
+                    Some(new_name.clone()),
+                ),
+                _ => return false,
+            };
         let request_id = request.request_id;
         let result = validate_version(request.version)
             .and_then(|()| self.language_targets(document_id, expected_revision));
@@ -380,10 +450,15 @@ impl DesktopBackend {
         let worker_reply = reply.clone();
         let work = Box::new(move || {
             let result = run_language_feature(
-                kind,
-                document_id,
-                expected_revision,
-                position,
+                LanguageFeatureParams {
+                    kind,
+                    document_id,
+                    expected_revision,
+                    position,
+                    include_declaration,
+                    range,
+                    new_name,
+                },
                 targets,
                 cancelled,
             );
@@ -457,6 +532,13 @@ impl DesktopBackend {
                 expected_revision,
                 position,
             } => self.language_definition(document_id, expected_revision, position),
+            RequestMethod::LanguageReferences { .. }
+            | RequestMethod::LanguageFormat { .. }
+            | RequestMethod::LanguageCodeActions { .. }
+            | RequestMethod::LanguageRename { .. } => Err(ProtocolError {
+                code: ErrorCode::Internal,
+                message: "language feature request was not dispatched to its worker".into(),
+            }),
             RequestMethod::OpenWorkspace { path } => {
                 self.workspace.open(path).map_err(workspace_error)?;
                 Ok(ResponseValue::WorkspaceOpened {
@@ -1998,22 +2080,52 @@ enum FeatureKind {
     Hover,
     Completion,
     Definition,
+    References,
+    Formatting,
+    CodeActions,
+    Rename,
 }
 
-fn run_language_feature(
+struct LanguageFeatureParams {
     kind: FeatureKind,
     document_id: u64,
     expected_revision: u64,
     position: koren_protocol::TextPosition,
+    include_declaration: bool,
+    range: koren_protocol::TextRange,
+    new_name: Option<String>,
+}
+
+fn single_position_range(position: koren_protocol::TextPosition) -> koren_protocol::TextRange {
+    koren_protocol::TextRange {
+        start: position,
+        end: position,
+    }
+}
+
+fn run_language_feature(
+    params: LanguageFeatureParams,
     targets: Vec<(u64, LspServerHandle, String, i32)>,
     cancelled: Arc<AtomicBool>,
 ) -> Result<ResponseValue, ProtocolError> {
+    let LanguageFeatureParams {
+        kind,
+        document_id,
+        expected_revision,
+        position,
+        include_declaration,
+        range,
+        new_name,
+    } = params;
     let deadline = Instant::now() + LANGUAGE_FEATURE_TIMEOUT;
     let mut tickets = Vec::new();
+    let mut aggregated_actions = Vec::new();
+    let mut aggregated_references = Vec::new();
     for (_, server, uri, version) in targets {
         if cancelled.load(Ordering::Acquire) {
             return Err(not_found(format!("document '{document_id}' is closed")));
         }
+        let action_uri = uri.clone();
         let request = match kind {
             FeatureKind::Hover => LspRequest::Hover {
                 uri,
@@ -2033,17 +2145,48 @@ fn run_language_feature(
                 position,
                 timeout: LANGUAGE_FEATURE_TIMEOUT,
             },
+            FeatureKind::References => LspRequest::References {
+                uri,
+                version,
+                position,
+                include_declaration,
+                timeout: LANGUAGE_FEATURE_TIMEOUT,
+            },
+            FeatureKind::Formatting => LspRequest::Formatting {
+                uri,
+                version,
+                options: FormattingOptions {
+                    tab_size: 4,
+                    insert_spaces: true,
+                },
+                timeout: LANGUAGE_FEATURE_TIMEOUT,
+            },
+            FeatureKind::CodeActions => LspRequest::CodeActions {
+                uri,
+                version,
+                range,
+                diagnostics: Vec::new(),
+                only: Vec::new(),
+                timeout: LANGUAGE_FEATURE_TIMEOUT,
+            },
+            FeatureKind::Rename => LspRequest::Rename {
+                uri,
+                version,
+                position,
+                new_name: new_name.clone().unwrap_or_default(),
+                timeout: LANGUAGE_FEATURE_TIMEOUT,
+            },
         };
         if let Ok(ticket) = server.request(request) {
-            tickets.push((version, Some(ticket)));
+            tickets.push((version, action_uri, Some(ticket)));
         }
     }
 
-    while Instant::now() < deadline && tickets.iter().any(|(_, ticket)| ticket.is_some()) {
+    while Instant::now() < deadline && tickets.iter().any(|(_, _, ticket)| ticket.is_some()) {
         if cancelled.load(Ordering::Acquire) {
             return Err(not_found(format!("document '{document_id}' is closed")));
         }
-        for (version, ticket) in &mut tickets {
+        for (version, action_uri, ticket) in &mut tickets {
             let Some(pending) = ticket.as_mut() else {
                 continue;
             };
@@ -2096,10 +2239,110 @@ fn run_language_feature(
                                     .collect(),
                             })
                         }
+                        LspResponse::References(result)
+                            if matches!(kind, FeatureKind::References)
+                                && result.is_current(*version) =>
+                        {
+                            Some(ResponseValue::LanguageReferences {
+                                document_revision: expected_revision,
+                                locations: result
+                                    .value
+                                    .into_iter()
+                                    .map(|location| koren_protocol::LanguageLocation {
+                                        uri: location.uri,
+                                        range: location.range,
+                                    })
+                                    .collect(),
+                            })
+                        }
+                        LspResponse::Formatting(result)
+                            if matches!(kind, FeatureKind::Formatting)
+                                && result.is_current(*version) =>
+                        {
+                            Some(ResponseValue::LanguageFormatting {
+                                document_revision: expected_revision,
+                                edits: result.value,
+                            })
+                        }
+                        LspResponse::CodeActions(result)
+                            if matches!(kind, FeatureKind::CodeActions)
+                                && result.is_current(*version) =>
+                        {
+                            let actions = result.value.into_iter().map(|action| {
+                                let unsupported_reason = if action.edit.as_ref().is_some_and(|edit| {
+                                    !edit.unsupported_operations.is_empty()
+                                        || edit.document_edits.len() != 1
+                                        || edit.document_edits.first().is_none_or(|group| group.uri != *action_uri)
+                                }) {
+                                    Some("This action changes multiple files or uses unsupported filesystem operations.".to_owned())
+                                } else if action.command.is_some() {
+                                    Some("This action requires a provider command that Koren does not execute automatically.".to_owned())
+                                } else if action.edit.is_none() {
+                                    Some("This action does not contain a supported text edit.".to_owned())
+                                } else { None };
+                                let edits = if unsupported_reason.is_none() {
+                                    action.edit.and_then(|edit| edit.document_edits.into_iter().next().map(|group| group.edits))
+                                } else { None };
+                                koren_protocol::LanguageCodeAction {
+                                    id: action.id,
+                                    title: action.title,
+                                    provider_id: action.provider_id,
+                                    kind: action.kind,
+                                    related_diagnostics: action.related_diagnostics,
+                                    edits,
+                                    unsupported_reason,
+                                    disabled_reason: action.disabled_reason,
+                                }
+                            }).collect();
+                            Some(ResponseValue::LanguageCodeActions {
+                                document_revision: expected_revision,
+                                actions,
+                            })
+                        }
+                        LspResponse::Rename(result)
+                            if matches!(kind, FeatureKind::Rename)
+                                && result.is_current(*version) =>
+                        {
+                            let edits = match result.value {
+                                None => Vec::new(),
+                                Some(edit)
+                                    if edit.unsupported_operations.is_empty()
+                                        && (edit.document_edits.is_empty()
+                                            || (edit.document_edits.len() == 1
+                                                && edit.document_edits[0].uri == *action_uri)) =>
+                                {
+                                    edit.document_edits
+                                        .into_iter()
+                                        .next()
+                                        .map_or_else(Vec::new, |document| document.edits)
+                                }
+                                Some(_) => {
+                                    return Err(invalid(
+                                        "rename affects other files or uses unsupported filesystem operations; no edits were applied",
+                                    ));
+                                }
+                            };
+                            Some(ResponseValue::LanguageRename {
+                                document_revision: expected_revision,
+                                edits,
+                            })
+                        }
                         _ => None,
                     };
                     if let Some(result) = result {
-                        return Ok(result);
+                        match result {
+                            ResponseValue::LanguageCodeActions { actions, .. }
+                                if matches!(kind, FeatureKind::CodeActions) =>
+                            {
+                                aggregated_actions.extend(actions);
+                            }
+                            ResponseValue::LanguageReferences { locations, .. }
+                                if matches!(kind, FeatureKind::References) =>
+                            {
+                                aggregated_references.extend(locations);
+                            }
+                            other => return Ok(other),
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -2120,6 +2363,25 @@ fn run_language_feature(
     if cancelled.load(Ordering::Acquire) {
         return Err(not_found(format!("document '{document_id}' is closed")));
     }
+    if matches!(kind, FeatureKind::CodeActions) {
+        return Ok(ResponseValue::LanguageCodeActions {
+            document_revision: expected_revision,
+            actions: aggregated_actions,
+        });
+    }
+    if matches!(kind, FeatureKind::References) {
+        aggregated_references.sort_by(|left, right| {
+            left.uri
+                .cmp(&right.uri)
+                .then_with(|| left.range.start.line.cmp(&right.range.start.line))
+                .then_with(|| left.range.start.character.cmp(&right.range.start.character))
+        });
+        aggregated_references.dedup();
+        return Ok(ResponseValue::LanguageReferences {
+            document_revision: expected_revision,
+            locations: aggregated_references,
+        });
+    }
     Ok(match kind {
         FeatureKind::Hover => ResponseValue::LanguageHover {
             document_revision: expected_revision,
@@ -2133,6 +2395,22 @@ fn run_language_feature(
         FeatureKind::Definition => ResponseValue::LanguageDefinitions {
             document_revision: expected_revision,
             locations: Vec::new(),
+        },
+        FeatureKind::References => ResponseValue::LanguageReferences {
+            document_revision: expected_revision,
+            locations: Vec::new(),
+        },
+        FeatureKind::Formatting => ResponseValue::LanguageFormatting {
+            document_revision: expected_revision,
+            edits: Vec::new(),
+        },
+        FeatureKind::CodeActions => ResponseValue::LanguageCodeActions {
+            document_revision: expected_revision,
+            actions: Vec::new(),
+        },
+        FeatureKind::Rename => ResponseValue::LanguageRename {
+            document_revision: expected_revision,
+            edits: Vec::new(),
         },
     })
 }
@@ -2814,6 +3092,21 @@ mod tests {
         }
     }
 
+    fn run_deferred_language_request(
+        backend: &DesktopBackend,
+        pool: &LanguageFeaturePool,
+        request_id: u64,
+        method: RequestMethod,
+    ) -> Result<ResponseValue, ProtocolError> {
+        let (sender, receiver) = mpsc::channel();
+        let request = Request::new(request_id, method);
+        assert!(backend.defer_language_feature(&request, sender, pool));
+        receiver
+            .recv_timeout(LANGUAGE_FEATURE_TIMEOUT + Duration::from_secs(1))
+            .expect("language request response")
+            .result
+    }
+
     fn wait_for_file(path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !path.exists() {
@@ -3017,6 +3310,46 @@ mod tests {
         assert!(
             matches!(backend.method(RequestMethod::LanguageDefinition { document_id, expected_revision: 0, position: koren_protocol::TextPosition { line: 0, character: 1 } }).unwrap(), ResponseValue::LanguageDefinitions { locations, .. } if locations.is_empty())
         );
+        let feature_pool = LanguageFeaturePool::new();
+        let range = koren_protocol::TextRange {
+            start: koren_protocol::TextPosition {
+                line: 0,
+                character: 0,
+            },
+            end: koren_protocol::TextPosition {
+                line: 0,
+                character: 5,
+            },
+        };
+        assert!(matches!(
+            run_deferred_language_request(&backend, &feature_pool, 21, RequestMethod::LanguageCodeActions {
+                document_id, expected_revision: 0, range,
+            }).unwrap(),
+            ResponseValue::LanguageCodeActions { actions, .. }
+                if actions.len() == 1 && actions[0].edits.as_ref().is_some_and(|edits| edits[0].new_text == "demo")
+        ));
+        assert!(matches!(
+            run_deferred_language_request(&backend, &feature_pool, 22, RequestMethod::LanguageReferences {
+                document_id, expected_revision: 0,
+                position: koren_protocol::TextPosition { line: 0, character: 1 },
+                include_declaration: true,
+            }).unwrap(),
+            ResponseValue::LanguageReferences { locations, .. } if locations.len() == 1
+        ));
+        assert!(matches!(
+            run_deferred_language_request(&backend, &feature_pool, 23, RequestMethod::LanguageFormat {
+                document_id, expected_revision: 0,
+            }).unwrap(),
+            ResponseValue::LanguageFormatting { edits, .. } if edits.len() == 1 && edits[0].new_text == "x"
+        ));
+        assert!(matches!(
+            run_deferred_language_request(&backend, &feature_pool, 24, RequestMethod::LanguageRename {
+                document_id, expected_revision: 0,
+                position: koren_protocol::TextPosition { line: 0, character: 1 },
+                new_name: "world".into(),
+            }).unwrap(),
+            ResponseValue::LanguageRename { edits, .. } if edits.len() == 1 && edits[0].new_text == "world"
+        ));
         assert!(matches!(
             backend
                 .method(RequestMethod::ApplyDocumentEdits {

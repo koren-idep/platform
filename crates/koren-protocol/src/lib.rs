@@ -126,6 +126,44 @@ pub enum RequestMethod {
         /// UTF-16 document position.
         position: TextPosition,
     },
+    /// Find symbol references through a capable language server.
+    LanguageReferences {
+        /// Open document identifier.
+        document_id: u64,
+        /// Revision shown by the editor.
+        expected_revision: u64,
+        /// UTF-16 symbol position.
+        position: TextPosition,
+        /// Include the declaration in results.
+        include_declaration: bool,
+    },
+    /// Format the current document through a capable language server.
+    LanguageFormat {
+        /// Open document identifier.
+        document_id: u64,
+        /// Revision shown by the editor.
+        expected_revision: u64,
+    },
+    /// Request code actions and intentions for a selected range.
+    LanguageCodeActions {
+        /// Open document identifier.
+        document_id: u64,
+        /// Revision shown by the editor.
+        expected_revision: u64,
+        /// Selected UTF-16 range; an empty range requests intentions.
+        range: TextRange,
+    },
+    /// Request a symbol rename proposal from the active language server.
+    LanguageRename {
+        /// Open document identifier.
+        document_id: u64,
+        /// Revision shown by the editor.
+        expected_revision: u64,
+        /// UTF-16 symbol position.
+        position: TextPosition,
+        /// New symbol name.
+        new_name: String,
+    },
     /// Read information about a local directory.
     WorkspaceInfo {
         /// Local filesystem path to inspect.
@@ -452,6 +490,34 @@ pub enum ResponseValue {
         document_revision: u64,
         /// Definition locations.
         locations: Vec<LanguageLocation>,
+    },
+    /// Versioned symbol reference locations.
+    LanguageReferences {
+        /// Document revision used for the request.
+        document_revision: u64,
+        /// Reference locations.
+        locations: Vec<LanguageLocation>,
+    },
+    /// Versioned formatting proposal; the host must preview before applying.
+    LanguageFormatting {
+        /// Document revision used for the request.
+        document_revision: u64,
+        /// Proposed text edits.
+        edits: Vec<TextEdit>,
+    },
+    /// Versioned code actions, including unsupported proposals with an explanation.
+    LanguageCodeActions {
+        /// Document revision used for the request.
+        document_revision: u64,
+        /// Available actions.
+        actions: Vec<LanguageCodeAction>,
+    },
+    /// Versioned, single-document rename proposal; preview before applying.
+    LanguageRename {
+        /// Document revision used for the request.
+        document_revision: u64,
+        /// Proposed text edits for the active document.
+        edits: Vec<TextEdit>,
     },
     /// Root path and top-level entry count.
     Workspace {
@@ -960,6 +1026,27 @@ pub struct LanguageLocation {
     pub uri: String,
     /// Target range.
     pub range: TextRange,
+}
+
+/// A language-server code action safe to present to the user.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LanguageCodeAction {
+    /// Request-scoped identity.
+    pub id: String,
+    /// User-facing title.
+    pub title: String,
+    /// Provider identity.
+    pub provider_id: String,
+    /// Optional LSP action kind.
+    pub kind: Option<String>,
+    /// Related diagnostic messages.
+    pub related_diagnostics: Vec<String>,
+    /// Text edits for the active document when the proposal is single-file and supported.
+    pub edits: Option<Vec<TextEdit>>,
+    /// Explanation when the proposal cannot be applied by this host.
+    pub unsupported_reason: Option<String>,
+    /// Provider supplied disabled reason.
+    pub disabled_reason: Option<String>,
 }
 
 /// Serializable project summary with manager-local identity.

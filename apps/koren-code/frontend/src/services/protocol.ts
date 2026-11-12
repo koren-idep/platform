@@ -130,6 +130,10 @@ export type RequestMethod =
   | { method: 'language_hover'; params: { document_id: number; expected_revision: number; position: TextPosition } }
   | { method: 'language_completion'; params: { document_id: number; expected_revision: number; position: TextPosition } }
   | { method: 'language_definition'; params: { document_id: number; expected_revision: number; position: TextPosition } }
+  | { method: 'language_references'; params: { document_id: number; expected_revision: number; position: TextPosition; include_declaration: boolean } }
+  | { method: 'language_format'; params: { document_id: number; expected_revision: number } }
+  | { method: 'language_code_actions'; params: { document_id: number; expected_revision: number; range: TextRange } }
+  | { method: 'language_rename'; params: { document_id: number; expected_revision: number; position: TextPosition; new_name: string } }
   | { method: 'open_workspace'; params: { path: string } }
   | { method: 'close_workspace' }
   | { method: 'list_directory'; params: { path: string } }
@@ -178,6 +182,10 @@ export type ResponseValue =
   | { kind: 'language_hover'; value: { document_revision: number; contents: string | null; range: TextRange | null } }
   | { kind: 'language_completions'; value: { document_revision: number; items: Array<{ label: string; detail: string | null; insert_text: string | null; documentation: string | null }> } }
   | { kind: 'language_definitions'; value: { document_revision: number; locations: Array<{ uri: string; range: TextRange }> } }
+  | { kind: 'language_references'; value: { document_revision: number; locations: Array<{ uri: string; range: TextRange }> } }
+  | { kind: 'language_formatting'; value: { document_revision: number; edits: TextEdit[] } }
+  | { kind: 'language_code_actions'; value: { document_revision: number; actions: Array<{ id: string; title: string; provider_id: string; kind: string | null; related_diagnostics: string[]; edits: TextEdit[] | null; unsupported_reason: string | null; disabled_reason: string | null }> } }
+  | { kind: 'language_rename'; value: { document_revision: number; edits: TextEdit[] } }
   | { kind: 'workspace_opened'; value: { root: string } }
   | { kind: 'workspace_closed'; value: { root: string } }
   | { kind: 'directory_entries'; value: DirectoryEntry[] }
