@@ -58,6 +58,13 @@ pub enum RequestMethod {
     },
     /// List installed extensions and their active command contributions.
     ListExtensions,
+    /// Update a validated namespaced extension setting.
+    SetExtensionSetting {
+        /// Fully qualified setting identifier.
+        setting_id: String,
+        /// JSON-compatible primitive value.
+        value: ExtensionSettingValue,
+    },
     /// Explicitly enable an installed extension without executing its code.
     SetExtensionEnabled {
         /// Reverse-DNS extension identifier.
@@ -393,6 +400,11 @@ pub enum ResponseValue {
     CommandOutput(String),
     /// Installed extension metadata and active command contributions.
     Extensions(ExtensionCatalog),
+    /// A setting value was stored successfully.
+    ExtensionSettingUpdated {
+        /// Fully qualified setting identifier.
+        setting_id: String,
+    },
     /// Extension lifecycle transition result.
     ExtensionChanged(ExtensionSummary),
     /// Installed extension language-server configurations.
@@ -614,10 +626,252 @@ pub struct ExtensionCatalog {
     pub extensions: Vec<ExtensionSummary>,
     /// Active namespaced commands.
     pub commands: Vec<ExtensionCommandSummary>,
+    /// Host built-in commands available to the command palette.
+    #[serde(default)]
+    pub built_in_commands: Vec<CommandCatalogSummary>,
     /// Active typed menu actions.
     pub menu_items: Vec<ExtensionMenuSummary>,
     /// Declarative language-server configurations.
     pub language_servers: Vec<LanguageServerSummary>,
+    /// User-openable extension panels.
+    #[serde(default)]
+    pub tool_windows: Vec<ExtensionToolWindowSummary>,
+    /// Namespaced extension setting definitions and effective values.
+    #[serde(default)]
+    pub settings: Vec<ExtensionSettingSummary>,
+    /// Safe design-token themes.
+    #[serde(default)]
+    pub themes: Vec<ExtensionThemeSummary>,
+    /// Non-destructive diagnostic enrichments.
+    #[serde(default)]
+    pub diagnostic_details: Vec<ExtensionDiagnosticDetailSummary>,
+    /// Generic project wizard declarations for future host-authorized submissions.
+    #[serde(default)]
+    pub project_wizards: Vec<ExtensionProjectWizardSummary>,
+}
+
+/// Host-owned command palette metadata.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandCatalogSummary {
+    /// Stable host command identifier.
+    pub id: String,
+    /// Display title.
+    pub title: String,
+    /// Command description.
+    pub description: String,
+    /// Optional keyboard shortcut.
+    pub shortcut: Option<String>,
+    /// Whether it is currently available.
+    pub enabled: bool,
+}
+
+/// Primitive setting value sent through the typed protocol.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExtensionSettingValue {
+    /// Boolean value.
+    Boolean(bool),
+    /// Integer value.
+    Integer(i64),
+    /// Plain-text value.
+    Text(String),
+}
+
+/// Typed setting control schema.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExtensionSettingKind {
+    /// Boolean toggle.
+    Boolean {
+        /// Default value.
+        default: bool,
+    },
+    /// Bounded integer value.
+    Integer {
+        /// Default value.
+        default: i64,
+        /// Inclusive minimum.
+        min: i64,
+        /// Inclusive maximum.
+        max: i64,
+    },
+    /// Bounded plain-text value.
+    Text {
+        /// Default value.
+        default: String,
+        /// Maximum byte length.
+        max_length: usize,
+    },
+    /// One of a fixed option set.
+    Choice {
+        /// Default option.
+        default: String,
+        /// Allowed option values.
+        options: Vec<String>,
+    },
+}
+
+/// Safe contributed extension setting.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionSettingSummary {
+    /// Fully qualified identifier.
+    pub id: String,
+    /// User-facing label.
+    pub title: String,
+    /// Optional help text.
+    pub description: String,
+    /// Accepted value schema.
+    pub kind: ExtensionSettingKind,
+    /// Current effective value.
+    pub value: ExtensionSettingValue,
+}
+
+/// Declarative safe panel content.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionUiDocument {
+    /// Stable view identifier.
+    pub id: String,
+    /// Safe elements in display order.
+    pub elements: Vec<ExtensionUiElement>,
+}
+
+/// Supported host-rendered UI primitives.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExtensionUiElement {
+    /// Plain text.
+    Text {
+        /// Stable element identifier.
+        id: String,
+        /// Plain display text.
+        text: String,
+    },
+    /// Section heading.
+    Heading {
+        /// Stable element identifier.
+        id: String,
+        /// Heading text.
+        text: String,
+    },
+    /// Action button invoking an owned command.
+    Button {
+        /// Stable element identifier.
+        id: String,
+        /// Button label.
+        label: String,
+        /// Registered extension command.
+        command_id: String,
+    },
+    /// List of plain text items.
+    List {
+        /// Stable element identifier.
+        id: String,
+        /// Display items.
+        items: Vec<String>,
+    },
+    /// Two-column table.
+    Table {
+        /// Stable element identifier.
+        id: String,
+        /// Display rows.
+        rows: Vec<[String; 2]>,
+    },
+    /// Bounded text field.
+    Input {
+        /// Stable component identifier.
+        id: String,
+        /// Field label.
+        label: String,
+        /// Current value.
+        value: String,
+        /// Whether the user must provide a value.
+        required: bool,
+        /// Maximum byte length.
+        max_length: usize,
+    },
+    /// Fixed-option choice field.
+    Select {
+        /// Stable component identifier.
+        id: String,
+        /// Field label.
+        label: String,
+        /// Allowed values.
+        options: Vec<String>,
+        /// Selected default.
+        value: String,
+    },
+    /// Boolean field.
+    Checkbox {
+        /// Stable component identifier.
+        id: String,
+        /// Field label.
+        label: String,
+        /// Default state.
+        checked: bool,
+    },
+    /// Semantic state indicator.
+    Status {
+        /// Stable element identifier.
+        id: String,
+        /// Status label.
+        label: String,
+        /// Semantic tone name.
+        tone: String,
+    },
+}
+
+/// User-openable extension panel catalog item.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionToolWindowSummary {
+    /// Fully qualified panel identifier.
+    pub id: String,
+    /// Panel title.
+    pub title: String,
+    /// Initial declarative panel content.
+    pub initial_view: ExtensionUiDocument,
+}
+
+/// Generic declarative project-creation form.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionProjectWizardSummary {
+    /// Fully qualified wizard identifier.
+    pub id: String,
+    /// User-facing title.
+    pub title: String,
+    /// Safe declarative field model.
+    pub form: ExtensionUiDocument,
+}
+
+/// Safe theme description.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionThemeSummary {
+    /// Fully qualified theme identifier.
+    pub id: String,
+    /// Theme title.
+    pub title: String,
+    /// Base palette name.
+    pub base: String,
+    /// Approved design-token overrides.
+    pub tokens: std::collections::BTreeMap<String, String>,
+}
+
+/// Non-destructive diagnostic presentation enrichment.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionDiagnosticDetailSummary {
+    /// Fully qualified detail identifier.
+    pub id: String,
+    /// Optional diagnostic source selector.
+    pub source: Option<String>,
+    /// Optional diagnostic code selector.
+    pub code: Option<String>,
+    /// Detail heading.
+    pub title: String,
+    /// Additional explanation.
+    pub explanation: String,
+    /// Optional extension command.
+    pub suggested_command: Option<String>,
+    /// Related context strings.
+    pub related: Vec<String>,
 }
 
 /// A validated extension command contribution.
@@ -629,6 +883,10 @@ pub struct ExtensionCommandSummary {
     pub title: String,
     /// Short description.
     pub description: String,
+    /// Optional keyboard shortcut.
+    pub shortcut: Option<String>,
+    /// Whether the host-evaluated availability condition currently allows invocation.
+    pub enabled: bool,
 }
 
 /// Validated extension menu action exposed through the desktop bridge.
@@ -640,6 +898,8 @@ pub struct ExtensionMenuSummary {
     pub label: String,
     /// Placement identifier.
     pub location: String,
+    /// Current host-evaluated command availability.
+    pub enabled: bool,
 }
 
 /// Declared external language-server command for a workspace.
@@ -1024,6 +1284,10 @@ mod tests {
                 extension_id: "org.example.hello".into(),
                 enabled: true,
             },
+            RequestMethod::SetExtensionSetting {
+                setting_id: "org.example.hello.show_path".into(),
+                value: ExtensionSettingValue::Boolean(false),
+            },
             RequestMethod::StartLanguageServer {
                 extension_id: "org.example.lang".into(),
                 configuration_id: "demo".into(),
@@ -1060,6 +1324,17 @@ mod tests {
         let encoded = serde_json::to_string(&response).unwrap();
         assert!(encoded.contains("language_server_approval_required"));
         assert!(encoded.contains("API_TOKEN"));
+        assert_eq!(
+            serde_json::from_str::<Response>(&encoded).unwrap(),
+            response
+        );
+        let response = Response::new(
+            43,
+            Ok(ResponseValue::ExtensionSettingUpdated {
+                setting_id: "org.example.hello.show_path".into(),
+            }),
+        );
+        let encoded = serde_json::to_string(&response).unwrap();
         assert_eq!(
             serde_json::from_str::<Response>(&encoded).unwrap(),
             response
