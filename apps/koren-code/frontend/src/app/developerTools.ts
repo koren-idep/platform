@@ -1,5 +1,24 @@
 import type { GitChangedFile, SearchMatch, SearchSummary } from '../services/protocol';
 
+export interface GitRepositoryChoice {
+  path: string;
+  label: string;
+}
+
+export function gitRepositoryChoices(
+  workspaceRoot: string,
+  repositories: Array<{ root: string; branch: string | null }>,
+): GitRepositoryChoice[] {
+  const workspace = workspaceRoot.replaceAll('\\', '/').replace(/\/$/, '');
+  return repositories.map((repository) => {
+    const root = repository.root.replaceAll('\\', '/').replace(/\/$/, '');
+    const relative = root.slice(workspace.length).replace(/^\//, '');
+    const path = relative || '.';
+    const branch = repository.branch ?? '(detached)';
+    return { path, label: `${path}/${branch}` };
+  });
+}
+
 export function groupSearchMatches(matches: readonly SearchMatch[]): Map<string, SearchMatch[]> {
   const groups = new Map<string, SearchMatch[]>();
   for (const match of matches) {

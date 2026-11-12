@@ -11,7 +11,7 @@ import { activePanelLayout, diagnosticDetailMatches, extensionMenusAt, safeTheme
 import { readLayout, persistLayout, type LayoutPreferences } from './app/layout';
 import { formatCursorPosition, lineEndingFor } from './app/status';
 import { runConfigurationTasks, selectedRunTask } from './app/toolbar';
-import { groupSearchMatches, normalizedCommitMessage, partitionGitFiles, searchSummaryText } from './app/developerTools';
+import { gitRepositoryChoices, groupSearchMatches, normalizedCommitMessage, partitionGitFiles, searchSummaryText } from './app/developerTools';
 import { nextTheme, persistTheme, readTheme } from './app/theme';
 import { taskStatus, visibleOutput } from './app/taskPresentation';
 import { extensionCanActivate, extensionToggleLabel, languageServerEnabled } from './app/extensions';
@@ -1717,10 +1717,9 @@ async function refreshGitRepositories(): Promise<void> {
   try {
     gitRepositories = expect(await client.call({ method: 'discover_git_repositories' }), 'git_repositories').value;
     const select = document.querySelector<HTMLSelectElement>('#git-repository')!;
-    const workspace = workspaceRoot.replaceAll('\\', '/').replace(/\/$/, '');
-    const choices = gitRepositories.map((repo) => ({ repo, path: repo.root.replaceAll('\\', '/').replace(/\/$/, '').slice(workspace.length).replace(/^\//, '') }));
+    const choices = gitRepositoryChoices(workspaceRoot, gitRepositories);
     select.replaceChildren(new Option('Select repository', ''));
-    for (const { repo, path } of choices) select.add(new Option(`${path ? `${path}/` : ''}${repo.branch ?? '(detached)'}`, path));
+    for (const { label, path } of choices) select.add(new Option(label, path));
     if (!choices.some(({ path }) => path === gitRepositoryPath)) gitRepositoryPath = choices[0]?.path ?? '';
     select.value = gitRepositoryPath;
     if (gitRepositoryPath) await refreshGitStatus();

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { groupSearchMatches, normalizedCommitMessage, partitionGitFiles, searchSummaryText } from './developerTools';
+import { gitRepositoryChoices, groupSearchMatches, normalizedCommitMessage, partitionGitFiles, searchSummaryText } from './developerTools';
 import type { GitChangedFile, SearchMatch } from '../services/protocol';
 
 const match = (path: string, line: number): SearchMatch => ({ path, line, column_utf16: 0, match_length_utf16: 1, preview: 'x' });
@@ -20,6 +20,18 @@ describe('developer tool presentations', () => {
     ]);
     expect(split.staged.map((item) => item.path)).toEqual(['both.txt', 'staged.txt']);
     expect(split.unstaged.map((item) => item.path)).toEqual(['both.txt', 'new.txt']);
+  });
+
+  it('keeps the workspace-root Git repository selectable alongside nested repositories', () => {
+    const choices = gitRepositoryChoices('/work/koren/', [
+      { root: '/work/koren', branch: 'main' },
+      { root: '/work/koren/examples/project', branch: null },
+    ]);
+    expect(choices).toEqual([
+      { path: '.', label: './main' },
+      { path: 'examples/project', label: 'examples/project/(detached)' },
+    ]);
+    expect(new Set(choices.map((choice) => choice.path)).size).toBe(choices.length);
   });
 
   it('normalizes explicit commit messages and reports bounded search outcomes', () => {
