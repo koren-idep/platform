@@ -118,6 +118,14 @@ LSP requests for code actions and intentions, references, rename, and formatting
 
 The public Rust crates are currently experimental. Protocol and extension API compatibility checks are implemented, but this release does not promise a stable compiled-plugin ABI. Extensions should use the manifest and typed host APIs; arbitrary HTML/JavaScript injection, dynamic Rust libraries, and WebAssembly are not supported.
 
+## Phase 9A host services
+
+The Rust platform exposes workspace mutation in `koren-workspace`, bounded text search in `koren-search`, and local Git operations in `koren-git`. Desktop and headless hosts call these same APIs through additive protocol-v2 requests. Workspace changes are coordinated with the revision-aware document manager; dirty buffers block conflicting rename, move, and delete operations. Search is explicit, cancellable, ignore-aware, and returns UTF-16 source columns.
+
+These services are not automatically exposed to Lua. The current capability model does not grant extensions unrestricted filesystem writes, project-wide scanning, staging, or commits. A future host may add narrow extension operations with explicit capability declarations and user confirmation, while reusing the shared Rust services. Extensions must not execute Git through a shell or bypass task/server authorization.
+
+The Git adapter uses `git2` and libgit2 locally. It does not invoke user hooks; commit hooks and remote operations are not part of this phase. The current Code Editor UI exposes only status, bounded text diffs, selected-path stage/unstage, and explicit commits from the staged index.
+
 ## Local development
 
 Copy `examples/extensions/org.example.hello` into the extension root, reopen the Extensions manager, enable it, then activate it. The Developer Tools example demonstrates a command, menu and palette entry, user-opened workspace panel, typed setting, safe theme, diagnostic details, and panel refresh. Copy `examples/extensions/org.example.text-inspection` to demonstrate Lua rule registration and a safe replacement proposal. The optional `org.koren.rust-analyzer` example uses the same configuration path for any LSP-compatible editor host; install `rust-analyzer` separately before starting it. It is not bundled and is not required for editing.
