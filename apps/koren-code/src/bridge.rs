@@ -2,7 +2,10 @@ use koren_cargo::CargoProvider;
 use koren_commands::{CommandError, CommandRegistry};
 use koren_core::{Platform, PlatformEvent};
 use koren_documents::{DocumentId, DocumentManager};
-use koren_extensions::{CommandContext, ExtensionManager, ExtensionState, MenuLocation};
+use koren_extensions::{
+    CommandContext, CommandEnablement, ExtensionManager, ExtensionState, MenuLocation, SettingKind,
+    SettingValue, ThemeBase, UiDocument, UiElement,
+};
 use koren_lsp::{
     DiagnosticSet, LspActorEvent, LspDocumentSync, LspRequest, LspResponse, LspServerActors,
     LspServerHandle, ServerAuthorizer, ServerConfig, ServerEvent, ServerId, path_to_uri,
@@ -10,9 +13,12 @@ use koren_lsp::{
 use koren_lua::{LuaDocumentContext, LuaExtensionRuntime, LuaHostContext, LuaLimits};
 use koren_projects::{DiscoveryLimits, ProjectId, ProjectInfo, ProjectManager};
 use koren_protocol::{
-    CargoPackageSummary, CargoProjectSummary, CargoTargetSummary, DirectoryEntry,
-    DirectoryEntryKind, ErrorCode, ExecutionApprovalSummary, ExtensionCatalog,
-    ExtensionCommandSummary, ExtensionMenuSummary, ExtensionSummary as ProtocolExtensionSummary,
+    CargoPackageSummary, CargoProjectSummary, CargoTargetSummary, CommandCatalogSummary,
+    DirectoryEntry, DirectoryEntryKind, ErrorCode, ExecutionApprovalSummary, ExtensionCatalog,
+    ExtensionCommandSummary, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary,
+    ExtensionProjectWizardSummary, ExtensionSettingKind, ExtensionSettingSummary,
+    ExtensionSettingValue, ExtensionSummary as ProtocolExtensionSummary, ExtensionThemeSummary,
+    ExtensionToolWindowSummary, ExtensionUiDocument, ExtensionUiElement,
     LanguageServerApprovalSummary, LanguageServerSummary, ProjectLifecycle, ProjectSummary,
     ProtocolError, Request, RequestMethod, Response, ResponseValue, TaskLifecycle, TaskSummary,
     TextEdit, validate_version,
@@ -39,6 +45,7 @@ use std::{
 const LANGUAGE_FEATURE_TIMEOUT: Duration = Duration::from_millis(150);
 const LANGUAGE_FEATURE_WORKERS: usize = 4;
 const LANGUAGE_FEATURE_QUEUE_CAPACITY: usize = 64;
+const MAX_EXTENSION_PANEL_STATE_BYTES: usize = 256 * 1024;
 type FeatureWork = Box<dyn FnOnce() + Send + 'static>;
 
 struct LanguageFeaturePool {
@@ -213,6 +220,8 @@ struct DesktopBackend {
     extensions: ExtensionManager,
     extension_root: Option<PathBuf>,
     extensions_discovered: bool,
+    extension_setting_values: BTreeMap<String, ExtensionSettingValue>,
+    updated_panel_text: BTreeMap<String, String>,
     lua_runtimes: BTreeMap<String, LuaExtensionRuntime>,
     active_document: Option<DocumentId>,
     language_servers: LspServerActors,
@@ -275,6 +284,8 @@ impl DesktopBackend {
             extensions: ExtensionManager::new(),
             extension_root: extension_install_root(),
             extensions_discovered: false,
+            extension_setting_values: load_extension_settings(),
+            updated_panel_text: BTreeMap::new(),
             lua_runtimes: BTreeMap::new(),
             active_document: None,
             language_servers: LspServerActors::new(),
@@ -293,6 +304,11 @@ impl DesktopBackend {
         self.approvals.shutdown();
         self.language_servers.shutdown();
         self.tasks.shutdown();
+        for (id, runtime) in std::mem::take(&mut self.lua_runtimes) {
+            let _ = runtime.deactivate();
+            let _ = self.extensions.deactivate(&id);
+        }
+        self.updated_panel_text.clear();
         if let Ok(root) = self.workspace.root() {
             let root = root.to_path_buf();
             self.projects.close_workspace(&root);
@@ -405,6 +421,9 @@ impl DesktopBackend {
             }
             RequestMethod::ExecuteCommand { command_id } => self.execute_command(&command_id),
             RequestMethod::ListExtensions => self.list_extensions(),
+            RequestMethod::SetExtensionSetting { setting_id, value } => {
+                self.set_extension_setting(&setting_id, value)
+            }
             RequestMethod::SetExtensionEnabled {
                 extension_id,
                 enabled,
@@ -795,9 +814,234 @@ impl DesktopBackend {
         Ok(ResponseValue::Extensions(ExtensionCatalog {
             extensions,
             commands: self.active_extension_commands(),
+            built_in_commands: self.built_in_commands(),
             menu_items: self.active_extension_menus(),
             language_servers: self.declared_language_servers(),
+            tool_windows: self.active_tool_windows(),
+            settings: self.active_extension_settings(),
+            themes: self.active_extension_themes(),
+            diagnostic_details: self.active_diagnostic_details(),
+            project_wizards: self.active_project_wizards(),
         }))
+    }
+
+    fn active_tool_windows(&self) -> Vec<ExtensionToolWindowSummary> {
+        let mut panels = Vec::new();
+        for extension in self
+            .extensions
+            .list()
+            .into_iter()
+            .filter(|item| item.state == ExtensionState::Active)
+        {
+            if let Ok(items) = self.extensions.contributions(&extension.id) {
+                for panel in &items.tool_windows {
+                    let mut view = protocol_ui_document(&panel.initial_view);
+                    if let Some(text) = self.updated_panel_text.get(&panel.id) {
+                        if let Some(ExtensionUiElement::Text { text: contents, .. }) = view
+                            .elements
+                            .iter_mut()
+                            .find(|element| matches!(element, ExtensionUiElement::Text { .. }))
+                        {
+                            contents.clone_from(text);
+                        }
+                    }
+                    panels.push(ExtensionToolWindowSummary {
+                        id: panel.id.clone(),
+                        title: panel.title.clone(),
+                        initial_view: view,
+                    });
+                }
+            }
+        }
+        panels.sort_by(|left, right| left.id.cmp(&right.id));
+        panels
+    }
+
+    fn active_extension_settings(&self) -> Vec<ExtensionSettingSummary> {
+        let mut settings = Vec::new();
+        for extension in self
+            .extensions
+            .list()
+            .into_iter()
+            .filter(|item| item.state == ExtensionState::Active)
+        {
+            if let Ok(items) = self.extensions.contributions(&extension.id) {
+                for setting in &items.settings {
+                    let (kind, default) = protocol_setting_kind(&setting.kind);
+                    let value = self
+                        .extension_setting_values
+                        .get(&setting.id)
+                        .cloned()
+                        .filter(|value| valid_setting_value(&setting.kind, value))
+                        .unwrap_or(default);
+                    settings.push(ExtensionSettingSummary {
+                        id: setting.id.clone(),
+                        title: setting.title.clone(),
+                        description: setting.description.clone(),
+                        kind,
+                        value,
+                    });
+                }
+            }
+        }
+        settings.sort_by(|left, right| left.id.cmp(&right.id));
+        settings
+    }
+
+    fn active_extension_themes(&self) -> Vec<ExtensionThemeSummary> {
+        let mut themes = Vec::new();
+        for extension in self
+            .extensions
+            .list()
+            .into_iter()
+            .filter(|item| item.state == ExtensionState::Active)
+        {
+            if let Ok(items) = self.extensions.contributions(&extension.id) {
+                for theme in &items.themes {
+                    themes.push(ExtensionThemeSummary {
+                        id: theme.id.clone(),
+                        title: theme.title.clone(),
+                        base: match theme.base {
+                            ThemeBase::Dark => "dark",
+                            ThemeBase::Light => "light",
+                        }
+                        .into(),
+                        tokens: theme
+                            .tokens
+                            .iter()
+                            .map(|(key, value)| (format!("{key:?}").to_lowercase(), value.clone()))
+                            .collect(),
+                    });
+                }
+            }
+        }
+        themes.sort_by(|left, right| left.id.cmp(&right.id));
+        themes
+    }
+
+    fn active_diagnostic_details(&self) -> Vec<ExtensionDiagnosticDetailSummary> {
+        let mut details = Vec::new();
+        for extension in self
+            .extensions
+            .list()
+            .into_iter()
+            .filter(|item| item.state == ExtensionState::Active)
+        {
+            if let Ok(items) = self.extensions.contributions(&extension.id) {
+                details.extend(items.diagnostic_details.iter().map(|detail| {
+                    ExtensionDiagnosticDetailSummary {
+                        id: detail.id.clone(),
+                        source: detail.source.clone(),
+                        code: detail.code.clone(),
+                        title: detail.title.clone(),
+                        explanation: detail.explanation.clone(),
+                        suggested_command: detail.suggested_command.clone(),
+                        related: detail.related.clone(),
+                    }
+                }));
+            }
+        }
+        details.sort_by(|left, right| left.id.cmp(&right.id));
+        details
+    }
+
+    fn active_project_wizards(&self) -> Vec<ExtensionProjectWizardSummary> {
+        let mut wizards = Vec::new();
+        for extension in self
+            .extensions
+            .list()
+            .into_iter()
+            .filter(|item| item.state == ExtensionState::Active)
+        {
+            if let Ok(items) = self.extensions.contributions(&extension.id) {
+                wizards.extend(items.project_wizards.iter().map(|wizard| {
+                    ExtensionProjectWizardSummary {
+                        id: wizard.id.clone(),
+                        title: wizard.title.clone(),
+                        form: protocol_ui_document(&wizard.form),
+                    }
+                }));
+            }
+        }
+        wizards.sort_by(|left, right| left.id.cmp(&right.id));
+        wizards
+    }
+
+    fn store_panel_text(&mut self, id: String, text: String) {
+        let current_bytes = self
+            .updated_panel_text
+            .values()
+            .map(String::len)
+            .sum::<usize>();
+        let replaced_bytes = self.updated_panel_text.get(&id).map_or(0, String::len);
+        if current_bytes
+            .saturating_sub(replaced_bytes)
+            .saturating_add(text.len())
+            <= MAX_EXTENSION_PANEL_STATE_BYTES
+        {
+            self.updated_panel_text.insert(id, text);
+        }
+    }
+
+    fn set_extension_setting(
+        &mut self,
+        setting_id: &str,
+        value: ExtensionSettingValue,
+    ) -> Result<ResponseValue, ProtocolError> {
+        self.ensure_extensions_discovered()?;
+        let mut definition = None;
+        for extension in self
+            .extensions
+            .list()
+            .into_iter()
+            .filter(|item| item.state == ExtensionState::Active)
+        {
+            if let Ok(items) = self.extensions.contributions(&extension.id) {
+                if let Some(setting) = items
+                    .settings
+                    .iter()
+                    .find(|setting| setting.id == setting_id)
+                {
+                    definition = Some(setting.kind.clone());
+                    break;
+                }
+            }
+        }
+        let kind = definition.ok_or_else(|| {
+            not_found(format!(
+                "active extension setting '{setting_id}' was not found"
+            ))
+        })?;
+        if !valid_setting_value(&kind, &value) {
+            return Err(invalid(
+                "setting value does not match its declared type or range",
+            ));
+        }
+        let previous = self
+            .extension_setting_values
+            .insert(setting_id.into(), value);
+        if let Err(error) = persist_extension_settings(&self.extension_setting_values) {
+            if let Some(previous) = previous {
+                self.extension_setting_values
+                    .insert(setting_id.into(), previous);
+            } else {
+                self.extension_setting_values.remove(setting_id);
+            }
+            return Err(ProtocolError {
+                code: ErrorCode::Internal,
+                message: format!("could not save extension settings: {error}"),
+            });
+        }
+        if let Some((owner, _)) = setting_id.rsplit_once('.') {
+            if let Some(runtime) = self.lua_runtimes.get(owner) {
+                let _ = runtime.update_context(self.lua_context());
+                let payload = serde_json::to_string(&serde_json::json!({ "id": setting_id, "value": self.extension_setting_values.get(setting_id) })).unwrap_or_default();
+                let _ = runtime.dispatch_event("settings_changed", &payload);
+            }
+        }
+        Ok(ResponseValue::ExtensionSettingUpdated {
+            setting_id: setting_id.into(),
+        })
     }
 
     fn ensure_extensions_discovered(&mut self) -> Result<(), ProtocolError> {
@@ -841,6 +1085,8 @@ impl DesktopBackend {
             }
             self.pending_language_servers
                 .retain(|_, pending| pending.extension_id != id);
+            self.updated_panel_text
+                .retain(|panel_id, _| !panel_id.starts_with(&format!("{id}.")));
             self.extensions.disable(id).map_err(extension_error)?;
         }
         let summary = self
@@ -900,9 +1146,14 @@ impl DesktopBackend {
             .max_by_key(String::len)
             .ok_or_else(|| not_found(format!("command '{id}' was not found")))?;
         let context = self.command_context();
+        if let Some(runtime) = self.lua_runtimes.get(&extension_id) {
+            runtime
+                .update_context(self.lua_context())
+                .map_err(lua_error)?;
+        }
         let output = self
             .extensions
-            .invoke_command(&extension_id, &context, &[])
+            .invoke_command(id, &context, &[])
             .map_err(extension_error)?;
         if let Some(runtime) = self.lua_runtimes.get(&extension_id) {
             for edit in runtime.take_edit_requests().map_err(lua_error)? {
@@ -916,6 +1167,16 @@ impl DesktopBackend {
                         }],
                     )
                     .map_err(document_error)?;
+            }
+            for (panel_id, text) in runtime.take_ui_updates().map_err(lua_error)? {
+                let qualified = format!("{extension_id}.{panel_id}");
+                if self
+                    .extensions
+                    .contributions(&extension_id)
+                    .is_ok_and(|items| items.tool_windows.iter().any(|panel| panel.id == qualified))
+                {
+                    self.store_panel_text(qualified, text);
+                }
             }
         }
         Ok(ResponseValue::CommandOutput(output))
@@ -949,11 +1210,48 @@ impl DesktopBackend {
         LuaHostContext {
             workspace_root: self.workspace.root().ok().map(Path::to_path_buf),
             active_document,
+            settings: self.effective_extension_settings(),
         }
+    }
+
+    fn effective_extension_settings(&self) -> BTreeMap<String, SettingValue> {
+        let mut values = BTreeMap::new();
+        for extension in self
+            .extensions
+            .list()
+            .into_iter()
+            .filter(|item| item.state == ExtensionState::Active)
+        {
+            if let Ok(items) = self.extensions.contributions(&extension.id) {
+                for setting in &items.settings {
+                    let value = self
+                        .extension_setting_values
+                        .get(&setting.id)
+                        .cloned()
+                        .filter(|value| valid_setting_value(&setting.kind, value));
+                    let effective = match value {
+                        Some(ExtensionSettingValue::Boolean(value)) => SettingValue::Boolean(value),
+                        Some(ExtensionSettingValue::Integer(value)) => SettingValue::Integer(value),
+                        Some(ExtensionSettingValue::Text(value)) => SettingValue::Text(value),
+                        None => match &setting.kind {
+                            SettingKind::Boolean { default } => SettingValue::Boolean(*default),
+                            SettingKind::Integer { default, .. } => SettingValue::Integer(*default),
+                            SettingKind::Text { default, .. }
+                            | SettingKind::Choice { default, .. } => {
+                                SettingValue::Text(default.clone())
+                            }
+                        },
+                    };
+                    values.insert(setting.id.clone(), effective);
+                }
+            }
+        }
+        values
     }
 
     fn active_extension_commands(&self) -> Vec<ExtensionCommandSummary> {
         let mut commands = Vec::new();
+        let context = self.command_context();
         for extension in self.extensions.list() {
             if extension.state != ExtensionState::Active {
                 continue;
@@ -964,6 +1262,14 @@ impl DesktopBackend {
                         id: id.clone(),
                         title: command.title.clone(),
                         description: command.description.clone(),
+                        shortcut: command.shortcut.clone(),
+                        enabled: match command.enablement {
+                            CommandEnablement::Always => true,
+                            CommandEnablement::WorkspaceOpen => context.workspace_root.is_some(),
+                            CommandEnablement::ActiveDocument => {
+                                context.active_document_id.is_some()
+                            }
+                        },
                     }
                 }));
             }
@@ -972,14 +1278,49 @@ impl DesktopBackend {
         commands
     }
 
+    fn built_in_commands(&self) -> Vec<CommandCatalogSummary> {
+        self.commands
+            .ids()
+            .into_iter()
+            .map(|id| {
+                let raw_title = id.rsplit('.').next().unwrap_or(id).replace(['-', '_'], " ");
+                let mut characters = raw_title.chars();
+                let title = characters.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + characters.as_str()
+                });
+                CommandCatalogSummary {
+                    id: id.into(),
+                    title,
+                    description: self.commands.description(id).unwrap_or_default().into(),
+                    shortcut: None,
+                    enabled: true,
+                }
+            })
+            .collect()
+    }
+
     fn active_extension_menus(&self) -> Vec<ExtensionMenuSummary> {
         let mut menus = Vec::new();
+        let context = self.command_context();
         for extension in self.extensions.list() {
             if extension.state != ExtensionState::Active {
                 continue;
             }
             if let Ok(contributions) = self.extensions.contributions(&extension.id) {
                 menus.extend(contributions.menus.iter().map(|menu| {
+                    let enabled =
+                        contributions
+                            .commands
+                            .get(&menu.command_id)
+                            .is_some_and(|command| match command.enablement {
+                                CommandEnablement::Always => true,
+                                CommandEnablement::WorkspaceOpen => {
+                                    context.workspace_root.is_some()
+                                }
+                                CommandEnablement::ActiveDocument => {
+                                    context.active_document_id.is_some()
+                                }
+                            });
                     ExtensionMenuSummary {
                         command_id: menu.command_id.clone(),
                         label: menu.label.clone(),
@@ -987,8 +1328,11 @@ impl DesktopBackend {
                             MenuLocation::Tools => "tools",
                             MenuLocation::Navigate => "navigate",
                             MenuLocation::EditorContext => "editor_context",
+                            MenuLocation::ProjectExplorerContext => "project_explorer_context",
+                            MenuLocation::CommandPalette => "command_palette",
                         }
                         .into(),
+                        enabled,
                     }
                 }));
             }
@@ -2148,6 +2492,166 @@ fn protocol_extension(extension: koren_extensions::ExtensionSummary) -> Protocol
     }
 }
 
+fn protocol_ui_document(view: &UiDocument) -> ExtensionUiDocument {
+    ExtensionUiDocument {
+        id: view.id.clone(),
+        elements: view
+            .elements
+            .iter()
+            .map(|element| match element {
+                UiElement::Text { id, text } => ExtensionUiElement::Text {
+                    id: id.clone(),
+                    text: text.clone(),
+                },
+                UiElement::Heading { id, text } => ExtensionUiElement::Heading {
+                    id: id.clone(),
+                    text: text.clone(),
+                },
+                UiElement::Button {
+                    id,
+                    label,
+                    command_id,
+                } => ExtensionUiElement::Button {
+                    id: id.clone(),
+                    label: label.clone(),
+                    command_id: command_id.clone(),
+                },
+                UiElement::List { id, items } => ExtensionUiElement::List {
+                    id: id.clone(),
+                    items: items.clone(),
+                },
+                UiElement::Table { id, rows } => ExtensionUiElement::Table {
+                    id: id.clone(),
+                    rows: rows.clone(),
+                },
+                UiElement::Input {
+                    id,
+                    label,
+                    value,
+                    required,
+                    max_length,
+                } => ExtensionUiElement::Input {
+                    id: id.clone(),
+                    label: label.clone(),
+                    value: value.clone(),
+                    required: *required,
+                    max_length: *max_length,
+                },
+                UiElement::Select {
+                    id,
+                    label,
+                    options,
+                    value,
+                } => ExtensionUiElement::Select {
+                    id: id.clone(),
+                    label: label.clone(),
+                    options: options.clone(),
+                    value: value.clone(),
+                },
+                UiElement::Checkbox { id, label, checked } => ExtensionUiElement::Checkbox {
+                    id: id.clone(),
+                    label: label.clone(),
+                    checked: *checked,
+                },
+                UiElement::Status { id, label, tone } => ExtensionUiElement::Status {
+                    id: id.clone(),
+                    label: label.clone(),
+                    tone: format!("{tone:?}").to_lowercase(),
+                },
+            })
+            .collect(),
+    }
+}
+
+fn protocol_setting_kind(kind: &SettingKind) -> (ExtensionSettingKind, ExtensionSettingValue) {
+    match kind {
+        SettingKind::Boolean { default } => (
+            ExtensionSettingKind::Boolean { default: *default },
+            ExtensionSettingValue::Boolean(*default),
+        ),
+        SettingKind::Integer { default, min, max } => (
+            ExtensionSettingKind::Integer {
+                default: *default,
+                min: *min,
+                max: *max,
+            },
+            ExtensionSettingValue::Integer(*default),
+        ),
+        SettingKind::Text {
+            default,
+            max_length,
+        } => (
+            ExtensionSettingKind::Text {
+                default: default.clone(),
+                max_length: *max_length,
+            },
+            ExtensionSettingValue::Text(default.clone()),
+        ),
+        SettingKind::Choice { default, options } => (
+            ExtensionSettingKind::Choice {
+                default: default.clone(),
+                options: options.clone(),
+            },
+            ExtensionSettingValue::Text(default.clone()),
+        ),
+    }
+}
+
+fn valid_setting_value(kind: &SettingKind, value: &ExtensionSettingValue) -> bool {
+    match (kind, value) {
+        (SettingKind::Boolean { .. }, ExtensionSettingValue::Boolean(_)) => true,
+        (SettingKind::Integer { min, max, .. }, ExtensionSettingValue::Integer(value)) => {
+            value >= min && value <= max
+        }
+        (SettingKind::Text { max_length, .. }, ExtensionSettingValue::Text(value)) => {
+            value.len() <= *max_length
+        }
+        (SettingKind::Choice { options, .. }, ExtensionSettingValue::Text(value)) => {
+            options.contains(value)
+        }
+        _ => false,
+    }
+}
+
+fn extension_settings_path() -> Option<PathBuf> {
+    let base = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"))
+    } else if let Some(home) = std::env::var_os("XDG_CONFIG_HOME") {
+        Some(PathBuf::from(home))
+    } else {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+    }?;
+    base.is_absolute()
+        .then(|| base.join("koren/extension-settings.json"))
+}
+
+fn load_extension_settings() -> BTreeMap<String, ExtensionSettingValue> {
+    extension_settings_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn persist_extension_settings(
+    values: &BTreeMap<String, ExtensionSettingValue>,
+) -> std::io::Result<()> {
+    let Some(path) = extension_settings_path() else {
+        return Err(std::io::Error::other(
+            "no user configuration directory is available",
+        ));
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("settings path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let temp_path = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(values).map_err(std::io::Error::other)?;
+    std::fs::write(&temp_path, bytes)?;
+    std::fs::rename(temp_path, path)
+}
+
 fn extension_install_root() -> Option<PathBuf> {
     let path = if let Some(path) = std::env::var_os("KOREN_EXTENSION_DIR") {
         Some(PathBuf::from(path))
@@ -2175,6 +2679,110 @@ mod tests {
     };
 
     struct Temp(PathBuf);
+
+    #[test]
+    fn extension_setting_values_must_match_declared_type_and_range() {
+        assert!(valid_setting_value(
+            &SettingKind::Integer {
+                default: 3,
+                min: 1,
+                max: 5
+            },
+            &ExtensionSettingValue::Integer(5)
+        ));
+        assert!(!valid_setting_value(
+            &SettingKind::Integer {
+                default: 3,
+                min: 1,
+                max: 5
+            },
+            &ExtensionSettingValue::Integer(6)
+        ));
+        assert!(valid_setting_value(
+            &SettingKind::Choice {
+                default: "fast".into(),
+                options: vec!["fast".into(), "safe".into()]
+            },
+            &ExtensionSettingValue::Text("safe".into())
+        ));
+        assert!(!valid_setting_value(
+            &SettingKind::Boolean { default: true },
+            &ExtensionSettingValue::Text("true".into())
+        ));
+    }
+
+    #[test]
+    fn desktop_bridge_publishes_and_cleans_up_lua_ui_contributions() {
+        let temp = Temp::new();
+        let extension_root = temp.0.join("extensions");
+        let example = extension_root.join("org.example.hello");
+        fs::create_dir_all(&example).unwrap();
+        fs::write(
+            example.join("koren-extension.toml"),
+            include_str!("../../../examples/extensions/org.example.hello/koren-extension.toml"),
+        )
+        .unwrap();
+        fs::write(
+            example.join("main.lua"),
+            include_str!("../../../examples/extensions/org.example.hello/main.lua"),
+        )
+        .unwrap();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend.extension_root = Some(extension_root);
+        let listed = backend.method(RequestMethod::ListExtensions).unwrap();
+        assert!(
+            matches!(listed, ResponseValue::Extensions(ref catalog) if catalog.extensions.len() == 1)
+        );
+        backend
+            .method(RequestMethod::SetExtensionEnabled {
+                extension_id: "org.example.hello".into(),
+                enabled: true,
+            })
+            .unwrap();
+        backend
+            .method(RequestMethod::ActivateExtension {
+                extension_id: "org.example.hello".into(),
+            })
+            .unwrap();
+        let catalog = match backend.method(RequestMethod::ListExtensions).unwrap() {
+            ResponseValue::Extensions(catalog) => catalog,
+            other => panic!("unexpected response {other:?}"),
+        };
+        assert_eq!(catalog.commands.len(), 1);
+        assert_eq!(catalog.commands[0].shortcut.as_deref(), Some("Ctrl+Alt+H"));
+        assert_eq!(catalog.tool_windows.len(), 1);
+        assert_eq!(catalog.settings.len(), 1);
+        assert_eq!(catalog.themes.len(), 1);
+        assert_eq!(catalog.diagnostic_details.len(), 1);
+        backend
+            .method(RequestMethod::ExecuteCommand {
+                command_id: "org.example.hello.hello".into(),
+            })
+            .unwrap();
+        let refreshed = match backend.method(RequestMethod::ListExtensions).unwrap() {
+            ResponseValue::Extensions(catalog) => catalog,
+            other => panic!("unexpected response {other:?}"),
+        };
+        assert!(
+            matches!(&refreshed.tool_windows[0].initial_view.elements[0], ExtensionUiElement::Text { text, .. } if text.contains("an empty workspace"))
+        );
+        backend
+            .method(RequestMethod::SetExtensionEnabled {
+                extension_id: "org.example.hello".into(),
+                enabled: false,
+            })
+            .unwrap();
+        let disabled = match backend.method(RequestMethod::ListExtensions).unwrap() {
+            ResponseValue::Extensions(catalog) => catalog,
+            other => panic!("unexpected response {other:?}"),
+        };
+        assert!(
+            disabled.tool_windows.is_empty()
+                && disabled.settings.is_empty()
+                && disabled.themes.is_empty()
+        );
+        backend.shutdown();
+    }
     impl Temp {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
