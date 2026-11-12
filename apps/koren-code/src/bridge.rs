@@ -1368,15 +1368,15 @@ impl DesktopBackend {
             })
             .map_err(extension_error)?;
         if let Some(runtime) = runtime {
-            if !runtime.rules().is_empty()
-                && let Err(error) = self.inspections.register(Arc::new(runtime.clone()))
-            {
-                let _ = runtime.deactivate();
-                let _ = self.extensions.disable(id);
-                return Err(ProtocolError {
-                    code: ErrorCode::InvalidRequest,
-                    message: format!("could not register extension inspections: {error}"),
-                });
+            if !runtime.rules().is_empty() {
+                if let Err(error) = self.inspections.register(Arc::new(runtime.clone())) {
+                    let _ = runtime.deactivate();
+                    let _ = self.extensions.disable(id);
+                    return Err(ProtocolError {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("could not register extension inspections: {error}"),
+                    });
+                }
             }
             self.lua_runtimes.insert(id.to_owned(), runtime);
         }
