@@ -10,6 +10,7 @@ ALLOWED_INTERNAL_DEPS = {
     "koren-commands": {"koren-core", "koren-protocol"},
     "koren-extensions": set(),
     "koren-lsp": {"koren-documents", "koren-protocol"},
+    "koren-inspections": {"koren-protocol"},
     "koren-lua": {"koren-extensions", "koren-protocol"},
     "koren-workspace": {"koren-core"},
     "koren-documents": {"koren-core", "koren-protocol", "koren-workspace"},
