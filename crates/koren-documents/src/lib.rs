@@ -45,6 +45,32 @@ pub struct DocumentSnapshot {
     pub text: String,
 }
 
+/// One before-and-after text change in a validated document preview.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviewChange {
+    /// Original UTF-16 range.
+    pub range: TextRange,
+    /// Text currently inside the range.
+    pub before: String,
+    /// Replacement text proposed for the range.
+    pub after: String,
+}
+
+/// Revision-bound preview for one document's text-only edits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentEditPreview {
+    /// Target document identity.
+    pub document_id: DocumentId,
+    /// Workspace-relative path, or `None` for an untitled buffer.
+    pub path: Option<PathBuf>,
+    /// Revision used to compute the preview.
+    pub expected_revision: u64,
+    /// Bounded before-and-after hunks.
+    pub changes: Vec<PreviewChange>,
+    /// Exact text edits to apply after explicit confirmation.
+    pub edits: Vec<TextEdit>,
+}
+
 /// A specific backing-file conflict encountered by a save.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SaveConflict {
@@ -470,6 +496,56 @@ impl DocumentManager {
         )
     }
 
+    /// Creates a readable before-and-after preview without changing the document.
+    ///
+    /// # Errors
+    /// Returns the same validation errors as [`Self::apply_edits`].
+    pub fn preview_edits(
+        &self,
+        id: DocumentId,
+        expected_revision: u64,
+        edits: &[TextEdit],
+    ) -> Result<DocumentEditPreview, DocumentError> {
+        let document = self.document(id)?;
+        validate_edit_batch(document, expected_revision, edits, self.max_document_bytes)?;
+        let changes = edits
+            .iter()
+            .map(|edit| {
+                let start = position_to_char(&document.text, edit.range.start)?;
+                let end = position_to_char(&document.text, edit.range.end)?;
+                Ok(PreviewChange {
+                    range: edit.range,
+                    before: document.text.slice(start..end).to_string(),
+                    after: edit.new_text.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, DocumentError>>()?;
+        Ok(DocumentEditPreview {
+            document_id: id,
+            path: document.path.clone(),
+            expected_revision,
+            changes,
+            edits: edits.to_vec(),
+        })
+    }
+
+    /// Applies the exact edits in a preview if its document revision is still current.
+    ///
+    /// This updates one in-memory document only. Disk saves remain separate per-file operations.
+    ///
+    /// # Errors
+    /// Returns stale-revision or edit-validation errors without changing the document.
+    pub fn apply_preview(
+        &mut self,
+        preview: &DocumentEditPreview,
+    ) -> Result<DocumentInfo, DocumentError> {
+        self.apply_edits(
+            preview.document_id,
+            preview.expected_revision,
+            &preview.edits,
+        )
+    }
+
     /// Applies a non-overlapping edit set atomically against one revision.
     ///
     /// Ranges are interpreted against the original revision, sorted by their
@@ -492,42 +568,10 @@ impl DocumentManager {
             .documents
             .get_mut(&id)
             .ok_or(DocumentError::NotOpen(id))?;
-        check_revision(document, expected_revision)?;
-        let mut converted = Vec::with_capacity(edits.len());
-        for edit in edits {
-            let start = position_to_char(&document.text, edit.range.start)?;
-            let end = position_to_char(&document.text, edit.range.end)?;
-            if end < start {
-                return Err(DocumentError::InvalidPosition(edit.range.end));
-            }
-            converted.push((start, end, edit.new_text.clone()));
-        }
-        converted.sort_by_key(|(start, end, _)| (*start, *end));
-        for pair in converted.windows(2) {
-            if pair[1].0 < pair[0].1 || pair[1].0 == pair[0].0 {
-                return Err(DocumentError::OverlappingEdits);
-            }
-        }
+        let converted =
+            validate_edit_batch(document, expected_revision, edits, max_document_bytes)?;
         if converted.is_empty() {
             return Ok(document.info());
-        }
-        let old_bytes = converted
-            .iter()
-            .map(|(start, end, _)| {
-                i128::try_from(document.text.slice(*start..*end).len_bytes()).unwrap_or(i128::MAX)
-            })
-            .sum::<i128>();
-        let inserted_bytes = converted
-            .iter()
-            .map(|(_, _, text)| i128::try_from(text.len()).unwrap_or(i128::MAX))
-            .sum::<i128>();
-        let current_bytes = i128::try_from(document.text.len_bytes()).unwrap_or(i128::MAX);
-        let new_bytes = current_bytes - old_bytes + inserted_bytes;
-        if new_bytes > i128::from(max_document_bytes) {
-            return Err(DocumentError::TooLarge {
-                size_bytes: u64::try_from(new_bytes).unwrap_or(u64::MAX),
-                limit_bytes: max_document_bytes,
-            });
         }
         let revision = document
             .revision
@@ -816,6 +860,55 @@ fn check_revision(document: &Document, expected: u64) -> Result<(), DocumentErro
             actual: document.revision,
         })
     }
+}
+
+fn validate_edit_batch(
+    document: &Document,
+    expected_revision: u64,
+    edits: &[TextEdit],
+    max_document_bytes: u64,
+) -> Result<Vec<(usize, usize, String)>, DocumentError> {
+    check_revision(document, expected_revision)?;
+    let mut converted = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let start = position_to_char(&document.text, edit.range.start)?;
+        let end = position_to_char(&document.text, edit.range.end)?;
+        if end < start {
+            return Err(DocumentError::InvalidPosition(edit.range.end));
+        }
+        converted.push((start, end, edit.new_text.clone()));
+    }
+    converted.sort_by_key(|(start, end, _)| (*start, *end));
+    for pair in converted.windows(2) {
+        if pair[1].0 < pair[0].1 || pair[1].0 == pair[0].0 {
+            return Err(DocumentError::OverlappingEdits);
+        }
+    }
+    if !converted.is_empty() {
+        let old_bytes = converted
+            .iter()
+            .map(|(start, end, _)| {
+                i128::try_from(document.text.slice(*start..*end).len_bytes()).unwrap_or(i128::MAX)
+            })
+            .sum::<i128>();
+        let inserted_bytes = converted
+            .iter()
+            .map(|(_, _, text)| i128::try_from(text.len()).unwrap_or(i128::MAX))
+            .sum::<i128>();
+        let current_bytes = i128::try_from(document.text.len_bytes()).unwrap_or(i128::MAX);
+        let new_bytes = current_bytes - old_bytes + inserted_bytes;
+        if new_bytes > i128::from(max_document_bytes) {
+            return Err(DocumentError::TooLarge {
+                size_bytes: u64::try_from(new_bytes).unwrap_or(u64::MAX),
+                limit_bytes: max_document_bytes,
+            });
+        }
+        document
+            .revision
+            .checked_add(1)
+            .ok_or(DocumentError::RevisionExhausted)?;
+    }
+    Ok(converted)
 }
 
 fn position_to_char(text: &Rope, position: TextPosition) -> Result<usize, DocumentError> {
@@ -1248,6 +1341,66 @@ mod tests {
             Err(DocumentError::OverlappingEdits)
         ));
         assert_eq!(documents.snapshot(id).unwrap(), before);
+    }
+
+    #[test]
+    fn edit_preview_is_read_only_and_confirmation_rechecks_revision() {
+        let (_temp, _workspace, mut documents, id) = setup(b"hello");
+        let replacement = TextEdit {
+            range: TextRange {
+                start: TextPosition {
+                    line: 0,
+                    character: 1,
+                },
+                end: TextPosition {
+                    line: 0,
+                    character: 4,
+                },
+            },
+            new_text: "i".into(),
+        };
+        let preview = documents.preview_edits(id, 0, &[replacement]).unwrap();
+        assert_eq!(preview.changes[0].before, "ell");
+        assert_eq!(preview.changes[0].after, "i");
+        assert_eq!(documents.snapshot(id).unwrap().text, "hello");
+        documents.apply_preview(&preview).unwrap();
+        assert_eq!(documents.snapshot(id).unwrap().text, "hio");
+
+        let stale = documents
+            .preview_edits(
+                id,
+                1,
+                &[TextEdit {
+                    range: TextRange {
+                        start: TextPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: TextPosition {
+                            line: 0,
+                            character: 1,
+                        },
+                    },
+                    new_text: "H".into(),
+                }],
+            )
+            .unwrap();
+        documents
+            .insert_text(
+                id,
+                1,
+                TextPosition {
+                    line: 0,
+                    character: 3,
+                },
+                "!",
+            )
+            .unwrap();
+        assert!(matches!(
+            documents.apply_preview(&stale),
+            Err(DocumentError::StaleRevision { .. })
+        ));
+        assert_eq!(documents.snapshot(id).unwrap().text, "hio!");
     }
 
     #[test]
