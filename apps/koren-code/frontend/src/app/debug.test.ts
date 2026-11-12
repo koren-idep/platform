@@ -102,4 +102,36 @@ describe('DebugPanel', () => {
     expect(set).toHaveBeenCalledWith([{ line: 4, column: null, condition: null, hit_condition: null, log_message: null, enabled: true }]);
     expect(panel.breakpointState('/workspace/main.c', 4)).toBe('unverified');
   });
+
+  it('selects threads and frames, navigates to source, and expands bounded variables', async () => {
+    const navigate = vi.fn(async () => {});
+    markup();
+    const client = fakeClient((method) => {
+      if (method === 'list_debug_configurations') return { kind: 'debug_configurations', value: [configuration] };
+      if (method === 'list_debug_sessions') return { kind: 'debug_sessions', value: [session] };
+      return { kind: 'debug_request_accepted', value: { session_id: 1, request_id: 2 } };
+    });
+    const { DebugPanel } = await import('./debug');
+    const panel = new DebugPanel(document.querySelector<HTMLElement>('#debug')!, client, navigate, vi.fn());
+    await vi.waitFor(() => expect(document.querySelector<HTMLSelectElement>('[data-debug-session]')!.options).toHaveLength(1));
+    panel.handleEvent({ kind: 'debug_event', debug_event: { kind: 'response', session_id: 1, request_id: 10, command: 'threads', success: true,
+      body: { threads: [{ id: 7, name: 'worker' }] } } });
+    panel.handleEvent({ kind: 'debug_event', debug_event: { kind: 'response', session_id: 1, request_id: 11, command: 'stackTrace', success: true,
+      body: { stackFrames: [{ id: 42, name: 'run', line: 8, column: 1, source: { name: 'main.c', path: '/workspace/main.c' } }] } } });
+    document.querySelector<HTMLButtonElement>('[data-debug-threads] button')!.click();
+    document.querySelector<HTMLButtonElement>('[data-debug-stack] button')!.click();
+    await vi.waitFor(() => expect(navigate).toHaveBeenCalledWith('/workspace/main.c', 7));
+    expect(client.call).toHaveBeenCalledWith({ method: 'debug_inspect', params: expect.objectContaining({ operation: 'stack_trace', thread_id: 7 }) });
+    expect(client.call).toHaveBeenCalledWith({ method: 'debug_inspect', params: expect.objectContaining({ operation: 'scopes', frame_id: 42 }) });
+
+    panel.handleEvent({ kind: 'debug_event', debug_event: { kind: 'response', session_id: 1, request_id: 12, command: 'scopes', success: true,
+      body: { scopes: [{ name: 'Locals', variablesReference: 11 }] } } });
+    document.querySelector<HTMLButtonElement>('[data-debug-variables] button')!.click();
+    panel.handleEvent({ kind: 'debug_event', debug_event: { kind: 'response', session_id: 1, request_id: 13, command: 'variables', success: true,
+      body: { variables: [{ name: 'point', value: 'Point', variablesReference: 19 }] } } });
+    document.querySelector<HTMLButtonElement>('[aria-label="Expand point"]')!.click();
+    expect(client.call).toHaveBeenCalledWith({ method: 'debug_inspect', params: expect.objectContaining({ operation: 'variables', reference: {
+      session_id: 1, stop_generation: 2, adapter_reference: 19,
+    } }) });
+  });
 });
