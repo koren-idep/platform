@@ -70,7 +70,12 @@ while True:
                 time.sleep(delay / 1000)
             if os.environ.get("FAKE_LSP_CRASH_ON_INIT") == "1":
                 os._exit(31)
-            result = {"capabilities": {"hoverProvider": True, "completionProvider": {}, "definitionProvider": True}}
+            result = {"capabilities": {
+                "hoverProvider": True, "completionProvider": {}, "definitionProvider": True,
+                "codeActionProvider": {"resolveProvider": True}, "referencesProvider": True,
+                "renameProvider": {"prepareProvider": True}, "documentFormattingProvider": True,
+                "documentRangeFormattingProvider": True,
+            }}
         elif method == "textDocument/hover":
             wait_for_gate("FAKE_LSP_HOVER_GATE", "FAKE_LSP_HOVER_REACHED")
             if os.environ.get("FAKE_LSP_CRASH_ON_HOVER") == "1":
@@ -81,6 +86,24 @@ while True:
             result = {"isIncomplete": False, "items": [{"label": "complete"}]}
         elif method == "textDocument/definition":
             result = []
+        elif method == "textDocument/codeAction":
+            uri = message["params"]["textDocument"]["uri"]
+            result = [{"title": "Replace text", "kind": "quickfix", "data": {"token": "demo"}, "edit": {"changes": {uri: [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}, "newText": "demo"
+            }]}}}]
+        elif method == "codeAction/resolve":
+            result = message["params"]
+        elif method == "textDocument/references":
+            result = [{"uri": message["params"]["textDocument"]["uri"], "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}}]
+        elif method == "textDocument/prepareRename":
+            result = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}, "placeholder": "name"}
+        elif method == "textDocument/rename":
+            uri = message["params"]["textDocument"]["uri"]
+            result = {"changes": {uri: [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}, "newText": message["params"]["newName"]
+            }]}}
+        elif method in ("textDocument/formatting", "textDocument/rangeFormatting"):
+            result = [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": "x"}]
         write_message({"jsonrpc": "2.0", "id": message["id"], "result": result})
     if method == "textDocument/didOpen":
         document = message["params"]["textDocument"]

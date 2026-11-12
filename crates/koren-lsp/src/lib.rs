@@ -11,7 +11,7 @@ pub use actor::{
 };
 
 use koren_documents::{DocumentId, DocumentSnapshot};
-use koren_protocol::{TextPosition, TextRange};
+use koren_protocol::{TextEdit, TextPosition, TextRange};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -32,6 +32,16 @@ use std::{
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// Default request timeout used for initialization and language requests.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum code actions accepted from one language-server response.
+pub const MAX_CODE_ACTIONS: usize = 200;
+/// Maximum files represented by one text-only workspace edit.
+pub const MAX_WORKSPACE_EDIT_FILES: usize = 128;
+/// Maximum text edits represented by one workspace edit.
+pub const MAX_WORKSPACE_EDIT_ITEMS: usize = 2_000;
+/// Maximum aggregate replacement text in one workspace edit.
+pub const MAX_WORKSPACE_EDIT_TEXT_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum opaque data retained for one deferred code action.
+pub const MAX_CODE_ACTION_DATA_BYTES: usize = 64 * 1024;
 
 /// Exact direct-process configuration reviewed by the host before server startup.
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -193,6 +203,78 @@ pub struct Location {
     pub uri: String,
     /// Target UTF-16 range.
     pub range: TextRange,
+}
+
+/// One versioned text-document edit in an LSP workspace edit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VersionedDocumentEdits {
+    /// Target file URI.
+    pub uri: String,
+    /// LSP document version, absent for edits from the unversioned `changes` form.
+    pub version: Option<i32>,
+    /// UTF-16 text replacements.
+    pub edits: Vec<TextEdit>,
+}
+
+/// Supported text-only portion of an LSP workspace edit.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceEdit {
+    /// Text edits grouped by source document.
+    pub document_edits: Vec<VersionedDocumentEdits>,
+    /// Unsupported resource operations, such as create, rename, or delete.
+    pub unsupported_operations: Vec<String>,
+}
+
+/// Provider command returned by a code action. It is never executed automatically.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderCommand {
+    /// User-facing command title.
+    pub title: String,
+    /// Provider command identity.
+    pub command: String,
+    /// Opaque provider arguments; hosts must require explicit authorization before dispatch.
+    pub arguments: Vec<Value>,
+}
+
+/// Typed LSP code action or intention.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LspCodeAction {
+    /// Request-scoped identity.
+    pub id: String,
+    /// User-facing action title.
+    pub title: String,
+    /// Provider identity.
+    pub provider_id: String,
+    /// Optional action kind, such as `quickfix`, `refactor`, or `source`.
+    pub kind: Option<String>,
+    /// Messages from related diagnostics returned by the provider.
+    pub related_diagnostics: Vec<String>,
+    /// Optional safe-to-preview text-only edit.
+    pub edit: Option<WorkspaceEdit>,
+    /// Optional provider command, never implicitly executed.
+    pub command: Option<ProviderCommand>,
+    /// Provider supplied disabled reason.
+    pub disabled_reason: Option<String>,
+    /// Opaque server data retained for advertised deferred resolution.
+    pub data: Option<Value>,
+}
+
+/// Prepare-rename response from an LSP server.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RenamePreparation {
+    /// Symbol range to replace.
+    pub range: TextRange,
+    /// Placeholder name suggested by the server.
+    pub placeholder: Option<String>,
+}
+
+/// Formatting options sent to a language server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FormattingOptions {
+    /// Indentation width.
+    pub tab_size: u32,
+    /// Whether indentation uses spaces.
+    pub insert_spaces: bool,
 }
 
 /// Concise, renderable hover result.
@@ -594,8 +676,18 @@ impl LspServer {
                     "hover": { "dynamicRegistration": false },
                     "definition": { "dynamicRegistration": false },
                     "completion": { "completionItem": { "snippetSupport": false } },
+                    "references": { "dynamicRegistration": false },
+                    "rename": { "dynamicRegistration": false, "prepareSupport": true },
+                    "formatting": { "dynamicRegistration": false },
+                    "rangeFormatting": { "dynamicRegistration": false },
+                    "codeAction": {
+                        "dynamicRegistration": false,
+                        "codeActionLiteralSupport": { "codeActionKind": { "valueSet": ["quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite", "source", "source.organizeImports"] } },
+                        "resolveSupport": { "properties": ["edit", "command", "data"] }
+                    },
                     "publishDiagnostics": { "relatedInformation": true }
-                }
+                },
+                "workspace": { "workspaceEdit": { "documentChanges": true, "resourceOperations": [] } }
             }
         }), timeout, None)?;
         self.capabilities = result.get("capabilities").cloned().unwrap_or(Value::Null);
@@ -838,6 +930,214 @@ impl LspServer {
         })
     }
 
+    /// Requests quick fixes, refactorings, source actions, and provider intentions for a range.
+    ///
+    /// An empty diagnostics list is valid and allows intention actions. Returned commands remain
+    /// inert data; the host must present them and apply any edits only after explicit user choice.
+    ///
+    /// # Errors
+    /// Returns an error when the server does not advertise code actions or the request fails.
+    pub fn code_actions(
+        &mut self,
+        uri: &str,
+        version: i32,
+        range: TextRange,
+        diagnostics: &[Value],
+        only: &[String],
+        timeout: Duration,
+    ) -> Result<VersionedResult<Vec<LspCodeAction>>, LspError> {
+        self.ensure_capability("codeActionProvider")?;
+        let mut context = json!({ "diagnostics": diagnostics });
+        if !only.is_empty() {
+            context["only"] = json!(only);
+        }
+        let result = self.request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": uri }, "range": range, "context": context
+            }),
+            timeout,
+            None,
+        )?;
+        Ok(VersionedResult {
+            uri: uri.into(),
+            document_version: version,
+            value: parse_code_actions(&self.config_id, &result)?,
+        })
+    }
+
+    /// Resolves an advertised deferred code action.
+    ///
+    /// # Errors
+    /// Returns an error when `codeActionProvider.resolveProvider` was not advertised.
+    pub fn resolve_code_action(
+        &mut self,
+        action: Value,
+        timeout: Duration,
+    ) -> Result<LspCodeAction, LspError> {
+        if self
+            .capabilities
+            .pointer("/codeActionProvider/resolveProvider")
+            != Some(&Value::Bool(true))
+        {
+            return Err(LspError::UnsupportedFeature(
+                "codeActionProvider.resolveProvider".into(),
+            ));
+        }
+        let result = self.request("codeAction/resolve", action, timeout, None)?;
+        parse_code_actions(&self.config_id, &json!([result]))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| LspError::Protocol("resolved code action was empty".into()))
+    }
+
+    /// Requests references at a position when the server supports them.
+    ///
+    /// # Errors
+    /// Returns an error when references are unsupported or the request fails.
+    pub fn references(
+        &mut self,
+        uri: &str,
+        version: i32,
+        position: TextPosition,
+        include_declaration: bool,
+        timeout: Duration,
+    ) -> Result<VersionedResult<Vec<Location>>, LspError> {
+        self.ensure_capability("referencesProvider")?;
+        let mut params = text_position_params(uri, position);
+        params["context"] = json!({ "includeDeclaration": include_declaration });
+        let result = self.request("textDocument/references", params, timeout, None)?;
+        Ok(VersionedResult {
+            uri: uri.into(),
+            document_version: version,
+            value: parse_locations(result)?,
+        })
+    }
+
+    /// Requests whether a symbol can be renamed and which range/name should be used.
+    ///
+    /// # Errors
+    /// Returns an error when rename is unsupported or the request fails.
+    pub fn prepare_rename(
+        &mut self,
+        uri: &str,
+        version: i32,
+        position: TextPosition,
+        timeout: Duration,
+    ) -> Result<VersionedResult<Option<RenamePreparation>>, LspError> {
+        self.ensure_capability("renameProvider")?;
+        let result = self.request(
+            "textDocument/prepareRename",
+            text_position_params(uri, position),
+            timeout,
+            None,
+        )?;
+        let value = if result.is_null() {
+            None
+        } else {
+            let range = result
+                .get("range")
+                .cloned()
+                .ok_or_else(|| LspError::Protocol("prepareRename omitted range".into()))?;
+            Some(RenamePreparation {
+                range: serde_json::from_value(range)
+                    .map_err(|error| LspError::Protocol(error.to_string()))?,
+                placeholder: result
+                    .get("placeholder")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        };
+        Ok(VersionedResult {
+            uri: uri.into(),
+            document_version: version,
+            value,
+        })
+    }
+
+    /// Requests a rename workspace edit. The returned edit is not applied by this client.
+    ///
+    /// # Errors
+    /// Returns an error when rename is unsupported or the request fails.
+    pub fn rename(
+        &mut self,
+        uri: &str,
+        version: i32,
+        position: TextPosition,
+        new_name: &str,
+        timeout: Duration,
+    ) -> Result<VersionedResult<Option<WorkspaceEdit>>, LspError> {
+        self.ensure_capability("renameProvider")?;
+        let mut params = text_position_params(uri, position);
+        params["newName"] = json!(new_name);
+        let result = self.request("textDocument/rename", params, timeout, None)?;
+        let edit = if result.is_null() {
+            None
+        } else {
+            Some(parse_workspace_edit(&result)?)
+        };
+        Ok(VersionedResult {
+            uri: uri.into(),
+            document_version: version,
+            value: edit,
+        })
+    }
+
+    /// Requests full-document formatting when advertised by the server.
+    ///
+    /// # Errors
+    /// Returns an error when formatting is unsupported or the request fails.
+    pub fn formatting(
+        &mut self,
+        uri: &str,
+        version: i32,
+        options: FormattingOptions,
+        timeout: Duration,
+    ) -> Result<VersionedResult<Vec<TextEdit>>, LspError> {
+        self.ensure_capability("documentFormattingProvider")?;
+        let result = self.request(
+            "textDocument/formatting",
+            json!({
+                "textDocument": { "uri": uri }, "options": format_options(options)
+            }),
+            timeout,
+            None,
+        )?;
+        Ok(VersionedResult {
+            uri: uri.into(),
+            document_version: version,
+            value: parse_text_edits(&result)?,
+        })
+    }
+
+    /// Requests formatting for one range when advertised by the server.
+    ///
+    /// # Errors
+    /// Returns an error when range formatting is unsupported or the request fails.
+    pub fn range_formatting(
+        &mut self,
+        uri: &str,
+        version: i32,
+        range: TextRange,
+        options: FormattingOptions,
+        timeout: Duration,
+    ) -> Result<VersionedResult<Vec<TextEdit>>, LspError> {
+        self.ensure_capability("documentRangeFormattingProvider")?;
+        let result = self.request(
+            "textDocument/rangeFormatting",
+            json!({
+                "textDocument": { "uri": uri }, "range": range, "options": format_options(options)
+            }),
+            timeout,
+            None,
+        )?;
+        Ok(VersionedResult {
+            uri: uri.into(),
+            document_version: version,
+            value: parse_text_edits(&result)?,
+        })
+    }
+
     /// Drains server notifications and stderr/errors currently available.
     pub fn drain_events(&mut self) -> Vec<ServerEvent> {
         while let Ok(message) = self.incoming.try_recv() {
@@ -882,6 +1182,28 @@ impl LspServer {
         } else {
             Err(LspError::UnsupportedFeature(key.into()))
         }
+    }
+
+    pub(crate) fn request_feature_with_cancellation(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<Value, LspError> {
+        let capability = match method {
+            "textDocument/hover" => "hoverProvider",
+            "textDocument/completion" => "completionProvider",
+            "textDocument/definition" => "definitionProvider",
+            "textDocument/codeAction" => "codeActionProvider",
+            "textDocument/references" => "referencesProvider",
+            "textDocument/prepareRename" | "textDocument/rename" => "renameProvider",
+            "textDocument/formatting" => "documentFormattingProvider",
+            "textDocument/rangeFormatting" => "documentRangeFormattingProvider",
+            _ => return Err(LspError::UnsupportedFeature(method.to_owned())),
+        };
+        self.ensure_capability(capability)?;
+        self.request(method, params, timeout, Some(cancelled))
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), LspError> {
@@ -1191,6 +1513,214 @@ fn parse_locations(value: Value) -> Result<Vec<Location>, LspError> {
             Ok(Location { uri, range })
         })
         .collect()
+}
+
+fn parse_text_edits(value: &Value) -> Result<Vec<TextEdit>, LspError> {
+    let Some(edits) = value.as_array() else {
+        if value.is_null() {
+            return Ok(Vec::new());
+        }
+        return Err(LspError::Protocol(
+            "text edit response was not an array".into(),
+        ));
+    };
+    if edits.len() > MAX_WORKSPACE_EDIT_ITEMS {
+        return Err(LspError::MessageTooLarge(edits.len()));
+    }
+    edits
+        .iter()
+        .map(|edit| {
+            let range = edit
+                .get("range")
+                .cloned()
+                .ok_or_else(|| LspError::Protocol("text edit omitted range".into()))?;
+            let range = serde_json::from_value(range)
+                .map_err(|error| LspError::Protocol(error.to_string()))?;
+            let new_text = edit
+                .get("newText")
+                .and_then(Value::as_str)
+                .ok_or_else(|| LspError::Protocol("text edit omitted newText".into()))?;
+            Ok(TextEdit {
+                range,
+                new_text: new_text.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn parse_workspace_edit(value: &Value) -> Result<WorkspaceEdit, LspError> {
+    let mut result = WorkspaceEdit::default();
+    if let Some(changes) = value.get("changes").and_then(Value::as_object) {
+        for (uri, edits) in changes {
+            result.document_edits.push(VersionedDocumentEdits {
+                uri: uri.clone(),
+                version: None,
+                edits: parse_text_edits(edits)?,
+            });
+        }
+    }
+    if let Some(changes) = value.get("documentChanges").and_then(Value::as_array) {
+        for change in changes {
+            if let Some(document) = change.get("textDocument") {
+                let uri = document
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| LspError::Protocol("document change omitted URI".into()))?;
+                let version = document
+                    .get("version")
+                    .and_then(Value::as_i64)
+                    .and_then(|version| i32::try_from(version).ok());
+                let empty_edits = Value::Null;
+                let edits = parse_text_edits(change.get("edits").unwrap_or(&empty_edits))?;
+                result.document_edits.push(VersionedDocumentEdits {
+                    uri: uri.to_owned(),
+                    version,
+                    edits,
+                });
+            } else {
+                let kind = change
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                result.unsupported_operations.push(kind.to_owned());
+            }
+        }
+    }
+    if value.get("changes").is_none() && value.get("documentChanges").is_none() {
+        return Err(LspError::Protocol(
+            "workspace edit contained no supported change set".into(),
+        ));
+    }
+    result
+        .document_edits
+        .sort_by(|left, right| left.uri.cmp(&right.uri));
+    let edit_count = result
+        .document_edits
+        .iter()
+        .map(|file| file.edits.len())
+        .sum::<usize>();
+    let text_bytes = result
+        .document_edits
+        .iter()
+        .flat_map(|file| &file.edits)
+        .map(|edit| edit.new_text.len())
+        .sum::<usize>();
+    if result.document_edits.len() > MAX_WORKSPACE_EDIT_FILES
+        || edit_count > MAX_WORKSPACE_EDIT_ITEMS
+        || text_bytes > MAX_WORKSPACE_EDIT_TEXT_BYTES
+    {
+        return Err(LspError::MessageTooLarge(text_bytes.max(edit_count)));
+    }
+    if result
+        .document_edits
+        .windows(2)
+        .any(|pair| pair[0].uri == pair[1].uri)
+    {
+        result
+            .unsupported_operations
+            .push("multiple edit groups for one document".into());
+    }
+    Ok(result)
+}
+
+fn parse_code_actions(provider_id: &str, value: &Value) -> Result<Vec<LspCodeAction>, LspError> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let Some(actions) = value.as_array() else {
+        return Err(LspError::Protocol(
+            "code action response was not an array".into(),
+        ));
+    };
+    if actions.len() > MAX_CODE_ACTIONS {
+        return Err(LspError::MessageTooLarge(actions.len()));
+    }
+    actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let title = action
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or_else(|| LspError::Protocol("code action omitted title".into()))?
+                .to_owned();
+            let edit = action.get("edit").map(parse_workspace_edit).transpose()?;
+            let command_value = action.get("command").cloned();
+            let command = command_value
+                .map(|command| {
+                    if command.is_string() {
+                        Ok(ProviderCommand {
+                            title: title.clone(),
+                            command: command.as_str().unwrap_or_default().to_owned(),
+                            arguments: Vec::new(),
+                        })
+                    } else {
+                        let command_id = command
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                LspError::Protocol("provider command omitted command".into())
+                            })?;
+                        Ok(ProviderCommand {
+                            title: command
+                                .get("title")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&title)
+                                .to_owned(),
+                            command: command_id.to_owned(),
+                            arguments: command
+                                .get("arguments")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default(),
+                        })
+                    }
+                })
+                .transpose()?;
+            let related_diagnostics = action
+                .get("diagnostics")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|diagnostic| {
+                    diagnostic
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect();
+            let data = action.get("data").cloned();
+            if data.as_ref().is_some_and(|data| {
+                serde_json::to_vec(data)
+                    .map_or(true, |bytes| bytes.len() > MAX_CODE_ACTION_DATA_BYTES)
+            }) {
+                return Err(LspError::MessageTooLarge(
+                    MAX_CODE_ACTION_DATA_BYTES.saturating_add(1),
+                ));
+            }
+            Ok(LspCodeAction {
+                id: format!("{provider_id}:{index}:{title}"),
+                title,
+                provider_id: provider_id.to_owned(),
+                kind: action
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                related_diagnostics,
+                edit,
+                command,
+                disabled_reason: action
+                    .pointer("/disabled/reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                data,
+            })
+        })
+        .collect()
+}
+
+fn format_options(options: FormattingOptions) -> Value {
+    json!({ "tabSize": options.tab_size, "insertSpaces": options.insert_spaces })
 }
 
 fn parse_diagnostics(provider_id: &str, params: &Value) -> Result<DiagnosticSet, LspError> {
@@ -1530,6 +2060,22 @@ mod tests {
             "alpha"
         );
         assert_eq!(parse_locations(json!({"uri":"file:///target","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}})).unwrap().len(), 1);
+        let edit = parse_workspace_edit(&json!({"documentChanges":[
+            {"textDocument":{"uri":"file:///demo","version":2},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"x"}]},
+            {"kind":"rename","oldUri":"file:///a","newUri":"file:///b"}
+        ]})).unwrap();
+        assert_eq!(edit.document_edits[0].version, Some(2));
+        assert_eq!(edit.unsupported_operations, ["rename"]);
+        let actions = parse_code_actions("server", &json!([{"title":"Run provider command","command":{"title":"Run","command":"server.run","arguments":[1]}}])).unwrap();
+        assert_eq!(actions[0].command.as_ref().unwrap().command, "server.run");
+        let oversized_data = Value::String("x".repeat(MAX_CODE_ACTION_DATA_BYTES + 1));
+        assert!(matches!(
+            parse_code_actions(
+                "server",
+                &json!([{"title":"Resolve","data":oversized_data}])
+            ),
+            Err(LspError::MessageTooLarge(_))
+        ));
     }
 
     struct Allow(Arc<AtomicUsize>);
@@ -1614,6 +2160,7 @@ mod tests {
                 .value,
             []
         );
+        exercise_advanced_requests(server);
         server.did_open("file:///demo", "demo", 1, "hello").unwrap();
         thread::sleep(Duration::from_millis(25));
         assert!(
@@ -1633,6 +2180,87 @@ mod tests {
         manager.stop_server(id2).unwrap();
         manager.close_workspace(&root).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn exercise_advanced_requests(server: &mut LspServer) {
+        let range = TextRange {
+            start: TextPosition {
+                line: 0,
+                character: 0,
+            },
+            end: TextPosition {
+                line: 0,
+                character: 4,
+            },
+        };
+        let actions = server
+            .code_actions(
+                "file:///demo",
+                1,
+                range,
+                &[],
+                &["quickfix".into()],
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(actions.value[0].provider_id, "fake-lsp");
+        assert_eq!(actions.value[0].kind.as_deref(), Some("quickfix"));
+        assert_eq!(
+            actions.value[0].edit.as_ref().unwrap().document_edits[0].edits[0].new_text,
+            "demo"
+        );
+        assert!(actions.value[0].data.is_some());
+        assert_eq!(
+            server
+                .references("file:///demo", 1, range.start, true, Duration::from_secs(1))
+                .unwrap()
+                .value
+                .len(),
+            1
+        );
+        assert_eq!(
+            server
+                .prepare_rename("file:///demo", 1, range.start, Duration::from_secs(1))
+                .unwrap()
+                .value
+                .unwrap()
+                .placeholder
+                .as_deref(),
+            Some("name")
+        );
+        let rename = server
+            .rename(
+                "file:///demo",
+                1,
+                range.start,
+                "next",
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            rename.value.unwrap().document_edits[0].edits[0].new_text,
+            "next"
+        );
+        let formatting = FormattingOptions {
+            tab_size: 4,
+            insert_spaces: true,
+        };
+        assert_eq!(
+            server
+                .formatting("file:///demo", 1, formatting, Duration::from_secs(1))
+                .unwrap()
+                .value[0]
+                .new_text,
+            "x"
+        );
+        assert_eq!(
+            server
+                .range_formatting("file:///demo", 1, range, formatting, Duration::from_secs(1))
+                .unwrap()
+                .value[0]
+                .new_text,
+            "x"
+        );
     }
 
     #[test]

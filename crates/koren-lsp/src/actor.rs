@@ -1,10 +1,13 @@
 //! Bounded, per-process actors for hosts that must keep LSP work off request threads.
 
 use crate::{
-    CompletionItem, DEFAULT_REQUEST_TIMEOUT, HoverResult, Location, LspError, LspServerManager,
-    ServerAuthorizer, ServerConfig, ServerEvent, ServerId, SyncNotification, VersionedResult,
+    CompletionItem, DEFAULT_REQUEST_TIMEOUT, FormattingOptions, HoverResult, Location,
+    LspCodeAction, LspError, LspServerManager, RenamePreparation, ServerAuthorizer, ServerConfig,
+    ServerEvent, ServerId, SyncNotification, VersionedResult, WorkspaceEdit, parse_code_actions,
+    parse_locations, parse_text_edits, parse_workspace_edit, text_position_params,
 };
-use koren_protocol::TextPosition;
+use koren_protocol::{TextPosition, TextRange};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -63,6 +66,82 @@ pub enum LspRequest {
         /// Maximum server response wait.
         timeout: Duration,
     },
+    /// Request code actions, including intentions when diagnostics is empty.
+    CodeActions {
+        /// Synchronized file URI.
+        uri: String,
+        /// Current server document version.
+        version: i32,
+        /// Requested UTF-16 range.
+        range: TextRange,
+        /// Diagnostics in LSP wire form.
+        diagnostics: Vec<Value>,
+        /// Optional action kind filter.
+        only: Vec<String>,
+        /// Response deadline.
+        timeout: Duration,
+    },
+    /// Find symbol references.
+    References {
+        /// Synchronized file URI.
+        uri: String,
+        /// Current server document version.
+        version: i32,
+        /// Query position.
+        position: TextPosition,
+        /// Whether to include the declaration.
+        include_declaration: bool,
+        /// Response deadline.
+        timeout: Duration,
+    },
+    /// Prepare a rename request.
+    PrepareRename {
+        /// Synchronized file URI.
+        uri: String,
+        /// Current server document version.
+        version: i32,
+        /// Query position.
+        position: TextPosition,
+        /// Response deadline.
+        timeout: Duration,
+    },
+    /// Request a rename workspace edit.
+    Rename {
+        /// Synchronized file URI.
+        uri: String,
+        /// Current server document version.
+        version: i32,
+        /// Query position.
+        position: TextPosition,
+        /// Proposed symbol name.
+        new_name: String,
+        /// Response deadline.
+        timeout: Duration,
+    },
+    /// Request whole-document formatting edits.
+    Formatting {
+        /// Synchronized file URI.
+        uri: String,
+        /// Current server document version.
+        version: i32,
+        /// Formatting preferences.
+        options: FormattingOptions,
+        /// Response deadline.
+        timeout: Duration,
+    },
+    /// Request range formatting edits.
+    RangeFormatting {
+        /// Synchronized file URI.
+        uri: String,
+        /// Current server document version.
+        version: i32,
+        /// Requested UTF-16 range.
+        range: TextRange,
+        /// Formatting preferences.
+        options: FormattingOptions,
+        /// Response deadline.
+        timeout: Duration,
+    },
 }
 
 /// Typed response from one language request.
@@ -74,6 +153,18 @@ pub enum LspResponse {
     Completion(VersionedResult<Vec<CompletionItem>>),
     /// Definition locations and version.
     Definition(VersionedResult<Vec<Location>>),
+    /// Code actions and intentions.
+    CodeActions(VersionedResult<Vec<LspCodeAction>>),
+    /// Symbol references.
+    References(VersionedResult<Vec<Location>>),
+    /// Rename preparation range.
+    PrepareRename(VersionedResult<Option<RenamePreparation>>),
+    /// Rename edit proposal.
+    Rename(VersionedResult<Option<WorkspaceEdit>>),
+    /// Full-document formatting edit proposal.
+    Formatting(VersionedResult<Vec<koren_protocol::TextEdit>>),
+    /// Range-formatting edit proposal.
+    RangeFormatting(VersionedResult<Vec<koren_protocol::TextEdit>>),
 }
 
 /// A queued request response. Dropping or timing out the ticket cancels work that has not begun.
@@ -524,6 +615,50 @@ fn run_actor(startup: ActorStartup) {
                                 &uri, version, position, timeout, &cancelled,
                             )
                             .map(LspResponse::Definition),
+                        LspRequest::CodeActions { uri, version, range, diagnostics, only, timeout } => {
+                            let mut context = serde_json::json!({ "diagnostics": diagnostics });
+                            if !only.is_empty() { context["only"] = serde_json::json!(only); }
+                            let params = serde_json::json!({ "textDocument": { "uri": uri }, "range": range, "context": context });
+                            server.request_feature_with_cancellation("textDocument/codeAction", params, timeout, &cancelled)
+                                .and_then(|value| parse_code_actions(server.provider_id(), &value))
+                                .map(|value| LspResponse::CodeActions(VersionedResult { uri, document_version: version, value }))
+                        }
+                        LspRequest::References { uri, version, position, include_declaration, timeout } => {
+                            let mut params = text_position_params(&uri, position);
+                            params["context"] = serde_json::json!({ "includeDeclaration": include_declaration });
+                            server.request_feature_with_cancellation("textDocument/references", params, timeout, &cancelled)
+                                .and_then(parse_locations)
+                                .map(|value| LspResponse::References(VersionedResult { uri, document_version: version, value }))
+                        }
+                        LspRequest::PrepareRename { uri, version, position, timeout } => {
+                            server.request_feature_with_cancellation("textDocument/prepareRename", text_position_params(&uri, position), timeout, &cancelled)
+                                .and_then(|value| {
+                                    if value.is_null() { return Ok(None); }
+                                    let range = value.get("range").cloned().ok_or_else(|| LspError::Protocol("prepareRename omitted range".into()))?;
+                                    let range = serde_json::from_value(range).map_err(|error| LspError::Protocol(error.to_string()))?;
+                                    Ok(Some(RenamePreparation { range, placeholder: value.get("placeholder").and_then(Value::as_str).map(str::to_owned) }))
+                                })
+                                .map(|value| LspResponse::PrepareRename(VersionedResult { uri, document_version: version, value }))
+                        }
+                        LspRequest::Rename { uri, version, position, new_name, timeout } => {
+                            let mut params = text_position_params(&uri, position);
+                            params["newName"] = serde_json::json!(new_name);
+                            server.request_feature_with_cancellation("textDocument/rename", params, timeout, &cancelled)
+                                .and_then(|value| if value.is_null() { Ok(None) } else { parse_workspace_edit(&value).map(Some) })
+                                .map(|value| LspResponse::Rename(VersionedResult { uri, document_version: version, value }))
+                        }
+                        LspRequest::Formatting { uri, version, options, timeout } => {
+                            let params = serde_json::json!({ "textDocument": { "uri": uri }, "options": { "tabSize": options.tab_size, "insertSpaces": options.insert_spaces } });
+                            server.request_feature_with_cancellation("textDocument/formatting", params, timeout, &cancelled)
+                                .and_then(|value| parse_text_edits(&value))
+                                .map(|value| LspResponse::Formatting(VersionedResult { uri, document_version: version, value }))
+                        }
+                        LspRequest::RangeFormatting { uri, version, range, options, timeout } => {
+                            let params = serde_json::json!({ "textDocument": { "uri": uri }, "range": range, "options": { "tabSize": options.tab_size, "insertSpaces": options.insert_spaces } });
+                            server.request_feature_with_cancellation("textDocument/rangeFormatting", params, timeout, &cancelled)
+                                .and_then(|value| parse_text_edits(&value))
+                                .map(|value| LspResponse::RangeFormatting(VersionedResult { uri, document_version: version, value }))
+                        }
                     });
                 if !cancelled.load(Ordering::Acquire) {
                     let _ = reply.send(result);
