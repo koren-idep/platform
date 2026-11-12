@@ -75,10 +75,13 @@ export class DebugPanel {
       this.consumeResponse(debug.command ?? '', debug.body as DapBody);
     } else if (debug.kind === 'output') {
       this.appendOutput(`[${debug.category ?? 'console'}] ${debug.output ?? ''}`);
+      return;
     } else if (debug.kind === 'adapter_diagnostic') {
       this.appendOutput(`[adapter] ${debug.message ?? ''}`);
+      return;
     } else if (debug.kind === 'error') {
       this.appendOutput(`[debug error] ${debug.message ?? 'Unknown adapter error'}`);
+      return;
     } else if (debug.kind === 'breakpoint_changed' && debug.breakpoint) {
       const items = this.breakpoints.get(debug.source ?? '') ?? [];
       const changed = debug.breakpoint;
