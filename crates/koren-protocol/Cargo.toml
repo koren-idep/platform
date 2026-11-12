@@ -8,6 +8,7 @@ description = "Versioned internal contracts for Koren IDE Platform"
 
 [dependencies]
 serde.workspace = true
+koren-debug = { path = "../koren-debug" }
 
 [dev-dependencies]
 serde_json.workspace = true

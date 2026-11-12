@@ -2,10 +2,15 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use koren_cargo::CargoProvider;
 use koren_commands::{CommandError, CommandRegistry};
 use koren_core::{EventQueue, Platform, PlatformEvent};
+use koren_debug::{
+    BreakpointSpec, DebugAdapterDefinition, DebugAuthorizationDetails, DebugAuthorizer,
+    DebugConfiguration, DebugEvent, DebugManager, DebugRequestType, VariableReference,
+};
 use koren_documents::{DocumentId, DocumentManager};
 use koren_extensions::{
-    CommandContext, CommandEnablement, ExtensionManager, ExtensionState, MenuLocation, SettingKind,
-    SettingValue, ThemeBase, UiDocument, UiElement,
+    CommandContext, CommandEnablement, DebugRequestContribution, ExtensionContributions,
+    ExtensionManager, ExtensionState, MenuLocation, SettingKind, SettingValue, ThemeBase,
+    UiDocument, UiElement,
 };
 use koren_git::GitService;
 use koren_inspections::{
@@ -22,10 +27,11 @@ use koren_lua::{LuaDocumentContext, LuaExtensionRuntime, LuaHostContext, LuaLimi
 use koren_projects::{DiscoveryLimits, ProjectId, ProjectInfo, ProjectManager};
 use koren_protocol::{
     CargoPackageSummary, CargoProjectSummary, CargoTargetSummary, CommandCatalogSummary,
-    DirectoryEntry, DirectoryEntryKind, ErrorCode, ExecutionApprovalSummary, ExtensionCatalog,
-    ExtensionCommandSummary, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary,
-    ExtensionProjectWizardSummary, ExtensionSettingKind, ExtensionSettingSummary,
-    ExtensionSettingValue, ExtensionSummary as ProtocolExtensionSummary, ExtensionThemeSummary,
+    DebugApprovalSummary, DebugConfigurationSummary, DirectoryEntry, DirectoryEntryKind, ErrorCode,
+    ExecutionApprovalSummary, ExtensionCatalog, ExtensionCommandSummary,
+    ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary,
+    ExtensionSettingKind, ExtensionSettingSummary, ExtensionSettingValue,
+    ExtensionSummary as ProtocolExtensionSummary, ExtensionThemeSummary,
     ExtensionToolWindowSummary, ExtensionUiDocument, ExtensionUiElement, GitChangedFile,
     GitRepositorySummary, GitStatusSummary, InspectionCodeAction, InspectionConfigurationSummary,
     InspectionFinding, InspectionProposedTextEdit, InspectionRelatedLocation,
@@ -121,6 +127,10 @@ pub struct DesktopEvent {
     pub exit_code: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_process_group_active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_event: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,6 +304,12 @@ struct DesktopBackend {
     terminals: TerminalManager,
     terminal_approvals: BTreeMap<u64, PendingTerminalApproval>,
     next_terminal_approval_id: u64,
+    debugger: DebugManager,
+    debug_approvals: BTreeMap<u64, PendingDebugApproval>,
+    next_debug_approval_id: u64,
+    debug_extension_profiles: BTreeSet<String>,
+    known_debug_extension_profiles: BTreeSet<String>,
+    known_debug_extension_adapters: BTreeSet<String>,
     extensions: ExtensionManager,
     inspections: InspectionService,
     inspection_profiles: InspectionProfiles,
@@ -321,6 +337,33 @@ struct DesktopBackend {
     next_search_job_id: u64,
     search_service: Option<SearchService>,
     git_events: EventQueue,
+}
+
+struct PendingDebugApproval {
+    configuration_id: String,
+    details: DebugAuthorizationDetails,
+    expires_at: Instant,
+}
+
+struct DebugInspectionRequest {
+    session_id: u64,
+    operation: String,
+    thread_id: Option<i64>,
+    frame_id: Option<i64>,
+    reference: Option<VariableReference>,
+    start: usize,
+    count: usize,
+}
+
+struct ApprovedDebugRequest;
+impl DebugAuthorizer for ApprovedDebugRequest {
+    fn authorize_adapter(&mut self, _adapter: &DebugAdapterDefinition) -> bool {
+        true
+    }
+
+    fn authorize_target(&mut self, _configuration: &DebugConfiguration) -> bool {
+        true
+    }
 }
 
 struct PendingLanguageServer {
@@ -423,6 +466,12 @@ impl DesktopBackend {
             terminals: TerminalManager::default(),
             terminal_approvals: BTreeMap::new(),
             next_terminal_approval_id: 0,
+            debugger: DebugManager::new(),
+            debug_approvals: BTreeMap::new(),
+            next_debug_approval_id: 0,
+            debug_extension_profiles: BTreeSet::new(),
+            known_debug_extension_profiles: BTreeSet::new(),
+            known_debug_extension_adapters: BTreeSet::new(),
             extensions: ExtensionManager::new(),
             inspections: InspectionService::default(),
             inspection_profiles,
@@ -454,6 +503,8 @@ impl DesktopBackend {
     }
 
     fn shutdown(&mut self) {
+        self.debug_approvals.clear();
+        self.debugger.shutdown();
         self.terminal_approvals.clear();
         self.terminals.shutdown();
         for job in self.search_jobs.values() {
@@ -933,6 +984,7 @@ impl DesktopBackend {
                 self.search_jobs.clear();
                 self.search_service = None;
                 self.approvals.invalidate_workspace(&root);
+                self.debug_approvals.clear();
                 self.language_servers
                     .close_workspace(&root)
                     .map_err(lsp_error)?;
@@ -1563,8 +1615,409 @@ impl DesktopBackend {
                     .map_err(terminal_error)?;
                 Ok(ResponseValue::TerminalAction { session_id })
             }
+            RequestMethod::RegisterDebugConfiguration {
+                adapter,
+                configuration,
+            } => {
+                configuration.validate().map_err(debug_error)?;
+                if adapter.id != configuration.adapter_id
+                    || self
+                        .debugger
+                        .adapters()
+                        .iter()
+                        .any(|existing| existing.id == adapter.id)
+                    || self
+                        .debugger
+                        .configurations()
+                        .iter()
+                        .any(|existing| existing.id == configuration.id)
+                {
+                    return Err(invalid(
+                        "debug profile identifiers must be unique and matched",
+                    ));
+                }
+                self.debugger
+                    .register_adapter(adapter)
+                    .map_err(debug_error)?;
+                self.debugger
+                    .register_configuration(configuration)
+                    .map_err(debug_error)?;
+                Ok(ResponseValue::DebugConfigurations(
+                    self.debug_configuration_summaries(),
+                ))
+            }
+            RequestMethod::ListDebugConfigurations => {
+                self.sync_debug_extension_profiles()?;
+                Ok(ResponseValue::DebugConfigurations(
+                    self.debug_configuration_summaries(),
+                ))
+            }
+            RequestMethod::RequestDebugStart { configuration_id } => {
+                self.request_debug_start(configuration_id)
+            }
+            RequestMethod::ApproveDebugStart { approval_id } => {
+                self.approve_debug_start(approval_id)
+            }
+            RequestMethod::DenyDebugStart { approval_id } => {
+                self.debug_approvals
+                    .remove(&approval_id)
+                    .ok_or_else(|| ProtocolError {
+                        code: ErrorCode::NotFound,
+                        message: "debug approval was not found or expired".into(),
+                    })?;
+                Ok(ResponseValue::DebugDenied { approval_id })
+            }
+            RequestMethod::ListDebugSessions => {
+                Ok(ResponseValue::DebugSessions(self.debugger.sessions()))
+            }
+            RequestMethod::DebugAction {
+                session_id,
+                action,
+                thread_id,
+            } => self.debug_action(session_id, &action, thread_id),
+            RequestMethod::DebugInspect {
+                session_id,
+                operation,
+                thread_id,
+                frame_id,
+                reference,
+                start,
+                count,
+            } => self.debug_inspect(DebugInspectionRequest {
+                session_id,
+                operation,
+                thread_id,
+                frame_id,
+                reference,
+                start,
+                count,
+            }),
+            RequestMethod::SetDebugBreakpoints {
+                source,
+                breakpoints,
+            } => self.set_debug_breakpoints(&source, breakpoints),
+            RequestMethod::StopDebugSession { session_id } => {
+                self.debugger
+                    .session(session_id)
+                    .and_then(|session| session.stop())
+                    .map_err(debug_error)?;
+                Ok(ResponseValue::DebugRequestAccepted {
+                    session_id,
+                    request_id: 0,
+                })
+            }
             _ => Err(invalid("operation is not supported by Koren Code Editor")),
         }
+    }
+
+    fn debug_configuration_summaries(&self) -> Vec<DebugConfigurationSummary> {
+        let adapters = self
+            .debugger
+            .adapters()
+            .into_iter()
+            .map(|adapter| (adapter.id.clone(), adapter))
+            .collect::<BTreeMap<_, _>>();
+        self.debugger
+            .configurations()
+            .into_iter()
+            .filter(|configuration| {
+                !self
+                    .known_debug_extension_profiles
+                    .contains(&configuration.id)
+                    || self.debug_extension_profiles.contains(&configuration.id)
+            })
+            .filter_map(|configuration| {
+                let adapter = adapters.get(&configuration.adapter_id)?;
+                Some(DebugConfigurationSummary {
+                    id: configuration.id,
+                    name: configuration.name,
+                    adapter_id: configuration.adapter_id,
+                    adapter_name: adapter.name.clone(),
+                    request: configuration.request,
+                    program: configuration
+                        .program
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    process_id: configuration.process_id,
+                })
+            })
+            .collect()
+    }
+
+    fn request_debug_start(
+        &mut self,
+        configuration_id: String,
+    ) -> Result<ResponseValue, ProtocolError> {
+        self.sync_debug_extension_profiles()?;
+        if self
+            .known_debug_extension_profiles
+            .contains(&configuration_id)
+            && !self.debug_extension_profiles.contains(&configuration_id)
+        {
+            return Err(ProtocolError {
+                code: ErrorCode::NotFound,
+                message: "the declaring extension is not active".into(),
+            });
+        }
+        self.expire_debug_approvals();
+        if self.debug_approvals.len() >= 16 {
+            return Err(invalid("too many pending debug approvals"));
+        }
+        let details = self
+            .debugger
+            .authorization_details(&configuration_id)
+            .map_err(debug_error)?;
+        self.next_debug_approval_id = self
+            .next_debug_approval_id
+            .checked_add(1)
+            .ok_or_else(|| invalid("debug approval identifiers exhausted"))?;
+        let approval_id = self.next_debug_approval_id;
+        let expires_at = Instant::now() + Duration::from_secs(120);
+        self.debug_approvals.insert(
+            approval_id,
+            PendingDebugApproval {
+                configuration_id,
+                details: details.clone(),
+                expires_at,
+            },
+        );
+        Ok(ResponseValue::DebugApprovalRequired(
+            debug_approval_summary(
+                approval_id,
+                &details.adapter,
+                &details.configuration,
+                expires_at,
+            ),
+        ))
+    }
+
+    fn approve_debug_start(&mut self, approval_id: u64) -> Result<ResponseValue, ProtocolError> {
+        self.expire_debug_approvals();
+        let pending = self
+            .debug_approvals
+            .remove(&approval_id)
+            .ok_or_else(|| ProtocolError {
+                code: ErrorCode::NotFound,
+                message: "debug approval was not found or expired".into(),
+            })?;
+        self.sync_debug_extension_profiles()?;
+        if self
+            .known_debug_extension_profiles
+            .contains(&pending.configuration_id)
+            && !self
+                .debug_extension_profiles
+                .contains(&pending.configuration_id)
+        {
+            return Err(ProtocolError {
+                code: ErrorCode::Conflict,
+                message: "the extension that provided this debug profile is no longer active"
+                    .into(),
+            });
+        }
+        let current_details = self
+            .debugger
+            .authorization_details(&pending.configuration_id)
+            .map_err(debug_error)?;
+        if current_details != pending.details {
+            return Err(ProtocolError {
+                code: ErrorCode::Conflict,
+                message: "the debug configuration changed after approval was requested".into(),
+            });
+        }
+        let mut authorizer = ApprovedDebugRequest;
+        let session = self
+            .debugger
+            .start_session(&pending.configuration_id, &mut authorizer)
+            .map_err(debug_error)?;
+        Ok(ResponseValue::DebugSessionStarted(session))
+    }
+
+    fn expire_debug_approvals(&mut self) {
+        let now = Instant::now();
+        self.debug_approvals
+            .retain(|_, approval| approval.expires_at > now);
+    }
+
+    fn sync_debug_extension_profiles(&mut self) -> Result<(), ProtocolError> {
+        self.ensure_extensions_discovered()?;
+        for id in &self.known_debug_extension_profiles {
+            self.debugger
+                .unregister_configuration(id)
+                .map_err(debug_error)?;
+        }
+        for id in &self.known_debug_extension_adapters {
+            self.debugger.unregister_adapter(id).map_err(debug_error)?;
+        }
+        let workspace = self.workspace.root().ok().map(Path::to_path_buf);
+        if workspace.is_none() {
+            self.debug_extension_profiles.clear();
+            return Ok(());
+        }
+        let mut active_profiles = BTreeSet::new();
+        let mut contributions = Vec::<(String, ExtensionContributions)>::new();
+        for extension in self.extensions.list() {
+            if extension.state == ExtensionState::Active {
+                if let Ok(items) = self.extensions.contributions(&extension.id) {
+                    contributions.push((extension.id, items.clone()));
+                }
+            }
+        }
+        for (owner, items) in contributions {
+            let adapter_ids = items
+                .debug_adapters
+                .iter()
+                .map(|adapter| (adapter.id.clone(), qualify_debug_id(&owner, &adapter.id)))
+                .collect::<BTreeMap<_, _>>();
+            for adapter in &items.debug_adapters {
+                let qualified_id = qualify_debug_id(&owner, &adapter.id);
+                let working_directory =
+                    resolve_workspace_template(&adapter.working_directory, workspace.as_deref())?;
+                let adapter_is_registered = self
+                    .debugger
+                    .adapters()
+                    .iter()
+                    .any(|registered| registered.id == qualified_id);
+                if adapter_is_registered
+                    && !self.known_debug_extension_adapters.contains(&qualified_id)
+                {
+                    return Err(invalid(
+                        "extension debug adapter identifier conflicts with an existing adapter",
+                    ));
+                }
+                if !adapter_is_registered {
+                    self.debugger
+                        .register_adapter(DebugAdapterDefinition {
+                            id: qualified_id.clone(),
+                            name: adapter.name.clone(),
+                            command: adapter.command.clone(),
+                            arguments: adapter.arguments.clone(),
+                            working_directory,
+                            environment: adapter.environment.clone(),
+                        })
+                        .map_err(debug_error)?;
+                    self.known_debug_extension_adapters
+                        .insert(qualified_id.clone());
+                }
+            }
+            for profile in &items.debug_configurations {
+                let id = qualify_debug_id(&owner, &profile.id);
+                active_profiles.insert(id.clone());
+                self.known_debug_extension_profiles.insert(id.clone());
+                let adapter_id = adapter_ids.get(&profile.adapter_id).ok_or_else(|| {
+                    invalid("active debug profile references an unavailable adapter contribution")
+                })?;
+                let program = profile
+                    .program
+                    .as_deref()
+                    .map(|path| resolve_workspace_template(path, workspace.as_deref()))
+                    .transpose()?;
+                let configuration = DebugConfiguration {
+                    id,
+                    name: profile.name.clone(),
+                    adapter_id: adapter_id.clone(),
+                    request: match profile.request {
+                        DebugRequestContribution::Launch => DebugRequestType::Launch,
+                        DebugRequestContribution::Attach => DebugRequestType::Attach,
+                    },
+                    program,
+                    process_id: profile.process_id,
+                    arguments: profile.arguments.clone(),
+                    working_directory: resolve_workspace_template(
+                        &profile.working_directory,
+                        workspace.as_deref(),
+                    )?,
+                    environment: profile.environment.clone(),
+                    adapter_settings: profile.adapter_settings.clone(),
+                    stop_on_entry: profile.stop_on_entry,
+                };
+                self.debugger
+                    .register_configuration(configuration)
+                    .map_err(debug_error)?;
+                self.known_debug_extension_profiles
+                    .insert(qualify_debug_id(&owner, &profile.id));
+            }
+        }
+        self.debug_extension_profiles = active_profiles;
+        Ok(())
+    }
+
+    fn debug_action(
+        &self,
+        session_id: u64,
+        action: &str,
+        thread_id: Option<i64>,
+    ) -> Result<ResponseValue, ProtocolError> {
+        let session = self.debugger.session(session_id).map_err(debug_error)?;
+        let request_id = match action {
+            "continue" => session.continue_execution(),
+            "pause" => session.pause(required_thread_id(thread_id)?),
+            "step_over" => session.step_over(required_thread_id(thread_id)?),
+            "step_into" => session.step_into(required_thread_id(thread_id)?),
+            "step_out" => session.step_out(required_thread_id(thread_id)?),
+            _ => return Err(invalid("unsupported debug action")),
+        }
+        .map_err(debug_error)?;
+        Ok(ResponseValue::DebugRequestAccepted {
+            session_id,
+            request_id,
+        })
+    }
+
+    fn debug_inspect(
+        &self,
+        request: DebugInspectionRequest,
+    ) -> Result<ResponseValue, ProtocolError> {
+        let session = self
+            .debugger
+            .session(request.session_id)
+            .map_err(debug_error)?;
+        let request_id = match request.operation.as_str() {
+            "threads" => session.threads(),
+            "stack_trace" => session.stack_trace(
+                required_thread_id(request.thread_id)?,
+                request.start,
+                request.count,
+            ),
+            "scopes" => session.scopes(
+                request
+                    .frame_id
+                    .ok_or_else(|| invalid("frame_id is required"))?,
+            ),
+            "variables" => session.variables(
+                request
+                    .reference
+                    .ok_or_else(|| invalid("variable reference is required"))?,
+                None,
+                request.start,
+                request.count,
+            ),
+            _ => return Err(invalid("unsupported debug inspection request")),
+        }
+        .map_err(debug_error)?;
+        Ok(ResponseValue::DebugRequestAccepted {
+            session_id: request.session_id,
+            request_id,
+        })
+    }
+
+    fn set_debug_breakpoints(
+        &mut self,
+        source: &str,
+        breakpoints: Vec<BreakpointSpec>,
+    ) -> Result<ResponseValue, ProtocolError> {
+        let source = PathBuf::from(source);
+        if !source.is_absolute() {
+            return Err(invalid("debug breakpoint source must be absolute"));
+        }
+        let root = self.workspace.root().map_err(workspace_error)?;
+        if !source.starts_with(root) {
+            return Err(invalid(
+                "debug breakpoint source is outside the active workspace",
+            ));
+        }
+        self.debugger
+            .set_source_breakpoints(&source, breakpoints)
+            .map(ResponseValue::DebugBreakpoints)
+            .map_err(debug_error)
     }
 
     fn request_terminal_start(&mut self) -> Result<ResponseValue, ProtocolError> {
@@ -3122,7 +3575,17 @@ impl DesktopBackend {
 
     fn drain_events_for_subscribers(&mut self, has_subscribers: bool) -> Vec<DesktopEvent> {
         self.expire_terminal_approvals();
+        self.expire_debug_approvals();
         let mut events = Vec::new();
+        events.extend(self.debugger.drain_events().into_iter().map(|event| {
+            let session_id = debug_event_session_id(&event);
+            DesktopEvent {
+                kind: "debug_event".into(),
+                debug_id: Some(session_id),
+                debug_event: Some(serde_json::to_value(event).unwrap_or(serde_json::Value::Null)),
+                ..empty_event()
+            }
+        }));
         for event in self.terminals.drain_events(has_subscribers) {
             match event {
                 TerminalEvent::Output {
@@ -3959,6 +4422,8 @@ fn empty_event() -> DesktopEvent {
         terminal_state: None,
         exit_code: None,
         terminal_process_group_active: None,
+        debug_id: None,
+        debug_event: None,
         document_id: None,
         project_id: None,
         run_id: None,
@@ -4018,7 +4483,7 @@ fn terminal_approval_summary(
 }
 
 fn terminal_error(error: koren_terminal::TerminalError) -> ProtocolError {
-    let code = match error {
+    let code = match &error {
         koren_terminal::TerminalError::NotFound => ErrorCode::NotFound,
         koren_terminal::TerminalError::InvalidState(_)
         | koren_terminal::TerminalError::ActiveSession => ErrorCode::InvalidState,
@@ -4030,6 +4495,93 @@ fn terminal_error(error: koren_terminal::TerminalError) -> ProtocolError {
     ProtocolError {
         code,
         message: error.to_string(),
+    }
+}
+
+fn debug_error(error: koren_debug::DebugError) -> ProtocolError {
+    let code = match error {
+        koren_debug::DebugError::NotFound => ErrorCode::NotFound,
+        koren_debug::DebugError::AuthorizationDenied => ErrorCode::Unauthorized,
+        koren_debug::DebugError::InvalidState(_) => ErrorCode::InvalidState,
+        koren_debug::DebugError::Backpressure => ErrorCode::Busy,
+        koren_debug::DebugError::InvalidConfiguration(_)
+        | koren_debug::DebugError::Unsupported(_)
+        | koren_debug::DebugError::StaleVariableReference => ErrorCode::InvalidRequest,
+        koren_debug::DebugError::Transport(_) => ErrorCode::Internal,
+    };
+    ProtocolError {
+        code,
+        message: error.to_string(),
+    }
+}
+
+fn required_thread_id(thread_id: Option<i64>) -> Result<i64, ProtocolError> {
+    thread_id.ok_or_else(|| invalid("thread_id is required"))
+}
+
+fn qualify_debug_id(owner: &str, local_id: &str) -> String {
+    if local_id.starts_with(&format!("{owner}.")) {
+        local_id.to_owned()
+    } else {
+        format!("{owner}.{local_id}")
+    }
+}
+
+fn resolve_workspace_template(
+    value: &str,
+    workspace: Option<&Path>,
+) -> Result<PathBuf, ProtocolError> {
+    if !value.contains("${workspaceFolder}") {
+        return Ok(PathBuf::from(value));
+    }
+    let root = workspace.ok_or_else(|| invalid("open a workspace to use this debug profile"))?;
+    Ok(PathBuf::from(
+        value.replace("${workspaceFolder}", &root.to_string_lossy()),
+    ))
+}
+
+fn debug_event_session_id(event: &DebugEvent) -> u64 {
+    match event {
+        DebugEvent::StateChanged { session_id, .. }
+        | DebugEvent::Response { session_id, .. }
+        | DebugEvent::Output { session_id, .. }
+        | DebugEvent::AdapterDiagnostic { session_id, .. }
+        | DebugEvent::BreakpointChanged { session_id, .. }
+        | DebugEvent::AdapterEvent { session_id, .. }
+        | DebugEvent::Error { session_id, .. }
+        | DebugEvent::Closed { session_id } => *session_id,
+    }
+}
+
+fn debug_approval_summary(
+    approval_id: u64,
+    adapter: &DebugAdapterDefinition,
+    configuration: &DebugConfiguration,
+    expires_at: Instant,
+) -> DebugApprovalSummary {
+    DebugApprovalSummary {
+        approval_id,
+        adapter_name: adapter.name.clone(),
+        adapter_command: adapter.command.clone(),
+        adapter_arguments: adapter.arguments.clone(),
+        adapter_working_directory: adapter.working_directory.to_string_lossy().into_owned(),
+        adapter_environment_keys: adapter.environment.keys().cloned().collect(),
+        request: configuration.request,
+        program: configuration
+            .program
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        process_id: configuration.process_id,
+        arguments: configuration.arguments.clone(),
+        working_directory: configuration
+            .working_directory
+            .to_string_lossy()
+            .into_owned(),
+        environment_keys: configuration.environment.keys().cloned().collect(),
+        expires_in_ms: expires_at
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
     }
 }
 
@@ -4794,6 +5346,149 @@ mod tests {
         ));
         assert!(
             matches!(backend.method(RequestMethod::ListTerminalSessions).unwrap(), ResponseValue::TerminalSessions(sessions) if sessions.is_empty())
+        );
+        backend.shutdown();
+    }
+
+    #[test]
+    fn debug_configuration_is_lazy_and_denial_never_starts_an_adapter() {
+        let workspace = Temp::new();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: workspace.0.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        let adapter_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/koren-debug/tests/fake_adapter.py");
+        let mut environment = BTreeMap::new();
+        environment.insert("DEBUG_SECRET".into(), "never-show-this".into());
+        backend
+            .method(RequestMethod::RegisterDebugConfiguration {
+                adapter: DebugAdapterDefinition {
+                    id: "fake-debug".into(),
+                    name: "Fake adapter".into(),
+                    command: if cfg!(windows) { "python" } else { "python3" }.into(),
+                    arguments: vec![adapter_script.to_string_lossy().into_owned()],
+                    working_directory: workspace.0.clone(),
+                    environment: environment.clone(),
+                },
+                configuration: DebugConfiguration {
+                    id: "fake-debug.launch".into(),
+                    name: "Launch fixture".into(),
+                    adapter_id: "fake-debug".into(),
+                    request: DebugRequestType::Launch,
+                    program: Some(workspace.0.join("fixture")),
+                    process_id: None,
+                    arguments: Vec::new(),
+                    working_directory: workspace.0.clone(),
+                    environment,
+                    adapter_settings: serde_json::Map::new(),
+                    stop_on_entry: true,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            backend.method(RequestMethod::ListDebugSessions).unwrap(),
+            ResponseValue::DebugSessions(sessions) if sessions.is_empty()
+        ));
+        let approval = match backend
+            .method(RequestMethod::RequestDebugStart {
+                configuration_id: "fake-debug.launch".into(),
+            })
+            .unwrap()
+        {
+            ResponseValue::DebugApprovalRequired(approval) => approval,
+            other => panic!("unexpected response {other:?}"),
+        };
+        let rendered = serde_json::to_string(&approval).unwrap();
+        assert!(rendered.contains("DEBUG_SECRET"));
+        assert!(!rendered.contains("never-show-this"));
+        backend
+            .method(RequestMethod::DenyDebugStart {
+                approval_id: approval.approval_id,
+            })
+            .unwrap();
+        assert!(matches!(
+            backend.method(RequestMethod::ListDebugSessions).unwrap(),
+            ResponseValue::DebugSessions(sessions) if sessions.is_empty()
+        ));
+        backend.shutdown();
+    }
+
+    #[test]
+    fn extension_profile_approval_is_invalidated_when_owner_is_disabled() {
+        let temp = Temp::new();
+        let workspace = temp.0.join("workspace");
+        let extension_root = temp.0.join("extensions");
+        let extension = extension_root.join("org.example.debug");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&extension).unwrap();
+        let adapter_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/koren-debug/tests/fake_adapter.py");
+        fs::write(extension.join("main.lua"), "return {}\n").unwrap();
+        fs::write(
+            extension.join("koren-extension.toml"),
+            format!(
+                "schema_version=1\nid='org.example.debug'\nname='Debug fixture'\npublisher='Koren tests'\nversion='0.1.0'\ndescription='Debug lifecycle test'\nentry_point='main.lua'\napi_version='1.0.0'\ncapabilities=['debug_adapters']\n\n[[debug_adapters]]\nid='fake'\nname='Fake DAP'\ncommand='python3'\narguments=['{}']\nworking_directory='${{workspaceFolder}}'\n\n[[debug_configurations]]\nid='launch'\nname='Launch fixture'\nadapter_id='fake'\nrequest='launch'\nprogram='${{workspaceFolder}}/fixture'\nworking_directory='${{workspaceFolder}}'\n",
+                adapter_script.display()
+            ),
+        )
+        .unwrap();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend.extension_root = Some(extension_root);
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: workspace.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        backend.method(RequestMethod::ListExtensions).unwrap();
+        backend
+            .method(RequestMethod::SetExtensionEnabled {
+                extension_id: "org.example.debug".into(),
+                enabled: true,
+            })
+            .unwrap();
+        backend
+            .method(RequestMethod::ActivateExtension {
+                extension_id: "org.example.debug".into(),
+            })
+            .unwrap();
+        let approval = match backend
+            .method(RequestMethod::RequestDebugStart {
+                configuration_id: "org.example.debug.launch".into(),
+            })
+            .unwrap()
+        {
+            ResponseValue::DebugApprovalRequired(approval) => approval,
+            other => panic!("unexpected response {other:?}"),
+        };
+        backend
+            .method(RequestMethod::SetExtensionEnabled {
+                extension_id: "org.example.debug".into(),
+                enabled: false,
+            })
+            .unwrap();
+        let result = backend.method(RequestMethod::ApproveDebugStart {
+            approval_id: approval.approval_id,
+        });
+        assert!(matches!(
+            result,
+            Err(ProtocolError {
+                code: ErrorCode::Conflict,
+                ..
+            })
+        ));
+        assert!(matches!(
+            backend.method(RequestMethod::ListDebugSessions).unwrap(),
+            ResponseValue::DebugSessions(sessions) if sessions.is_empty()
+        ));
+        assert!(
+            backend
+                .debugger
+                .configurations()
+                .iter()
+                .all(|profile| { profile.id != "org.example.debug.launch" })
         );
         backend.shutdown();
     }

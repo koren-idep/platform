@@ -535,6 +535,71 @@ pub enum RequestMethod {
         /// Whether the user confirmed terminating a live process.
         terminate_active: bool,
     },
+    /// Register a validated, language-neutral DAP adapter and launch configuration.
+    /// Registration does not authorize or start the adapter.
+    RegisterDebugConfiguration {
+        /// Direct local stdio adapter definition.
+        adapter: koren_debug::DebugAdapterDefinition,
+        /// Launch or attach configuration bound to the adapter.
+        configuration: koren_debug::DebugConfiguration,
+    },
+    /// List debugger profiles without exposing environment values.
+    ListDebugConfigurations,
+    /// Create an exact, expiring authorization request for a debug profile.
+    RequestDebugStart {
+        /// Registered profile identifier.
+        configuration_id: String,
+    },
+    /// Approve one exact adapter and target launch/attach request.
+    ApproveDebugStart {
+        /// One-time approval identifier.
+        approval_id: u64,
+    },
+    /// Deny one pending debug start request.
+    DenyDebugStart {
+        /// One-time approval identifier.
+        approval_id: u64,
+    },
+    /// List current debug sessions.
+    ListDebugSessions,
+    /// Request one execution control operation.
+    DebugAction {
+        /// Session identity.
+        session_id: u64,
+        /// `continue`, `pause`, `step_over`, `step_into`, or `step_out`.
+        action: String,
+        /// Thread identity for thread-scoped actions.
+        thread_id: Option<i64>,
+    },
+    /// Request bounded threads, stack, scope, or variable data.
+    DebugInspect {
+        /// Session identity.
+        session_id: u64,
+        /// `threads`, `stack_trace`, `scopes`, or `variables`.
+        operation: String,
+        /// Thread identity for threads or stack traces.
+        thread_id: Option<i64>,
+        /// Frame identity for scope lookup.
+        frame_id: Option<i64>,
+        /// Stop-scoped DAP variable reference.
+        reference: Option<koren_debug::VariableReference>,
+        /// First requested frame or variable offset.
+        start: usize,
+        /// Bounded page size.
+        count: usize,
+    },
+    /// Replace source breakpoints and synchronize active sessions.
+    SetDebugBreakpoints {
+        /// Absolute source path.
+        source: String,
+        /// Complete replacement set for the source.
+        breakpoints: Vec<koren_debug::BreakpointSpec>,
+    },
+    /// Disconnect or terminate a debug session.
+    StopDebugSession {
+        /// Session identity.
+        session_id: u64,
+    },
 }
 
 /// Versioned request envelope for internal consumers.
@@ -1058,6 +1123,78 @@ pub enum ResponseValue {
         /// Terminal session identity.
         session_id: u64,
     },
+    /// A registered debug profile, with environment values omitted.
+    DebugConfigurations(Vec<DebugConfigurationSummary>),
+    /// Debug start approval is required before any adapter process starts.
+    DebugApprovalRequired(DebugApprovalSummary),
+    /// The exact approved profile started a new debug session.
+    DebugSessionStarted(koren_debug::DebugSessionInfo),
+    /// Current debug session snapshots.
+    DebugSessions(Vec<koren_debug::DebugSessionInfo>),
+    /// A bounded DAP request was queued on its session actor.
+    DebugRequestAccepted {
+        /// Session identity.
+        session_id: u64,
+        /// Request identity for asynchronous response correlation.
+        request_id: u64,
+    },
+    /// The complete source breakpoint replacement set.
+    DebugBreakpoints(Vec<koren_debug::SourceBreakpoint>),
+    /// A pending debug start was denied without launching an adapter.
+    DebugDenied {
+        /// Consumed approval identifier.
+        approval_id: u64,
+    },
+}
+
+/// Public debug profile summary without secret environment values.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DebugConfigurationSummary {
+    /// Configuration identity.
+    pub id: String,
+    /// User-visible configuration name.
+    pub name: String,
+    /// Adapter identity.
+    pub adapter_id: String,
+    /// Adapter display name.
+    pub adapter_name: String,
+    /// Launch or attach request type.
+    pub request: koren_debug::DebugRequestType,
+    /// Program path or executable metadata.
+    pub program: Option<String>,
+    /// Attach process identifier, if applicable.
+    pub process_id: Option<u32>,
+}
+
+/// Exact launch details presented before starting an adapter and its target.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DebugApprovalSummary {
+    /// One-time approval identity.
+    pub approval_id: u64,
+    /// Adapter display name.
+    pub adapter_name: String,
+    /// Adapter executable and direct argv.
+    pub adapter_command: String,
+    /// Adapter arguments.
+    pub adapter_arguments: Vec<String>,
+    /// Adapter working directory.
+    pub adapter_working_directory: String,
+    /// Adapter environment variable names.
+    pub adapter_environment_keys: Vec<String>,
+    /// Launch/attach target request.
+    pub request: koren_debug::DebugRequestType,
+    /// Target program path.
+    pub program: Option<String>,
+    /// Target process identifier.
+    pub process_id: Option<u32>,
+    /// Target arguments.
+    pub arguments: Vec<String>,
+    /// Target working directory.
+    pub working_directory: String,
+    /// Target environment variable names.
+    pub environment_keys: Vec<String>,
+    /// Expiration time remaining in milliseconds.
+    pub expires_in_ms: u64,
 }
 
 /// Exact interactive shell details shown to the user before approval.

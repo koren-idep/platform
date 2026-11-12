@@ -1228,6 +1228,7 @@ dependencies = [
  "koren-cargo",
  "koren-commands",
  "koren-core",
+ "koren-debug",
  "koren-documents",
  "koren-extensions",
  "koren-git",
@@ -1279,6 +1280,7 @@ version = "0.1.0"
 dependencies = [
  "semver",
  "serde",
+ "serde_json",
  "toml",
 ]
 
@@ -1349,6 +1351,7 @@ dependencies = [
 name = "koren-protocol"
 version = "0.1.0"
 dependencies = [
+ "koren-debug",
  "serde",
  "serde_json",
 ]

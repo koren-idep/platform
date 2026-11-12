@@ -33,6 +33,7 @@ koren-lsp = { workspace = true }
 koren-git = { workspace = true }
 koren-search = { workspace = true }
 koren-terminal = { workspace = true }
+koren-debug = { workspace = true }
 
 [dev-dependencies]
 git2.workspace = true
