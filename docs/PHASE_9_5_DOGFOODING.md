@@ -8,11 +8,14 @@ Manual WebKitGTK checks completed:
 
 - Opened the Koren repository and browsed its Rust workspace and source tree.
 - Opened a new document, pasted Unicode (`😀` and an em dash) through the system clipboard, saved it, renamed it while its tab was open, edited it again, and verified the final bytes on disk.
+- Ran project search for `gitRepositoryChoices` in the Koren tree; the panel returned 5 matches across 148 files and 9 skipped binary files.
+- Opened Source Control on the rebuilt app, confirmed the root repository appears as `./HEAD`, and saw a clean status in the disposable worktree.
+- Discovered the Cargo workspace and ran `Cargo workspace check` after approving its exact command in the graphical prompt. The first attempt stopped at the documented `tsc: command not found` prerequisite because the fresh worktree had no frontend dependencies. After `npm ci` in that worktree, the approved Cargo task succeeded with exit code 0 in 17.41 s.
 - Opened and approved an integrated shell through the graphical authorization prompt, entered a command, observed streamed output and a successful shell exit. The shell used an isolated temporary home directory.
 - Loaded the bundled Hello and Text Inspection examples, enabled and activated them, and invoked the Hello command through the command palette.
 - Inspected the Git panel and found that a repository at the workspace root could not be selected: its empty relative path collided with the placeholder option. The selector now gives the root repository the explicit relative path `.` and displays its branch. A frontend regression test covers root and nested repositories together.
 
-The real-window session did not cover save conflicts, external edits, diagnostic quick fixes, resize behavior, or the root-repository selection after rebuilding the fix. Those remain unverified interactively. The root path conversion and rendering are covered by the frontend unit test.
+The real-window session did not cover save conflicts, external edits, diagnostic quick fixes, panel resizing, or preference persistence across a desktop restart. Those remain unverified interactively. The root path conversion and rendering are covered by the frontend unit test and the selector was also checked in the rebuilt window.
 
 Automated verification completed after the fix:
 
