@@ -42,6 +42,10 @@ pub enum Capability {
     LanguageServer,
     /// Publish language-neutral diagnostics.
     Diagnostics,
+    /// Register typed namespaced settings.
+    Settings,
+    /// Register safe design-token themes.
+    Themes,
 }
 
 /// Conditions a host may use to decide when to activate an enabled extension.
@@ -336,6 +340,28 @@ pub struct CommandContext {
 pub type CommandCallback =
     Arc<dyn Fn(&CommandContext, &[String]) -> Result<String, String> + Send + Sync + 'static>;
 
+/// Host-evaluated command availability condition.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandEnablement {
+    /// Always enabled.
+    #[default]
+    Always,
+    /// Enabled only while a workspace is open.
+    WorkspaceOpen,
+    /// Enabled only while an editor document is active.
+    ActiveDocument,
+}
+
+/// Optional presentation and availability metadata for an extension command.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandOptions {
+    /// Optional shortcut label in conventional key notation.
+    pub shortcut: Option<String>,
+    /// Host-evaluated condition.
+    pub enablement: CommandEnablement,
+}
+
 /// Typed menu location for a contributed command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -346,6 +372,290 @@ pub enum MenuLocation {
     Navigate,
     /// Document editor context menu.
     EditorContext,
+    /// Project-explorer item context menu.
+    ProjectExplorerContext,
+    /// Command palette (commands are also discoverable through the default palette).
+    CommandPalette,
+}
+
+/// A bounded, declarative document rendered by the host with native editor components.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiDocument {
+    /// Stable document identifier within its owning extension.
+    pub id: String,
+    /// Safe elements in display order.
+    #[serde(default)]
+    pub elements: Vec<UiElement>,
+}
+
+/// Supported safe UI primitives. These values contain no markup, script, or arbitrary style.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UiElement {
+    /// Plain text.
+    Text {
+        /// Stable element identifier.
+        id: String,
+        /// Plain display text.
+        text: String,
+    },
+    /// A section heading.
+    Heading {
+        /// Stable element identifier.
+        id: String,
+        /// Heading text.
+        text: String,
+    },
+    /// A button that invokes an extension-owned command.
+    Button {
+        /// Stable element identifier.
+        id: String,
+        /// Button label.
+        label: String,
+        /// Registered extension-owned command.
+        command_id: String,
+    },
+    /// A simple list.
+    List {
+        /// Stable element identifier.
+        id: String,
+        /// Plain list items.
+        items: Vec<String>,
+    },
+    /// A two-column table.
+    Table {
+        /// Stable element identifier.
+        id: String,
+        /// Table rows.
+        rows: Vec<[String; 2]>,
+    },
+    /// A bounded text input for generic extension forms.
+    Input {
+        /// Stable element identifier.
+        id: String,
+        /// Field label.
+        label: String,
+        /// Current default value.
+        value: String,
+        /// Whether the user must provide a value.
+        required: bool,
+        /// Maximum byte length.
+        max_length: usize,
+    },
+    /// A fixed-option select control.
+    Select {
+        /// Stable element identifier.
+        id: String,
+        /// Field label.
+        label: String,
+        /// Available options.
+        options: Vec<String>,
+        /// Selected default.
+        value: String,
+    },
+    /// A boolean form control.
+    Checkbox {
+        /// Stable element identifier.
+        id: String,
+        /// Field label.
+        label: String,
+        /// Default state.
+        checked: bool,
+    },
+    /// A status indicator.
+    Status {
+        /// Stable element identifier.
+        id: String,
+        /// Status label.
+        label: String,
+        /// Semantic display tone.
+        tone: StatusTone,
+    },
+}
+
+/// Restrained semantic status colors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusTone {
+    /// Neutral information.
+    Neutral,
+    /// Successful state.
+    Success,
+    /// Caution state.
+    Warning,
+    /// Error state.
+    Error,
+}
+
+/// A user-openable extension panel. Not shown until the user opens it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolWindowContribution {
+    /// Owner-qualified stable identifier.
+    pub id: String,
+    /// User-facing title.
+    pub title: String,
+    /// Initial safe view.
+    pub initial_view: UiDocument,
+}
+
+/// Namespaced setting schema.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingContribution {
+    /// Fully qualified setting key.
+    pub id: String,
+    /// User-facing label.
+    pub title: String,
+    /// Optional help text.
+    pub description: String,
+    /// Type and default value.
+    pub kind: SettingKind,
+}
+
+/// Supported setting types and validated defaults.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SettingKind {
+    /// Boolean toggle.
+    Boolean {
+        /// Default value.
+        default: bool,
+    },
+    /// Bounded integer value.
+    Integer {
+        /// Default value.
+        default: i64,
+        /// Inclusive minimum.
+        min: i64,
+        /// Inclusive maximum.
+        max: i64,
+    },
+    /// Bounded plain-text value.
+    Text {
+        /// Default value.
+        default: String,
+        /// Maximum byte length.
+        max_length: usize,
+    },
+    /// One of a fixed set of choices.
+    Choice {
+        /// Default option.
+        default: String,
+        /// Allowed options.
+        options: Vec<String>,
+    },
+}
+
+/// A typed setting value.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SettingValue {
+    /// Boolean value.
+    Boolean(bool),
+    /// Integer value.
+    Integer(i64),
+    /// Plain-text value.
+    Text(String),
+}
+
+/// Approved semantic design tokens that extensions may override within their own theme.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesignToken {
+    /// Main application background.
+    Background,
+    /// Panel background.
+    Panel,
+    /// Raised surface background.
+    Raised,
+    /// Main text color.
+    Text,
+    /// Muted text color.
+    Muted,
+    /// Border color.
+    Border,
+    /// Accent color.
+    Accent,
+    /// Selection background.
+    Selection,
+}
+
+/// Safe theme definition using existing editor tokens only.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemeContribution {
+    /// Owner-qualified stable identifier.
+    pub id: String,
+    /// User-facing title.
+    pub title: String,
+    /// Palette used for unspecified tokens.
+    pub base: ThemeBase,
+    /// Safe token overrides.
+    pub tokens: BTreeMap<DesignToken, String>,
+}
+
+/// Base palette used for unspecified tokens.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeBase {
+    /// Dark palette base.
+    Dark,
+    /// Light palette base.
+    Light,
+}
+
+/// Enrichment attached to matching diagnostics without replacing their provider data.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticDetailContribution {
+    /// Owner-qualified stable identifier.
+    pub id: String,
+    /// Optional diagnostic source selector.
+    pub source: Option<String>,
+    /// Optional diagnostic code selector.
+    pub code: Option<String>,
+    /// User-facing detail heading.
+    pub title: String,
+    /// Additional explanation.
+    pub explanation: String,
+    /// Optional extension-owned suggested action.
+    #[serde(default)]
+    pub suggested_command: Option<String>,
+    /// Plain related diagnostic information.
+    #[serde(default)]
+    pub related: Vec<String>,
+}
+
+/// Typed selector and presentation data used when registering diagnostic enrichment.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticDetailDefinition {
+    /// Optional diagnostic source selector.
+    pub source: Option<String>,
+    /// Optional diagnostic code selector.
+    pub code: Option<String>,
+    /// User-facing detail heading.
+    pub title: String,
+    /// Additional explanation.
+    pub explanation: String,
+    /// Optional extension-owned suggested action.
+    pub suggested_command: Option<String>,
+    /// Plain related diagnostic information.
+    pub related: Vec<String>,
+}
+
+/// Typed, reusable project-creation extension point. Host performs authorized I/O on submit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectWizardContribution {
+    /// Owner-qualified stable identifier.
+    pub id: String,
+    /// User-facing title.
+    pub title: String,
+    /// Declarative form content, submitted for host-authorized operations.
+    pub form: UiDocument,
 }
 
 /// A menu item invoking one extension-owned command.
@@ -383,6 +693,16 @@ pub struct ExtensionContributions {
     pub language_servers: Vec<LanguageServerContribution>,
     /// Diagnostic provider declarations.
     pub diagnostic_providers: Vec<DiagnosticProviderContribution>,
+    /// Extension-owned panels.
+    pub tool_windows: Vec<ToolWindowContribution>,
+    /// Namespaced settings schemas.
+    pub settings: Vec<SettingContribution>,
+    /// Safe theme definitions.
+    pub themes: Vec<ThemeContribution>,
+    /// Diagnostic presentation enrichments.
+    pub diagnostic_details: Vec<DiagnosticDetailContribution>,
+    /// Generic future project wizard declarations.
+    pub project_wizards: Vec<ProjectWizardContribution>,
 }
 
 /// A command and its callback registered by an extension.
@@ -392,6 +712,10 @@ pub struct RegisteredCommand {
     pub title: String,
     /// Short command description.
     pub description: String,
+    /// Optional keyboard shortcut.
+    pub shortcut: Option<String>,
+    /// Host-evaluated availability condition.
+    pub enablement: CommandEnablement,
     /// Extension callback.
     pub callback: CommandCallback,
 }
@@ -401,6 +725,8 @@ impl std::fmt::Debug for RegisteredCommand {
         f.debug_struct("RegisteredCommand")
             .field("title", &self.title)
             .field("description", &self.description)
+            .field("shortcut", &self.shortcut)
+            .field("enablement", &self.enablement)
             .finish_non_exhaustive()
     }
 }
@@ -438,13 +764,39 @@ impl<'a> ContributionBuilder<'a> {
         description: impl Into<String>,
         callback: CommandCallback,
     ) -> Result<String, ExtensionError> {
+        self.command_with_options(id, title, description, CommandOptions::default(), callback)
+    }
+
+    /// Registers a command with optional shortcut and host-evaluated availability.
+    ///
+    /// # Errors
+    /// Returns an error when the capability is undeclared or command metadata is invalid.
+    pub fn command_with_options(
+        &mut self,
+        id: &str,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        options: CommandOptions,
+        callback: CommandCallback,
+    ) -> Result<String, ExtensionError> {
         self.require(Capability::Commands)?;
         validate_local_id(id)?;
         let title = title.into();
         let description = description.into();
-        if title.trim().is_empty() || description.trim().is_empty() {
+        if title.trim().is_empty() || description.len() > 512 || description.contains('\0') {
             return Err(ExtensionError::InvalidContribution(
-                "command title and description must not be empty".into(),
+                "command title must not be empty and description must be at most 512 bytes".into(),
+            ));
+        }
+        if options.shortcut.as_ref().is_some_and(|shortcut| {
+            shortcut.trim().is_empty()
+                || shortcut.len() > 48
+                || shortcut.chars().any(char::is_control)
+                || shortcut.split('+').count() < 2
+        }) {
+            return Err(ExtensionError::InvalidContribution(
+                "command shortcut must include a modifier and fit within 48 printable characters"
+                    .into(),
             ));
         }
         let full_id = format!("{}.{}", self.extension_id, id);
@@ -456,6 +808,8 @@ impl<'a> ContributionBuilder<'a> {
                 RegisteredCommand {
                     title,
                     description,
+                    shortcut: options.shortcut,
+                    enablement: options.enablement,
                     callback,
                 },
             )
@@ -514,6 +868,7 @@ impl<'a> ContributionBuilder<'a> {
                 | "document_changed"
                 | "document_saved"
                 | "document_closed"
+                | "settings_changed"
         ) {
             return Err(ExtensionError::InvalidContribution(format!(
                 "unsupported event '{event}'"
@@ -549,6 +904,217 @@ impl<'a> ContributionBuilder<'a> {
         Ok(())
     }
 
+    /// Registers a user-openable panel rendered from bounded safe components.
+    ///
+    /// # Errors
+    /// Returns an error when the capability is undeclared or the panel schema is invalid.
+    pub fn tool_window(
+        &mut self,
+        id: &str,
+        title: impl Into<String>,
+        mut view: UiDocument,
+    ) -> Result<String, ExtensionError> {
+        self.require(Capability::UiContributions)?;
+        validate_local_id(id)?;
+        let title = title.into();
+        validate_text(&title, "tool window title")?;
+        qualify_ui_actions(&mut view, self.extension_id);
+        validate_ui_document(&view, self.extension_id)?;
+        let full_id = format!("{}.{}", self.extension_id, id);
+        ensure_new_id(
+            &self
+                .values
+                .tool_windows
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            &full_id,
+        )?;
+        self.values.tool_windows.push(ToolWindowContribution {
+            id: full_id.clone(),
+            title,
+            initial_view: view,
+        });
+        Ok(full_id)
+    }
+
+    /// Registers a typed, namespaced setting with a validated default.
+    ///
+    /// # Errors
+    /// Returns an error when the capability is undeclared or the setting schema is invalid.
+    pub fn setting(
+        &mut self,
+        id: &str,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        kind: SettingKind,
+    ) -> Result<String, ExtensionError> {
+        self.require(Capability::Settings)?;
+        validate_local_id(id)?;
+        let title = title.into();
+        let description = description.into();
+        validate_text(&title, "setting title")?;
+        if !description.is_empty() && description.len() > 512 {
+            return Err(invalid_contribution(
+                "setting description exceeds 512 bytes",
+            ));
+        }
+        validate_setting_kind(&kind)?;
+        let full_id = format!("{}.{}", self.extension_id, id);
+        ensure_new_id(
+            &self
+                .values
+                .settings
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            &full_id,
+        )?;
+        self.values.settings.push(SettingContribution {
+            id: full_id.clone(),
+            title,
+            description,
+            kind,
+        });
+        Ok(full_id)
+    }
+
+    /// Registers a theme limited to approved design tokens and hexadecimal colors.
+    ///
+    /// # Errors
+    /// Returns an error when the capability is undeclared or a theme token is invalid.
+    pub fn theme(
+        &mut self,
+        id: &str,
+        title: impl Into<String>,
+        base: ThemeBase,
+        tokens: BTreeMap<DesignToken, String>,
+    ) -> Result<String, ExtensionError> {
+        self.require(Capability::Themes)?;
+        validate_local_id(id)?;
+        let title = title.into();
+        validate_text(&title, "theme title")?;
+        if tokens.len() > 8 || tokens.values().any(|color| !valid_hex_color(color)) {
+            return Err(invalid_contribution(
+                "theme colors must be #RRGGBB and use no more than eight design tokens",
+            ));
+        }
+        let full_id = format!("{}.{}", self.extension_id, id);
+        ensure_new_id(
+            &self
+                .values
+                .themes
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            &full_id,
+        )?;
+        self.values.themes.push(ThemeContribution {
+            id: full_id.clone(),
+            title,
+            base,
+            tokens,
+        });
+        Ok(full_id)
+    }
+
+    /// Registers a non-destructive diagnostic explanation or suggested command.
+    ///
+    /// # Errors
+    /// Returns an error when the capability is undeclared or the detail/action is invalid.
+    pub fn diagnostic_detail(
+        &mut self,
+        id: &str,
+        definition: DiagnosticDetailDefinition,
+    ) -> Result<String, ExtensionError> {
+        self.require(Capability::Diagnostics)?;
+        validate_local_id(id)?;
+        let DiagnosticDetailDefinition {
+            source,
+            code,
+            title,
+            explanation,
+            suggested_command,
+            related,
+        } = definition;
+        validate_text(&title, "diagnostic detail title")?;
+        validate_text(&explanation, "diagnostic explanation")?;
+        if source.as_ref().is_some_and(|value| value.len() > 128)
+            || code.as_ref().is_some_and(|value| value.len() > 128)
+            || related.len() > 16
+            || related.iter().any(|item| item.len() > 512)
+        {
+            return Err(invalid_contribution(
+                "diagnostic detail exceeds size limits",
+            ));
+        }
+        let full_id = format!("{}.{}", self.extension_id, id);
+        if let Some(command) = &suggested_command {
+            let qualified = qualify_id(self.extension_id, command);
+            if !self.values.commands.contains_key(&qualified) {
+                return Err(invalid_contribution(
+                    "diagnostic detail references an unregistered command",
+                ));
+            }
+        }
+        ensure_new_id(
+            &self
+                .values
+                .diagnostic_details
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            &full_id,
+        )?;
+        self.values
+            .diagnostic_details
+            .push(DiagnosticDetailContribution {
+                id: full_id.clone(),
+                source,
+                code,
+                title,
+                explanation,
+                suggested_command: suggested_command
+                    .map(|value| qualify_id(self.extension_id, &value)),
+                related,
+            });
+        Ok(full_id)
+    }
+
+    /// Declares a generic project-creation form. Submission must be handled by authorized host APIs.
+    ///
+    /// # Errors
+    /// Returns an error when the UI capability is undeclared or the form is invalid.
+    pub fn project_wizard(
+        &mut self,
+        id: &str,
+        title: impl Into<String>,
+        mut form: UiDocument,
+    ) -> Result<String, ExtensionError> {
+        self.require(Capability::UiContributions)?;
+        validate_local_id(id)?;
+        let title = title.into();
+        validate_text(&title, "project wizard title")?;
+        qualify_ui_actions(&mut form, self.extension_id);
+        validate_ui_document(&form, self.extension_id)?;
+        let full_id = format!("{}.{}", self.extension_id, id);
+        ensure_new_id(
+            &self
+                .values
+                .project_wizards
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            &full_id,
+        )?;
+        self.values.project_wizards.push(ProjectWizardContribution {
+            id: full_id.clone(),
+            title,
+            form,
+        });
+        Ok(full_id)
+    }
+
     fn require(&self, capability: Capability) -> Result<(), ExtensionError> {
         if self.capabilities.contains(&capability) {
             Ok(())
@@ -564,17 +1130,170 @@ impl<'a> ContributionBuilder<'a> {
     }
 }
 
+fn invalid_contribution(message: &str) -> ExtensionError {
+    ExtensionError::InvalidContribution(message.into())
+}
+fn validate_text(value: &str, label: &str) -> Result<(), ExtensionError> {
+    if value.trim().is_empty() || value.len() > 512 || value.contains('\0') {
+        Err(invalid_contribution(&format!(
+            "{label} is empty or exceeds 512 bytes"
+        )))
+    } else {
+        Ok(())
+    }
+}
+fn qualify_id(owner: &str, id: &str) -> String {
+    if id.starts_with(&format!("{owner}.")) {
+        id.to_owned()
+    } else {
+        format!("{owner}.{id}")
+    }
+}
+fn qualify_ui_actions(view: &mut UiDocument, owner: &str) {
+    for element in &mut view.elements {
+        if let UiElement::Button { command_id, .. } = element {
+            *command_id = qualify_id(owner, command_id);
+        }
+    }
+}
+fn ensure_new_id(existing: &[&str], id: &str) -> Result<(), ExtensionError> {
+    if existing.contains(&id) {
+        Err(ExtensionError::DuplicateContribution(id.into()))
+    } else {
+        Ok(())
+    }
+}
+fn valid_hex_color(value: &str) -> bool {
+    value.len() == 7
+        && value.starts_with('#')
+        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+fn validate_setting_kind(kind: &SettingKind) -> Result<(), ExtensionError> {
+    match kind {
+        SettingKind::Integer { default, min, max }
+            if min > max || default < min || default > max =>
+        {
+            return Err(invalid_contribution(
+                "integer setting default must be within a valid range",
+            ));
+        }
+        SettingKind::Text {
+            default,
+            max_length,
+        } if *max_length > 4096 || default.len() > *max_length => {
+            return Err(invalid_contribution(
+                "text setting default exceeds its length limit",
+            ));
+        }
+        SettingKind::Choice { default, options }
+            if options.is_empty()
+                || options.len() > 64
+                || !options.contains(default)
+                || options
+                    .iter()
+                    .any(|item| item.trim().is_empty() || item.len() > 128) =>
+        {
+            return Err(invalid_contribution(
+                "choice setting needs a valid default and 1 to 64 options",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+fn validate_ui_document(view: &UiDocument, owner: &str) -> Result<(), ExtensionError> {
+    validate_local_id(&view.id)?;
+    if view.elements.len() > 128 {
+        return Err(invalid_contribution(
+            "UI document contains more than 128 elements",
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for element in &view.elements {
+        let (id, text) = match element {
+            UiElement::Text { id, text } | UiElement::Heading { id, text } => (id, text.as_str()),
+            UiElement::Button {
+                id,
+                label,
+                command_id,
+            } => {
+                if !command_id.starts_with(&format!("{owner}.")) {
+                    return Err(invalid_contribution(
+                        "UI actions must reference commands owned by their extension",
+                    ));
+                }
+                (id, label.as_str())
+            }
+            UiElement::List { id, items } => {
+                if items.len() > 128 || items.iter().any(|item| item.len() > 1024) {
+                    return Err(invalid_contribution("UI list exceeds size limits"));
+                }
+                (id, "")
+            }
+            UiElement::Table { id, rows } => {
+                if rows.len() > 128 || rows.iter().flatten().any(|item| item.len() > 512) {
+                    return Err(invalid_contribution("UI table exceeds size limits"));
+                }
+                (id, "")
+            }
+            UiElement::Input {
+                id,
+                label,
+                value,
+                required: _,
+                max_length,
+            } => {
+                if *max_length > 4096 || value.len() > *max_length {
+                    return Err(invalid_contribution("UI input exceeds its declared length"));
+                }
+                (id, label.as_str())
+            }
+            UiElement::Select {
+                id,
+                label,
+                options,
+                value,
+            } => {
+                if options.is_empty()
+                    || options.len() > 64
+                    || !options.contains(value)
+                    || options.iter().any(|item| item.len() > 128)
+                {
+                    return Err(invalid_contribution(
+                        "UI select needs a valid default and up to 64 options",
+                    ));
+                }
+                (id, label.as_str())
+            }
+            UiElement::Checkbox { id, label, .. } | UiElement::Status { id, label, .. } => {
+                (id, label.as_str())
+            }
+        };
+        validate_local_id(id)?;
+        if !ids.insert(id) {
+            return Err(ExtensionError::DuplicateContribution(id.clone()));
+        }
+        if text.len() > 1024 || text.contains('\0') {
+            return Err(invalid_contribution("UI text exceeds 1024 bytes"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_local_id(id: &str) -> Result<(), ExtensionError> {
     if id.is_empty()
         || id.split('.').any(|part| {
             part.is_empty()
-                || !part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                || !part.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'-'
+                        || byte == b'_'
+                })
         })
     {
         return Err(ExtensionError::InvalidContribution(format!(
-            "'{id}' is not a valid lower-case command identifier"
+            "'{id}' is not a valid lower-case local identifier"
         )));
     }
     Ok(())
@@ -607,19 +1326,300 @@ struct ExtensionRecord {
     enabled: bool,
     state: ExtensionState,
     error: Option<String>,
-    contributions: ExtensionContributions,
+}
+
+/// Manager-local contribution store. Every record is indexed by its owner and removed as one
+/// lifecycle operation; it deliberately has no process-global mutable state.
+#[derive(Default)]
+pub struct ContributionRegistry {
+    owners: BTreeMap<String, ExtensionContributions>,
+}
+
+impl ContributionRegistry {
+    /// Creates an empty owner-indexed contribution registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Atomically registers all contributions for one extension after checking ownership and IDs.
+    ///
+    /// # Errors
+    /// Returns an error when ownership, identifiers, references, or schemas are invalid.
+    pub fn register(
+        &mut self,
+        owner: &str,
+        contributions: ExtensionContributions,
+    ) -> Result<(), ExtensionError> {
+        validate_identifier(owner).map_err(ExtensionError::InvalidContribution)?;
+        if self.owners.contains_key(owner) {
+            return Err(ExtensionError::DuplicateContribution(format!(
+                "{owner} already has registered contributions"
+            )));
+        }
+        if contribution_count(&contributions) > MAX_OWNER_CONTRIBUTIONS {
+            return Err(invalid_contribution(
+                "an extension may register at most 512 contributions",
+            ));
+        }
+        if contribution_payload_bytes(&contributions) > MAX_OWNER_PAYLOAD_BYTES {
+            return Err(invalid_contribution(
+                "extension contribution payload exceeds 512 KiB",
+            ));
+        }
+        let belongs_to_owner = |id: &str| id.starts_with(&format!("{owner}."));
+        let mut ids = BTreeSet::new();
+        let mut add = |id: &str| -> Result<(), ExtensionError> {
+            if !belongs_to_owner(id) {
+                return Err(invalid_contribution(&format!(
+                    "contribution '{id}' is not owned by '{owner}'"
+                )));
+            }
+            if !ids.insert(id.to_owned()) {
+                return Err(ExtensionError::DuplicateContribution(id.into()));
+            }
+            Ok(())
+        };
+        for id in contributions.commands.keys() {
+            add(id)?;
+        }
+        for item in &contributions.tool_windows {
+            add(&item.id)?;
+            validate_ui_document(&item.initial_view, owner)?;
+            validate_action_commands(&item.initial_view, &contributions.commands)?;
+        }
+        for item in &contributions.settings {
+            add(&item.id)?;
+            validate_setting_kind(&item.kind)?;
+        }
+        for item in &contributions.themes {
+            add(&item.id)?;
+            if item.tokens.len() > 8 || item.tokens.values().any(|color| !valid_hex_color(color)) {
+                return Err(invalid_contribution("invalid theme token color"));
+            }
+        }
+        for item in &contributions.diagnostic_details {
+            add(&item.id)?;
+        }
+        for item in &contributions.project_wizards {
+            add(&item.id)?;
+            validate_ui_document(&item.form, owner)?;
+            validate_action_commands(&item.form, &contributions.commands)?;
+        }
+        for item in &contributions.diagnostic_providers {
+            add(&item.id)?;
+        }
+        for menu in &contributions.menus {
+            if !belongs_to_owner(&menu.command_id)
+                || !contributions.commands.contains_key(&menu.command_id)
+            {
+                return Err(invalid_contribution(
+                    "menu contribution references a command not owned by its extension",
+                ));
+            }
+        }
+        for detail in &contributions.diagnostic_details {
+            if detail.suggested_command.as_ref().is_some_and(|command| {
+                !belongs_to_owner(command) || !contributions.commands.contains_key(command)
+            }) {
+                return Err(invalid_contribution(
+                    "diagnostic detail references an unregistered command",
+                ));
+            }
+        }
+        self.owners.insert(owner.into(), contributions);
+        Ok(())
+    }
+
+    /// Removes and returns every contribution owned by an extension.
+    pub fn unregister(&mut self, owner: &str) -> Option<ExtensionContributions> {
+        self.owners.remove(owner)
+    }
+
+    /// Returns the contribution set for one active owner.
+    #[must_use]
+    pub fn get(&self, owner: &str) -> Option<&ExtensionContributions> {
+        self.owners.get(owner)
+    }
+
+    /// Returns all currently registered extension owners.
+    pub fn owners(&self) -> impl Iterator<Item = &str> {
+        self.owners.keys().map(String::as_str)
+    }
+}
+
+fn validate_action_commands(
+    view: &UiDocument,
+    commands: &BTreeMap<String, RegisteredCommand>,
+) -> Result<(), ExtensionError> {
+    for element in &view.elements {
+        if let UiElement::Button { command_id, .. } = element {
+            if !commands.contains_key(command_id) {
+                return Err(invalid_contribution(&format!(
+                    "UI action references unregistered command '{command_id}'"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+const MAX_OWNER_CONTRIBUTIONS: usize = 512;
+const MAX_OWNER_PAYLOAD_BYTES: usize = 512 * 1024;
+
+fn ui_document_bytes(view: &UiDocument) -> usize {
+    let mut bytes = view.id.len();
+    for element in &view.elements {
+        bytes = bytes.saturating_add(match element {
+            UiElement::Text { id, text } | UiElement::Heading { id, text } => id.len() + text.len(),
+            UiElement::Button {
+                id,
+                label,
+                command_id,
+            } => id.len() + label.len() + command_id.len(),
+            UiElement::List { id, items } => {
+                id.len() + items.iter().map(String::len).sum::<usize>()
+            }
+            UiElement::Table { id, rows } => {
+                id.len() + rows.iter().flatten().map(String::len).sum::<usize>()
+            }
+            UiElement::Input {
+                id, label, value, ..
+            } => id.len() + label.len() + value.len(),
+            UiElement::Select {
+                id,
+                label,
+                options,
+                value,
+            } => {
+                id.len()
+                    + label.len()
+                    + value.len()
+                    + options.iter().map(String::len).sum::<usize>()
+            }
+            UiElement::Checkbox { id, label, .. } | UiElement::Status { id, label, .. } => {
+                id.len() + label.len()
+            }
+        });
+    }
+    bytes
+}
+
+fn contribution_count(items: &ExtensionContributions) -> usize {
+    items.commands.len()
+        + items.menus.len()
+        + items.events.len()
+        + items.languages.len()
+        + items.language_servers.len()
+        + items.diagnostic_providers.len()
+        + items.tool_windows.len()
+        + items.settings.len()
+        + items.themes.len()
+        + items.diagnostic_details.len()
+        + items.project_wizards.len()
+}
+
+fn contribution_payload_bytes(items: &ExtensionContributions) -> usize {
+    let mut bytes = 0usize;
+    for (id, command) in &items.commands {
+        bytes = bytes.saturating_add(
+            id.len()
+                + command.title.len()
+                + command.description.len()
+                + command.shortcut.as_ref().map_or(0, String::len),
+        );
+    }
+    for menu in &items.menus {
+        bytes = bytes.saturating_add(menu.command_id.len() + menu.label.len());
+    }
+    for event in &items.events {
+        bytes = bytes.saturating_add(event.len());
+    }
+    for language in &items.languages {
+        bytes = bytes.saturating_add(
+            language.id.len()
+                + language.name.len()
+                + language.extensions.iter().map(String::len).sum::<usize>(),
+        );
+    }
+    for server in &items.language_servers {
+        bytes = bytes.saturating_add(
+            server.id.len()
+                + server.command.len()
+                + server.arguments.iter().map(String::len).sum::<usize>()
+                + server.languages.iter().map(String::len).sum::<usize>()
+                + server
+                    .file_extensions
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>()
+                + server
+                    .environment
+                    .iter()
+                    .map(|(key, value)| key.len() + value.len())
+                    .sum::<usize>(),
+        );
+    }
+    for provider in &items.diagnostic_providers {
+        bytes = bytes.saturating_add(provider.id.len() + provider.name.len());
+    }
+    for panel in &items.tool_windows {
+        bytes = bytes.saturating_add(
+            panel.id.len() + panel.title.len() + ui_document_bytes(&panel.initial_view),
+        );
+    }
+    for setting in &items.settings {
+        bytes = bytes
+            .saturating_add(setting.id.len() + setting.title.len() + setting.description.len());
+        bytes = bytes.saturating_add(match &setting.kind {
+            SettingKind::Boolean { .. } => 1,
+            SettingKind::Integer { .. } => 24,
+            SettingKind::Text { default, .. } => default.len(),
+            SettingKind::Choice { default, options } => {
+                default.len() + options.iter().map(String::len).sum::<usize>()
+            }
+        });
+    }
+    for theme in &items.themes {
+        bytes = bytes.saturating_add(
+            theme.id.len()
+                + theme.title.len()
+                + theme.tokens.values().map(String::len).sum::<usize>(),
+        );
+    }
+    for detail in &items.diagnostic_details {
+        bytes = bytes.saturating_add(
+            detail.id.len()
+                + detail.source.as_ref().map_or(0, String::len)
+                + detail.code.as_ref().map_or(0, String::len)
+                + detail.title.len()
+                + detail.explanation.len()
+                + detail.suggested_command.as_ref().map_or(0, String::len)
+                + detail.related.iter().map(String::len).sum::<usize>(),
+        );
+    }
+    for wizard in &items.project_wizards {
+        bytes = bytes
+            .saturating_add(wizard.id.len() + wizard.title.len() + ui_document_bytes(&wizard.form));
+    }
+    bytes
 }
 
 /// Manager-local extension registry. It does not load code or communicate with the desktop.
 #[derive(Default)]
 pub struct ExtensionManager {
     extensions: BTreeMap<String, ExtensionRecord>,
+    contributions: ContributionRegistry,
 }
 
 impl std::fmt::Debug for ExtensionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExtensionManager")
             .field("extensions", &self.list())
+            .field(
+                "contribution_owners",
+                &self.contributions.owners().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -712,7 +1712,6 @@ impl ExtensionManager {
                     enabled: false,
                     state: ExtensionState::Disabled,
                     error: None,
-                    contributions: ExtensionContributions::default(),
                 },
             );
         }
@@ -746,7 +1745,6 @@ impl ExtensionManager {
                 enabled: false,
                 state: ExtensionState::Disabled,
                 error: None,
-                contributions: ExtensionContributions::default(),
             },
         );
         Ok(())
@@ -815,16 +1813,25 @@ impl ExtensionManager {
         let manifest = record.manifest.clone();
         let mut staging = ContributionBuilder::new(&manifest);
         let outcome = catch_unwind(AssertUnwindSafe(|| activate(&manifest, &mut staging)));
-        let record = self.record_mut(id)?;
         match outcome {
             Ok(Ok(())) => {
-                record.contributions = staging.values;
+                if let Err(error) = self
+                    .contributions
+                    .register(id, staging.into_contributions())
+                {
+                    let record = self.record_mut(id)?;
+                    record.state = ExtensionState::Failed;
+                    record.error = Some(error.to_string());
+                    return Err(error);
+                }
+                let record = self.record_mut(id)?;
                 record.state = ExtensionState::Active;
                 record.error = None;
                 Ok(())
             }
             Ok(Err(error)) => {
-                record.contributions = ExtensionContributions::default();
+                self.contributions.unregister(id);
+                let record = self.record_mut(id)?;
                 record.state = ExtensionState::Failed;
                 record.error = Some(error.clone());
                 Err(ExtensionError::ActivationFailed {
@@ -834,7 +1841,8 @@ impl ExtensionManager {
             }
             Err(_) => {
                 let error = "activation panicked".to_owned();
-                record.contributions = ExtensionContributions::default();
+                self.contributions.unregister(id);
+                let record = self.record_mut(id)?;
                 record.state = ExtensionState::Failed;
                 record.error = Some(error.clone());
                 Err(ExtensionError::ActivationFailed {
@@ -850,8 +1858,8 @@ impl ExtensionManager {
     /// # Errors
     /// Returns an error when no extension has the requested identifier.
     pub fn deactivate(&mut self, id: &str) -> Result<(), ExtensionError> {
+        self.contributions.unregister(id);
         let record = self.record_mut(id)?;
-        record.contributions = ExtensionContributions::default();
         record.state = if record.enabled {
             ExtensionState::Installed
         } else {
@@ -866,8 +1874,8 @@ impl ExtensionManager {
     /// # Errors
     /// Returns an error when no extension has the requested identifier.
     pub fn disable(&mut self, id: &str) -> Result<(), ExtensionError> {
+        self.contributions.unregister(id);
         let record = self.record_mut(id)?;
-        record.contributions = ExtensionContributions::default();
         record.enabled = false;
         record.state = ExtensionState::Disabled;
         record.error = None;
@@ -886,7 +1894,9 @@ impl ExtensionManager {
         if record.state != ExtensionState::Active {
             return Err(ExtensionError::NotActive(id.into()));
         }
-        Ok(&record.contributions)
+        self.contributions
+            .get(id)
+            .ok_or_else(|| ExtensionError::NotActive(id.into()))
     }
 
     /// Invokes an active extension command with the host's current safe context.
@@ -899,9 +1909,21 @@ impl ExtensionManager {
         context: &CommandContext,
         args: &[String],
     ) -> Result<String, ExtensionError> {
-        for record in self.extensions.values() {
+        for (owner, record) in &self.extensions {
             if record.state == ExtensionState::Active {
-                if let Some(command) = record.contributions.commands.get(id) {
+                if let Some(command) = self
+                    .contributions
+                    .get(owner)
+                    .and_then(|items| items.commands.get(id))
+                {
+                    let enabled = match command.enablement {
+                        CommandEnablement::Always => true,
+                        CommandEnablement::WorkspaceOpen => context.workspace_root.is_some(),
+                        CommandEnablement::ActiveDocument => context.active_document_id.is_some(),
+                    };
+                    if !enabled {
+                        return Err(ExtensionError::CommandDisabled(id.into()));
+                    }
                     return (command.callback)(context, args).map_err(|message| {
                         ExtensionError::CommandFailed {
                             id: id.into(),
@@ -972,6 +1994,8 @@ pub enum ExtensionError {
         /// Callback error summary.
         message: String,
     },
+    /// An extension command's declared availability condition is not met.
+    CommandDisabled(String),
     /// Filesystem discovery failed.
     Io {
         /// Filesystem path involved in discovery.
@@ -1018,6 +2042,9 @@ impl std::fmt::Display for ExtensionError {
             }
             Self::CommandFailed { id, message } => {
                 write!(f, "extension command '{id}' failed: {message}")
+            }
+            Self::CommandDisabled(id) => {
+                write!(f, "extension command '{id}' is currently disabled")
             }
             Self::Io { path, message } => write!(
                 f,
@@ -1171,6 +2198,243 @@ mod tests {
                     Ok(())
                 })
                 .is_err()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn registry_validates_owned_ui_and_removes_all_categories_on_deactivation() {
+        let mut manager = ExtensionManager::new();
+        let dir = temp_dir();
+        fs::write(dir.join("main.lua"), "return {}\n").unwrap();
+        let mut extension = manifest(&[
+            Capability::Commands,
+            Capability::UiContributions,
+            Capability::Settings,
+            Capability::Themes,
+            Capability::Diagnostics,
+        ]);
+        extension.capabilities.extend([
+            Capability::Settings,
+            Capability::Themes,
+            Capability::Diagnostics,
+        ]);
+        manager.register_installed(extension, dir.clone()).unwrap();
+        manager.enable("org.example.hello").unwrap();
+        manager
+            .activate("org.example.hello", |_manifest, builder| {
+                builder
+                    .command(
+                        "refresh",
+                        "Refresh",
+                        "Update developer info",
+                        Arc::new(|_, _| Ok("updated".into())),
+                    )
+                    .map_err(|error| error.to_string())?;
+                builder
+                    .tool_window(
+                        "workspace",
+                        "Workspace Info",
+                        UiDocument {
+                            id: "main".into(),
+                            elements: vec![UiElement::Button {
+                                id: "refresh-action".into(),
+                                label: "Refresh".into(),
+                                command_id: "refresh".into(),
+                            }],
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                builder
+                    .setting(
+                        "enabled",
+                        "Enabled",
+                        "",
+                        SettingKind::Boolean { default: true },
+                    )
+                    .map_err(|error| error.to_string())?;
+                builder
+                    .theme(
+                        "midnight",
+                        "Midnight",
+                        ThemeBase::Dark,
+                        BTreeMap::from([(DesignToken::Accent, "#62a8ff".into())]),
+                    )
+                    .map_err(|error| error.to_string())?;
+                builder
+                    .diagnostic_detail(
+                        "extra-help",
+                        DiagnosticDetailDefinition {
+                            source: None,
+                            code: None,
+                            title: "Extra help".into(),
+                            explanation: "Explanation".into(),
+                            suggested_command: Some("refresh".into()),
+                            related: vec![],
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+        let values = manager.contributions("org.example.hello").unwrap();
+        assert_eq!(values.tool_windows.len(), 1);
+        assert_eq!(values.settings.len(), 1);
+        assert_eq!(values.themes.len(), 1);
+        assert_eq!(values.diagnostic_details.len(), 1);
+        manager.deactivate("org.example.hello").unwrap();
+        assert!(manager.contributions("org.example.hello").is_err());
+        assert!(manager.contributions.owners().next().is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn registry_rejects_cross_owner_ids_and_invalid_safe_views() {
+        let mut registry = ContributionRegistry::new();
+        let mut values = ExtensionContributions::default();
+        values.tool_windows.push(ToolWindowContribution {
+            id: "org.other.panel".into(),
+            title: "Panel".into(),
+            initial_view: UiDocument {
+                id: "main".into(),
+                elements: vec![],
+            },
+        });
+        assert!(matches!(
+            registry.register("org.example.owner", values),
+            Err(ExtensionError::InvalidContribution(_))
+        ));
+        let repeated = ToolWindowContribution {
+            id: "org.example.owner.panel".into(),
+            title: "Panel".into(),
+            initial_view: UiDocument {
+                id: "main".into(),
+                elements: vec![],
+            },
+        };
+        let duplicate_values = ExtensionContributions {
+            tool_windows: vec![repeated.clone(), repeated],
+            ..ExtensionContributions::default()
+        };
+        assert!(matches!(
+            registry.register("org.example.owner", duplicate_values),
+            Err(ExtensionError::DuplicateContribution(_))
+        ));
+        let builder_manifest = manifest(&[Capability::UiContributions, Capability::Commands]);
+        let mut builder = ContributionBuilder::new(&builder_manifest);
+        builder
+            .command("ok", "OK", "Action", Arc::new(|_, _| Ok(String::new())))
+            .unwrap();
+        let invalid = UiDocument {
+            id: "main".into(),
+            elements: vec![UiElement::Button {
+                id: "do-it".into(),
+                label: "Do".into(),
+                command_id: "org.example.hello.missing".into(),
+            }],
+        };
+        let mut values = builder.into_contributions();
+        values.tool_windows.push(ToolWindowContribution {
+            id: "org.example.hello.panel".into(),
+            title: "Panel".into(),
+            initial_view: invalid,
+        });
+        assert!(matches!(
+            registry.register(&builder_manifest.id, values),
+            Err(ExtensionError::InvalidContribution(_))
+        ));
+    }
+
+    #[test]
+    fn registry_bounds_aggregate_contribution_payloads_and_counts() {
+        let mut registry = ContributionRegistry::new();
+        let mut oversized = ExtensionContributions::default();
+        let text = "x".repeat(1024);
+        let elements = (0..128)
+            .map(|index| UiElement::Text {
+                id: format!("item-{index}"),
+                text: text.clone(),
+            })
+            .collect::<Vec<_>>();
+        for index in 0..5 {
+            oversized.tool_windows.push(ToolWindowContribution {
+                id: format!("org.example.owner.panel-{index}"),
+                title: "Panel".into(),
+                initial_view: UiDocument {
+                    id: "main".into(),
+                    elements: elements.clone(),
+                },
+            });
+        }
+        assert!(matches!(
+            registry.register("org.example.owner", oversized),
+            Err(ExtensionError::InvalidContribution(_))
+        ));
+
+        let settings = (0..=MAX_OWNER_CONTRIBUTIONS)
+            .map(|index| SettingContribution {
+                id: format!("org.example.owner.setting-{index}"),
+                title: "Setting".into(),
+                description: String::new(),
+                kind: SettingKind::Boolean { default: false },
+            })
+            .collect();
+        let too_many = ExtensionContributions {
+            settings,
+            ..ExtensionContributions::default()
+        };
+        assert!(matches!(
+            registry.register("org.example.owner", too_many),
+            Err(ExtensionError::InvalidContribution(_))
+        ));
+    }
+
+    #[test]
+    fn command_enablement_is_enforced_by_the_shared_host_registry() {
+        let mut manager = ExtensionManager::new();
+        let dir = temp_dir();
+        fs::write(dir.join("main.lua"), "return {}\n").unwrap();
+        manager
+            .register_installed(manifest(&[Capability::Commands]), dir.clone())
+            .unwrap();
+        manager.enable("org.example.hello").unwrap();
+        manager
+            .activate("org.example.hello", |_manifest, builder| {
+                builder
+                    .command_with_options(
+                        "document-action",
+                        "Document action",
+                        "Needs an active document",
+                        CommandOptions {
+                            shortcut: Some("Ctrl+Alt+D".into()),
+                            enablement: CommandEnablement::ActiveDocument,
+                        },
+                        Arc::new(|_, _| Ok("ran".into())),
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            manager.invoke_command(
+                "org.example.hello.document-action",
+                &CommandContext::default(),
+                &[]
+            ),
+            Err(ExtensionError::CommandDisabled(_))
+        ));
+        assert_eq!(
+            manager
+                .invoke_command(
+                    "org.example.hello.document-action",
+                    &CommandContext {
+                        active_document_id: Some(7),
+                        ..CommandContext::default()
+                    },
+                    &[]
+                )
+                .unwrap(),
+            "ran"
         );
         let _ = fs::remove_dir_all(dir);
     }
