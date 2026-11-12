@@ -114,6 +114,16 @@ export interface LanguageDiagnostic {
 export interface LanguageDiagnosticSet {
   provider_id: string; uri: string; document_version: number | null; document_id: number | null; diagnostics: LanguageDiagnostic[];
 }
+export interface InspectionFinding {
+  id: string; provider_id: string; rule_id: string; path: string; document_revision: number | null;
+  range: TextRange; severity: 'error' | 'warning' | 'information' | 'hint'; message: string;
+  explanation: string | null; category: string | null;
+  related: Array<{ path: string; range: TextRange; message: string }>;
+  actions: Array<{ id: string; title: string; provider_id: string; kind: string; diagnostic_ids: string[];
+    edits: Array<{ path: string; expected_revision: number | null; range: TextRange; new_text: string }>;
+    disabled_reason: string | null }>;
+  origin: string;
+}
 
 export type RequestMethod =
   | { method: 'ping' }
@@ -134,6 +144,7 @@ export type RequestMethod =
   | { method: 'language_format'; params: { document_id: number; expected_revision: number } }
   | { method: 'language_code_actions'; params: { document_id: number; expected_revision: number; range: TextRange } }
   | { method: 'language_rename'; params: { document_id: number; expected_revision: number; position: TextPosition; new_name: string } }
+  | { method: 'inspect_document'; params: { document_id: number; expected_revision: number; language: string } }
   | { method: 'open_workspace'; params: { path: string } }
   | { method: 'close_workspace' }
   | { method: 'list_directory'; params: { path: string } }
@@ -186,6 +197,7 @@ export type ResponseValue =
   | { kind: 'language_formatting'; value: { document_revision: number; edits: TextEdit[] } }
   | { kind: 'language_code_actions'; value: { document_revision: number; actions: Array<{ id: string; title: string; provider_id: string; kind: string | null; related_diagnostics: string[]; edits: TextEdit[] | null; unsupported_reason: string | null; disabled_reason: string | null }> } }
   | { kind: 'language_rename'; value: { document_revision: number; edits: TextEdit[] } }
+  | { kind: 'inspection_findings'; value: { document_revision: number; findings: InspectionFinding[] } }
   | { kind: 'workspace_opened'; value: { root: string } }
   | { kind: 'workspace_closed'; value: { root: string } }
   | { kind: 'directory_entries'; value: DirectoryEntry[] }

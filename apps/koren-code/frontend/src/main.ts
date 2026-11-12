@@ -3,7 +3,7 @@ import { EditorState } from '@codemirror/state';
 import { basicSetup, EditorView } from 'codemirror';
 import { linter, setDiagnostics, type Diagnostic as CodeMirrorDiagnostic } from '@codemirror/lint';
 import { KorenClient, KorenError, createDesktopTransport } from './services/client';
-import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary, ExtensionSettingSummary, ExtensionSettingValue, ExtensionSummary, ExtensionThemeSummary, ExtensionToolWindowSummary, ExtensionUiDocument, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ResponseValue, TaskSummary, TextRange } from './services/protocol';
+import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary, ExtensionSettingSummary, ExtensionSettingValue, ExtensionSummary, ExtensionThemeSummary, ExtensionToolWindowSummary, ExtensionUiDocument, InspectionFinding, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ResponseValue, TaskSummary, TextRange } from './services/protocol';
 import { approvalChoice, conflictChoice } from './app/dialogs';
 import { commandShortcutMatches, filterCommands, nextCommandSelection } from './app/commands';
 import { activePanelLayout, diagnosticDetailMatches, extensionMenusAt, safeThemeVariables, validExtensionSettingValue } from './app/extensions';
@@ -17,7 +17,7 @@ import { diagnosticsForRevision, withDiagnosticPublication } from './app/diagnos
 import { ProjectTreeState, TabState, type EditorTab } from './app/state';
 import { DocumentEditPipeline } from './editor/sync';
 import { editsFromViewUpdate } from './editor/transactions';
-import { languageForPath, languageNameForPath } from './editor/languages';
+import { languageForPath, languageIdForPath, languageNameForPath } from './editor/languages';
 import { flushAndSave } from './editor/save';
 import { languageServiceExtensions } from './editor/languageServices';
 import './styles/main.css';
@@ -130,7 +130,7 @@ app.innerHTML = `
           <button class="selected" data-panel="output" role="tab" aria-selected="true">Output</button><button data-panel="problems" role="tab" aria-selected="false">Problems <span id="problem-count" class="count-badge">0</span></button><button data-panel="tasks" role="tab" aria-selected="false">Tasks</button><button data-panel="projects" role="tab" aria-selected="false">Projects</button>
         </div><span id="bottom-task-state" class="task-state"></span><span class="panel-actions"><button data-action="cancel-task" title="Cancel active task" aria-label="Cancel active task" disabled>■</button><button data-action="toggle-bottom" title="Collapse bottom panel" aria-label="Collapse bottom panel">⌄</button></span></div>
         <div id="output" class="panel-content output"><div class="panel-empty">Task output will appear here.</div></div>
-        <div id="problems" class="panel-content problem-list hidden"><div class="panel-empty">No problems reported by installed language integrations.</div></div>
+        <div id="problems" class="panel-content problem-list hidden"><div class="problem-filters"><label>Severity <select id="problem-severity-filter"><option value="all">All</option><option value="error">Errors</option><option value="warning">Warnings</option><option value="information">Information</option><option value="hint">Hints</option></select></label><label>Group by <select id="problem-grouping"><option value="file">File</option><option value="provider">Provider</option><option value="category">Category</option><option value="severity">Severity</option></select></label></div><div id="problem-entries"><div class="panel-empty">No problems reported by installed language integrations.</div></div></div>
         <div id="tasks" class="panel-content task-list hidden"><div class="panel-empty">Discover Cargo projects to see available tasks.</div></div>
         <div id="projects" class="panel-content project-list hidden"><div class="panel-empty">Project information will appear here.</div></div>
         <div id="extension-panel-content"></div>
@@ -176,6 +176,9 @@ const documentViews = new Map<number, { state: EditorState; pipeline: DocumentEd
 const taskById = new Map<number, TaskSummary>();
 const activeLanguageServers = new Map<string, number>();
 const diagnosticsByDocument = new Map<number, Map<string, LanguageDiagnosticSet>>();
+const inspectionFindingsByDocument = new Map<number, InspectionFinding[]>();
+const inspectionTimers = new Map<number, number>();
+const inspectionGenerations = new Map<number, number>();
 let editorContextMenus: ExtensionMenuSummary[] = [];
 let projectExplorerMenus: ExtensionMenuSummary[] = [];
 let extensionCatalogCache: ExtensionCatalog | null = null;
@@ -188,6 +191,8 @@ const commandMetadata = new Map<string, { description: string; shortcut: string 
 let editor: EditorView | null = null;
 let outputRefreshTimer = 0;
 let toastTimer = 0;
+let problemSeverityFilter = 'all';
+let problemGrouping = 'file';
 
 function expect<T extends ResponseValue['kind']>(response: ResponseValue, kind: T): Extract<ResponseValue, { kind: T }> {
   if (response.kind !== kind) throw new Error(`Expected ${kind}, received ${response.kind}`);
@@ -336,6 +341,7 @@ async function openDocument(path: string): Promise<void> {
     if (!editor) editor = new EditorView({ state, parent: editorHost }); else editor.setState(state);
     welcome.classList.add('hidden'); editorHost.classList.remove('hidden');
     renderTree(); renderTabs(); updateStatusDocument(); editor.focus();
+    scheduleInspection(tab.id);
   } catch (error) { showError(error); }
 }
 
@@ -368,6 +374,8 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
         if (update.docChanged) {
           entry.pipeline.enqueue(editsFromViewUpdate(update));
           diagnosticsByDocument.delete(tab.id);
+          inspectionFindingsByDocument.delete(tab.id);
+          scheduleInspection(tab.id);
           queueMicrotask(() => { if (tabs.activeId === tab.id) renderLanguageDiagnostics(tab.id); renderProblems(); });
         }
         if (update.docChanged || update.selectionSet || update.focusChanged) updateStatusDocument();
@@ -414,6 +422,7 @@ function selectTab(id: number): void {
   selectedPath = tab.path;
   const entry = documentViews.get(id); if (entry && editor) editor.setState(entry.state);
   renderLanguageDiagnostics(id);
+  scheduleInspection(id);
   renderTree(); renderTabs(); updateStatusDocument(); editor?.focus();
   void client.call({ method: 'read_document', params: { document_id: id } }).catch(showError);
 }
@@ -457,7 +466,9 @@ async function closeTab(tab: EditorTab): Promise<void> {
     await documentViews.get(tab.id)?.pipeline.flush();
     await client.call({ method: 'close_document', params: { document_id: tab.id, discard_unsaved_changes: action === 'discard' } });
     const wasActive = tabs.activeId === tab.id;
-    tabs.close(tab.id); documentViews.delete(tab.id); diagnosticsByDocument.delete(tab.id); renderProblems();
+    tabs.close(tab.id); documentViews.delete(tab.id); diagnosticsByDocument.delete(tab.id); inspectionFindingsByDocument.delete(tab.id);
+    const inspectionTimer = inspectionTimers.get(tab.id); if (inspectionTimer !== undefined) window.clearTimeout(inspectionTimer);
+    inspectionTimers.delete(tab.id); inspectionGenerations.delete(tab.id); renderProblems();
     if (wasActive && tabs.activeId !== null) selectTab(tabs.activeId); else renderTabs();
     updateStatusDocument();
   } catch (error) { showError(error); }
@@ -757,6 +768,37 @@ function showPanel(panel: 'output' | 'problems' | 'tasks' | 'projects' | string)
   setBottomCollapsed(false);
 }
 
+function scheduleInspection(documentId: number): void {
+  const previous = inspectionTimers.get(documentId);
+  if (previous !== undefined) window.clearTimeout(previous);
+  const generation = (inspectionGenerations.get(documentId) ?? 0) + 1;
+  inspectionGenerations.set(documentId, generation);
+  inspectionTimers.set(documentId, window.setTimeout(() => {
+    inspectionTimers.delete(documentId);
+    void inspectDocument(documentId, generation);
+  }, 300));
+}
+
+async function inspectDocument(documentId: number, generation: number): Promise<void> {
+  const entry = documentViews.get(documentId);
+  const tab = tabs.tabs.find((item) => item.id === documentId);
+  if (!entry || !tab) return;
+  try {
+    await entry.pipeline.flush();
+    const revision = entry.pipeline.currentRevision;
+    const result = expect(await client.call({ method: 'inspect_document', params: {
+      document_id: documentId, expected_revision: revision, language: languageIdForPath(tab.path),
+    } }), 'inspection_findings').value;
+    if (inspectionGenerations.get(documentId) !== generation || entry.pipeline.currentRevision !== result.document_revision) return;
+    inspectionFindingsByDocument.set(documentId, result.findings.filter((finding) => finding.document_revision === result.document_revision));
+    renderLanguageDiagnostics(documentId);
+    renderProblems();
+  } catch (error) {
+    if (inspectionGenerations.get(documentId) !== generation) return;
+    if (!(error instanceof KorenError) || error.code !== 'conflict') showError(error);
+  }
+}
+
 function codeMirrorDiagnostics(documentId: number): CodeMirrorDiagnostic[] {
   const entry = documentViews.get(documentId);
   if (!entry) return [];
@@ -766,6 +808,12 @@ function codeMirrorDiagnostics(documentId: number): CodeMirrorDiagnostic[] {
     const to = editorPosition(entry.state.doc, diagnostic.range.end.line, diagnostic.range.end.character);
     const severity = diagnostic.severity === 'information' || diagnostic.severity === null ? 'info' : diagnostic.severity;
     result.push({ from, to: Math.max(from, to), severity, message: diagnostic.message, source: diagnostic.source ?? provider });
+  }
+  for (const finding of inspectionFindingsByDocument.get(documentId) ?? []) {
+    if (finding.document_revision !== entry.pipeline.currentRevision) continue;
+    const from = editorPosition(entry.state.doc, finding.range.start.line, finding.range.start.character);
+    const to = editorPosition(entry.state.doc, finding.range.end.line, finding.range.end.character);
+    result.push({ from, to: Math.max(from, to), severity: finding.severity === 'information' ? 'info' : finding.severity, message: finding.message, source: finding.rule_id });
   }
   return result;
 }
@@ -780,14 +828,24 @@ function renderLanguageDiagnostics(documentId: number): void {
 }
 
 function renderProblems(): void {
-  const host = document.querySelector<HTMLDivElement>('#problems')!; host.replaceChildren();
+  const host = document.querySelector<HTMLDivElement>('#problem-entries')!; host.replaceChildren();
   const rows = [...diagnosticsByDocument.entries()].flatMap(([documentId, providers]) => {
     const entry = documentViews.get(documentId);
     if (!entry) return [];
     return diagnosticsForRevision(providers, entry.pipeline.currentRevision)
       .map(({ diagnostic, provider }) => ({ documentId, diagnostic, provider }));
+  }).filter(({ diagnostic }) => problemSeverityFilter === 'all' || (diagnostic.severity ?? 'information') === problemSeverityFilter);
+  const inspectionRows = [...inspectionFindingsByDocument.entries()].flatMap(([documentId, findings]) => {
+    const entry = documentViews.get(documentId);
+    return entry ? findings.filter((finding) => finding.document_revision === entry.pipeline.currentRevision && (problemSeverityFilter === 'all' || finding.severity === problemSeverityFilter)).map((finding) => ({ documentId, finding })) : [];
   });
-  document.querySelector('#problem-count')!.textContent = String(rows.length);
+  document.querySelector('#problem-count')!.textContent = String(rows.length + inspectionRows.length);
+  const groups = new Set<string>();
+  const groupHeading = (key: string): void => {
+    if (problemGrouping === 'file' || groups.has(key)) return;
+    groups.add(key);
+    const heading = document.createElement('div'); heading.className = 'problem-group'; heading.textContent = key; host.append(heading);
+  };
   for (const row of rows) {
     const rowHost = document.createElement('div'); rowHost.className = 'problem-entry';
     const button = document.createElement('button'); button.className = 'problem-row';
@@ -812,9 +870,69 @@ function renderProblems(): void {
       if (editor) editor.dispatch({ selection: { anchor: editorPosition(editor.state.doc, row.diagnostic.range.start.line, row.diagnostic.range.start.character) }, scrollIntoView: true });
       showPanel('problems');
     });
-    host.append(rowHost);
+    const key = problemGrouping === 'provider' ? row.provider : problemGrouping === 'category' ? row.diagnostic.source ?? row.provider : problemGrouping === 'severity' ? row.diagnostic.severity ?? 'information' : tab?.title ?? row.provider;
+    groupHeading(key); host.append(rowHost);
   }
-  if (!rows.length) host.innerHTML = '<div class="panel-empty">No problems reported by installed language integrations.</div>';
+  for (const { documentId, finding } of inspectionRows) {
+    const tab = tabs.tabs.find((item) => item.id === documentId);
+    const key = problemGrouping === 'provider' ? finding.provider_id : problemGrouping === 'category' ? finding.category ?? finding.rule_id : problemGrouping === 'severity' ? finding.severity : tab?.title ?? finding.path;
+    groupHeading(key); renderInspectionFinding(host, documentId, finding);
+  }
+  if (!rows.length && !inspectionRows.length) host.innerHTML = '<div class="panel-empty">No problems reported by installed language integrations.</div>';
+}
+
+function renderInspectionFinding(host: HTMLElement, documentId: number, finding: InspectionFinding): void {
+  const tab = tabs.tabs.find((item) => item.id === documentId);
+  const row = document.createElement('div'); row.className = 'problem-entry';
+  const button = document.createElement('button'); button.className = 'problem-row';
+  const severity = document.createElement('span'); severity.className = `problem-severity ${finding.severity}`; severity.textContent = finding.severity;
+  const message = document.createElement('span'); message.className = 'problem-message'; message.textContent = finding.message;
+  const location = document.createElement('span'); location.className = 'problem-location'; location.textContent = `${tab?.title ?? finding.path}:${finding.range.start.line + 1}`;
+  button.append(severity, message, location);
+  button.addEventListener('click', () => {
+    selectTab(documentId);
+    if (editor) editor.dispatch({ selection: { anchor: editorPosition(editor.state.doc, finding.range.start.line, finding.range.start.character) }, scrollIntoView: true });
+    showPanel('problems');
+  });
+  row.append(button);
+  const details = document.createElement('details'); details.className = 'diagnostic-detail';
+  const summary = document.createElement('summary'); summary.textContent = `${finding.rule_id} · ${finding.category ?? finding.provider_id} · ${finding.origin}`;
+  details.append(summary);
+  if (finding.explanation) { const explanation = document.createElement('p'); explanation.textContent = finding.explanation; details.append(explanation); }
+  for (const related of finding.related) { const note = document.createElement('p'); note.textContent = `${related.path}:${related.range.start.line + 1} — ${related.message}`; details.append(note); }
+  for (const action of finding.actions) {
+    const fix = document.createElement('button'); fix.type = 'button'; fix.textContent = action.disabled_reason ? `${action.title} — ${action.disabled_reason}` : action.title;
+    fix.disabled = Boolean(action.disabled_reason) || !action.edits.length;
+    fix.addEventListener('click', (event) => { event.stopPropagation(); void applyInspectionAction(documentId, action); });
+    details.append(fix);
+  }
+  row.append(details); host.append(row);
+}
+
+async function applyInspectionAction(documentId: number, action: InspectionFinding['actions'][number]): Promise<void> {
+  const entry = documentViews.get(documentId);
+  const tab = tabs.tabs.find((item) => item.id === documentId);
+  if (!entry || !tab || !editor || tabs.activeId !== documentId) return;
+  try {
+    await entry.pipeline.flush();
+    const revision = entry.pipeline.currentRevision;
+    if (action.edits.some((edit) => edit.path !== tab.path || edit.expected_revision !== revision)) {
+      setStatus('This quick fix is stale or targets another file. Run inspection again.');
+      return;
+    }
+    const doc = editor.state.doc;
+    const changes = action.edits.map((edit) => ({
+      from: editorPosition(doc, edit.range.start.line, edit.range.start.character),
+      to: editorPosition(doc, edit.range.end.line, edit.range.end.character),
+      insert: edit.new_text,
+    })).sort((left, right) => right.from - left.from);
+    if (changes.some((change) => change.to < change.from || change.to > doc.length)) return;
+    const before = doc.toString();
+    const after = changes.reduce((text, change) => text.slice(0, change.from) + change.insert + text.slice(change.to), before);
+    if (!window.confirm(`Preview: ${action.title}\n\nBefore:\n${before.slice(0, 800)}\n\nAfter:\n${after.slice(0, 800)}`)) return;
+    if (entry.pipeline.currentRevision !== revision) return;
+    editor.dispatch({ changes });
+  } catch (error) { showError(error); }
 }
 
 function clearDiagnosticProviders(prefix: string): void {
@@ -1256,6 +1374,12 @@ document.querySelector<HTMLInputElement>('#command-search')!.addEventListener('i
 });
 
 document.querySelectorAll<HTMLButtonElement>('[data-panel]').forEach((button) => button.addEventListener('click', () => showPanel(button.dataset.panel as 'output' | 'problems' | 'tasks' | 'projects')));
+document.querySelector<HTMLSelectElement>('#problem-severity-filter')!.addEventListener('change', (event) => {
+  problemSeverityFilter = (event.currentTarget as HTMLSelectElement).value; renderProblems();
+});
+document.querySelector<HTMLSelectElement>('#problem-grouping')!.addEventListener('change', (event) => {
+  problemGrouping = (event.currentTarget as HTMLSelectElement).value; renderProblems();
+});
 document.querySelector<HTMLSelectElement>('#theme-setting')!.addEventListener('change', (event) => {
   const value = (event.currentTarget as HTMLSelectElement).value;
   if (value.startsWith('extension:')) {

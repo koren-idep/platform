@@ -268,3 +268,7 @@ kbd {
   .status-item { padding-inline: 4px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+.problem-filters { display: flex; gap: 12px; padding: 7px 10px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 11px; }
+.problem-filters label { display: flex; align-items: center; gap: 6px; }
+.problem-filters select { color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; }
+.problem-group { padding: 7px 10px 3px; color: var(--muted); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }

@@ -6,6 +6,9 @@ export function registerLanguage(integration: LanguageIntegration): void { integ
 export function languageNameForPath(path: string): string {
   return findLanguage(path)?.label ?? 'Plain Text';
 }
+export function languageIdForPath(path: string): string {
+  return findLanguage(path)?.id ?? 'plaintext';
+}
 export async function languageForPath(path: string): Promise<Extension[]> {
   const match = findLanguage(path);
   return match ? [await match.create()] : [];
