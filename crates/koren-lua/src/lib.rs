@@ -1720,6 +1720,13 @@ mod tests {
         let source = r#"
             local m = {}
             function m.activate()
+              local function utf16_units(value)
+                local units = 0
+                for _, codepoint in utf8.codes(value) do
+                  units = units + (codepoint > 0xFFFF and 2 or 1)
+                end
+                return units
+              end
               koren.inspections.register_rule({
                 id = "todo",
                 title = "TODO marker",
@@ -1731,14 +1738,26 @@ mod tests {
                 if not settings.enabled or not document.text:find("TODO", 1, true) then
                   return {}
                 end
-                return {{
-                  start_line = 0, start_column = 0,
-                  end_line = 0, end_column = 4,
-                  message = "TODO marker remains",
-                  explanation = "Replace this marker before shipping.",
-                  replacement = "DONE",
-                  related = {{line = 0, column = 4, message = "Suggested replacement starts here"}}
-                }}
+                local findings = {}
+                local line_number = 0
+                for line in (document.text .. "\n"):gmatch("(.-)\n") do
+                  local start_at, end_at = line:find("TODO", 1, true)
+                  while start_at do
+                    local column = utf16_units(line:sub(1, start_at - 1))
+                    local finish = utf16_units(line:sub(1, end_at))
+                    findings[#findings + 1] = {
+                      start_line = line_number, start_column = column,
+                      end_line = line_number, end_column = finish,
+                      message = "TODO marker remains",
+                      explanation = "Replace this marker before shipping.",
+                      replacement = "DONE",
+                      related = {{line = line_number, column = finish, message = "Suggested replacement starts here"}}
+                    }
+                    start_at, end_at = line:find("TODO", end_at + 1, true)
+                  end
+                  line_number = line_number + 1
+                end
+                return findings
               end)
             end
             return m
@@ -1770,13 +1789,16 @@ mod tests {
             document_id: Some(7),
             revision: Some(12),
             language: "plaintext".into(),
-            text: Arc::from("TODO"),
+            text: Arc::from("😀 TODO\nTODO"),
         };
         let findings = runtime
             .inspect(&document, &profile, None, &CancellationToken::new())
             .unwrap();
-        assert_eq!(findings.len(), 1);
+        assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(findings[0].range.start.line, 0);
+        assert_eq!(findings[0].range.start.character, 3);
+        assert_eq!(findings[1].range.start.line, 1);
         assert_eq!(
             findings[0].explanation.as_deref(),
             Some("Replace this marker before shipping.")
