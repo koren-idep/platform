@@ -213,3 +213,18 @@ One local run on 2026-11-11, Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, In
 | Desktop startup | 1 smoke run | 177.5 ms to window; 399,276 KiB process-tree RSS after 1 s | Debug executable, one local Linux/Xvfb run; same smoke timing and RSS boundary as above |
 
 These fixtures are small local microbenchmarks on a temporary filesystem. They do not measure cold disks, network filesystems, very large repositories, UI paint, or concurrent editing. The Git dependency's native build/link size is platform/toolchain dependent. The startup result above is one local debug run; it measures process-start to window appearance and one-second process-tree RSS, not interactive latency. Windows and macOS were not measured.
+
+## Phase 9B integrated terminal measurements
+
+Controlled PTY measurements were recorded with `cargo test -p koren-terminal ... -- --nocapture` on the same Linux x86_64 development machine listed above. Each figure is a single local test sample using the Rust test executable as a controlled PTY child rather than the user's configured shell.
+
+| Workload | Result | Measurement boundary |
+|---|---:|---|
+| Reserve a terminal session | 16.4 µs | Create the lazy session record; does not allocate a PTY |
+| Allocate PTY and start controlled child | 0.69 ms | `start_session`, including PTY setup and process spawn |
+| Input to echoed response | 10.13 ms | Input queue through observed echo; the test polls output every 10 ms, so this is a coarse upper-bound sample |
+| Large output transfer | 2 MiB in 51.4 ms (~39 MiB/s) | Controlled child output drained in bounded 128 KiB batches; includes test-runner scheduling |
+
+The PTY fixture verifies byte ordering and no loss across the measured 2 MiB payload. These values are not repeated-run statistics. Shell-specific startup time, per-session RSS split from child RSS, idle CPU, sustained concurrent sessions, xterm render responsiveness, and clipboard/terminal behavior in a native WebKitGTK window remain unmeasured. Desktop startup and one-second process-tree RSS are measured separately by the Linux smoke test; opening no terminal starts no shell or PTY worker.
+
+After Phase 9B, the final Linux desktop smoke reported 171.1 ms to window appearance and 400,576 KiB process-tree RSS after one second, with no terminal opened. This is a single run using the same smoke boundary as the Phase 9A baseline above; it does not isolate terminal-service memory, and the RSS difference is within the variability of single-run samples.

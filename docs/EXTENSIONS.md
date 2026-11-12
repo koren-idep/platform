@@ -126,6 +126,10 @@ These services are not automatically exposed to Lua. The current capability mode
 
 The Git adapter uses `git2` and libgit2 locally. It does not invoke user hooks; commit hooks and remote operations are not part of this phase. The current Code Editor UI exposes only status, bounded text diffs, selected-path stage/unstage, and explicit commits from the staged index.
 
+## Phase 9B terminal permissions
+
+Interactive terminal sessions are host-only capabilities in Koren Code Editor. Lua extensions receive no terminal create/start/write/resize/close API, and terminal output events are excluded from extension callbacks. An extension must not try to bypass this policy through a contributed panel or command. Shell startup requires direct user approval in the desktop; after approval, commands typed into that shell are not individually approved. See [docs/TERMINAL.md](TERMINAL.md) for session lifecycle, transport, and platform constraints.
+
 ## Local development
 
 Copy `examples/extensions/org.example.hello` into the extension root, reopen the Extensions manager, enable it, then activate it. The Developer Tools example demonstrates a command, menu and palette entry, user-opened workspace panel, typed setting, safe theme, diagnostic details, and panel refresh. Copy `examples/extensions/org.example.text-inspection` to demonstrate Lua rule registration and a safe replacement proposal. The optional `org.koren.rust-analyzer` example uses the same configuration path for any LSP-compatible editor host; install `rust-analyzer` separately before starting it. It is not bundled and is not required for editing.

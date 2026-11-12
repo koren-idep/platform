@@ -9,7 +9,7 @@ koren-headless ──> koren-core, koren-protocol, koren-commands,
                    koren-workspace, koren-documents, koren-projects,
                    koren-tasks, koren-cargo
 koren-code ──────> platform crates plus koren-extensions, koren-lua,
-                   koren-inspections, koren-lsp
+                   koren-inspections, koren-lsp, koren-terminal
 koren-documents ─> koren-core, koren-protocol, koren-workspace, ropey
 koren-projects ──> koren-core, koren-workspace, koren-tasks
 koren-tasks ─────> koren-core
@@ -17,6 +17,7 @@ koren-cargo ─────> koren-projects, koren-tasks, koren-workspace,
                    serde, serde_json, toml, glob
 koren-extensions (no internal dependencies)
 koren-lsp ───────> koren-documents, koren-protocol
+koren-terminal ──> portable-pty, (Unix) nix process-group signaling
 koren-inspections -> koren-protocol
 koren-lua ───────> koren-extensions, koren-inspections, koren-protocol,
                    mlua (Lua 5.4)
@@ -83,7 +84,7 @@ Workspace and document managers own their event queues. They enqueue lifecycle, 
 
 ## Protocol evolution and headless session
 
-The experimental protocol remains version 2. Project, Cargo, task, and approval request/response variants are additive tagged operations; existing version-2 shapes are unchanged. Version 1 requests are rejected. Any incompatible field or encoding change must increment the version and update serialization and compatibility tests together. The headless session processes JSON Lines sequentially in one process, with caller-supplied request IDs and typed responses. Machine-readable output goes to stdout; diagnostics go to stderr. The session is local-only, not an HTTP or network server.
+The experimental protocol remains version 2. Project, Cargo, task, approval, and terminal request/response variants are additive tagged operations; existing version-2 shapes are unchanged. Version 1 requests are rejected. Any incompatible field or encoding change must increment the version and update serialization and compatibility tests together. The headless session processes JSON Lines sequentially in one process, with caller-supplied request IDs and typed responses. Machine-readable output goes to stdout; diagnostics go to stderr. The session is local-only, not an HTTP or network server. Desktop PTY bytes use base64 in typed requests and ordered desktop events over the existing long-poll channel.
 
 ## Frontend, products, and future interfaces
 
@@ -102,6 +103,14 @@ Workspace mutation stays in `koren-workspace`; the desktop and headless hosts co
 `koren-git` uses the maintained `git2` Rust bindings to libgit2 rather than starting the Git CLI. This avoids shell construction, executable discovery/authorization ambiguity, subprocess startup, and unapproved hook execution. The tradeoffs are a native libgit2 dependency and larger compile/link footprint, and behavior/features may differ from a user's installed Git version. Repository operations are local and synchronous; discovery is lazy and bounded, diffs are capped at 1 MiB, staging targets one selected path, and commits include only the index. Local commits call libgit2 directly and therefore do not run Git hooks. Push/pull/fetch, hooks, history rewriting, and conflict resolution are outside Phase 9A.
 
 The version-2 typed protocol adds additive workspace mutation, search, and Git operations. Search start returns a job ID, poll returns incremental batches and progress, and cancel requests cooperative worker cancellation. Desktop and headless consumers share the same public Rust services. Lua extensions do not receive filesystem mutation, search, or Git capabilities from these additions; extensions must use explicitly host-registered workflows and cannot bypass approval boundaries.
+
+## Phase 9B integrated terminal
+
+`koren-terminal` is a language-neutral service built on `portable-pty` 0.9.0, which provides native PTYs/ConPTY through one maintained Rust API. The host creates a `Created` session and presents exact executable, argv, resolved directory, environment override names, actor, and workspace to the user. Only a one-time graphical approval starts the shell. PTY construction is lazy, the service allows at most eight sessions by default, and no workspace metadata can supply a command. The detected profile uses `SHELL` on Unix or `COMSPEC` on Windows, with `/bin/sh` or `cmd.exe` fallback; custom profile argv is passed directly without shell expansion.
+
+Input and output are raw bytes transported as bounded base64 chunks. The reader uses bounded queues, applies backpressure to the PTY when output is not drained, and the host emits ordered per-session sequence numbers. Each event drain is capped at 128 KiB; input chunks are capped at 64 KiB. Output is private to the desktop terminal view and is not forwarded to Lua extensions. The renderer is xterm.js with its fit addon and built-in renderer; the terminal bundle loads only when the panel opens. No WebView process API is exposed.
+
+Shell approval grants an interactive shell using the user's account permissions. It is a broader trust decision than a predefined task approval and does not constrain later commands or filesystem access to the workspace. Clipboard reads/writes require explicit keyboard gestures, and no hyperlink addon is enabled. Linux and macOS process groups receive SIGTERM followed by bounded SIGKILL cleanup. Windows terminates the ConPTY child, not its full descendant tree. Close prompts before terminating a live tab; application shutdown performs bounded manager cleanup. Linux is the primary tested desktop target. WebKitGTK rendering and Windows/macOS PTY behavior need native interactive validation before claiming support.
 
 ## Performance
 
