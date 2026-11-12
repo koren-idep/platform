@@ -8,7 +8,7 @@ use koren_extensions::{
 };
 use koren_inspections::{
     CancellationToken, FindingOrigin, InspectionProfile, InspectionProfiles, InspectionProvider,
-    InspectionService,
+    InspectionService, RuleProfile, Severity,
 };
 use koren_lsp::{
     DiagnosticSet, FormattingOptions, LspActorEvent, LspDocumentSync, LspRequest, LspResponse,
@@ -24,10 +24,10 @@ use koren_protocol::{
     ExtensionProjectWizardSummary, ExtensionSettingKind, ExtensionSettingSummary,
     ExtensionSettingValue, ExtensionSummary as ProtocolExtensionSummary, ExtensionThemeSummary,
     ExtensionToolWindowSummary, ExtensionUiDocument, ExtensionUiElement, InspectionCodeAction,
-    InspectionFinding, InspectionProposedTextEdit, InspectionRelatedLocation,
-    LanguageServerApprovalSummary, LanguageServerSummary, ProjectLifecycle, ProjectSummary,
-    ProtocolError, Request, RequestMethod, Response, ResponseValue, TaskLifecycle, TaskSummary,
-    TextEdit, validate_version,
+    InspectionConfigurationSummary, InspectionFinding, InspectionProposedTextEdit,
+    InspectionRelatedLocation, InspectionRuleSummary, LanguageServerApprovalSummary,
+    LanguageServerSummary, ProjectLifecycle, ProjectSummary, ProtocolError, Request, RequestMethod,
+    Response, ResponseValue, TaskLifecycle, TaskSummary, TextEdit, validate_version,
 };
 use koren_tasks::{
     ExecutionRequestId, TaskApprovalManager, TaskAuthorizationDecision, TaskCaller, TaskDefinition,
@@ -35,7 +35,7 @@ use koren_tasks::{
     TaskOptions, TaskRunId, TaskSnapshot, TaskState,
 };
 use koren_workspace::{EntryKind, WorkspaceManager};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -228,6 +228,7 @@ struct DesktopBackend {
     extensions: ExtensionManager,
     inspections: InspectionService,
     inspection_profiles: InspectionProfiles,
+    settings_path: Option<PathBuf>,
     extension_root: Option<PathBuf>,
     extensions_discovered: bool,
     extension_setting_values: BTreeMap<String, ExtensionSettingValue>,
@@ -283,11 +284,17 @@ impl DesktopBackend {
         cargo
             .register(&mut projects)
             .map_err(|error| error.to_string())?;
-        let mut inspection_profiles = InspectionProfiles::default();
-        inspection_profiles.insert(InspectionProfile::new("Default"));
-        inspection_profiles
-            .select(None, "Default")
-            .map_err(|error| error.to_string())?;
+        let settings_path = extension_settings_path();
+        let persisted_settings = load_desktop_settings(settings_path.as_deref());
+        let mut inspection_profiles = persisted_settings.inspection_profiles;
+        if !inspection_profiles.profiles.contains_key("Default") {
+            inspection_profiles.insert(InspectionProfile::new("Default"));
+        }
+        if inspection_profiles.selected.is_none() {
+            inspection_profiles
+                .select(None, "Default")
+                .map_err(|error| error.to_string())?;
+        }
         Ok(Self {
             platform,
             commands,
@@ -300,9 +307,10 @@ impl DesktopBackend {
             extensions: ExtensionManager::new(),
             inspections: InspectionService::default(),
             inspection_profiles,
+            settings_path,
             extension_root: extension_install_root(),
             extensions_discovered: false,
-            extension_setting_values: load_extension_settings(),
+            extension_setting_values: persisted_settings.extension_settings,
             updated_panel_text: BTreeMap::new(),
             lua_runtimes: BTreeMap::new(),
             active_document: None,
@@ -658,6 +666,24 @@ impl DesktopBackend {
             }
             RequestMethod::ExecuteCommand { command_id } => self.execute_command(&command_id),
             RequestMethod::ListExtensions => self.list_extensions(),
+            RequestMethod::ListInspectionRules => self.list_inspection_rules(),
+            RequestMethod::SelectInspectionProfile {
+                profile_name,
+                workspace_specific,
+            } => self.select_inspection_profile(&profile_name, workspace_specific),
+            RequestMethod::SetInspectionRule {
+                rule_id,
+                enabled,
+                severity,
+                workspace_specific,
+                reset,
+            } => self.set_inspection_rule(
+                &rule_id,
+                enabled,
+                severity.as_deref(),
+                workspace_specific,
+                reset,
+            ),
             RequestMethod::SetExtensionSetting { setting_id, value } => {
                 self.set_extension_setting(&setting_id, value)
             }
@@ -1072,6 +1098,146 @@ impl DesktopBackend {
         }))
     }
 
+    fn list_inspection_rules(&self) -> Result<ResponseValue, ProtocolError> {
+        let workspace = self
+            .workspace
+            .root()
+            .ok()
+            .map(|root| root.to_string_lossy().into_owned());
+        let profile = self
+            .inspection_profiles
+            .selected_for(workspace.as_deref())
+            .ok_or_else(|| invalid("no inspection profile is selected"))?;
+        let rules = self
+            .inspections
+            .rules()
+            .into_iter()
+            .map(|rule| {
+                let effective = profile.effective_rule(workspace.as_deref(), &rule);
+                InspectionRuleSummary {
+                    id: rule.id.clone(),
+                    provider_id: rule.provider_id.clone(),
+                    title: rule.title,
+                    description: rule.description,
+                    category: rule.category,
+                    languages: rule.languages.into_iter().collect(),
+                    default_severity: severity_name(rule.default_severity).into(),
+                    enabled: effective.enabled,
+                    severity: severity_name(effective.severity.unwrap_or(rule.default_severity))
+                        .into(),
+                    workspace_override: workspace
+                        .as_ref()
+                        .and_then(|id| profile.workspace_overrides.get(id))
+                        .is_some_and(|settings| settings.contains_key(&rule.id)),
+                }
+            })
+            .collect();
+        Ok(ResponseValue::InspectionConfiguration(
+            InspectionConfigurationSummary {
+                profiles: self.inspection_profiles.profiles.keys().cloned().collect(),
+                selected_profile: profile.name.clone(),
+                workspace_specific: workspace.as_ref().is_some_and(|id| {
+                    self.inspection_profiles
+                        .workspace_selection
+                        .contains_key(id)
+                }),
+                rules,
+            },
+        ))
+    }
+
+    fn select_inspection_profile(
+        &mut self,
+        profile_name: &str,
+        workspace_specific: bool,
+    ) -> Result<ResponseValue, ProtocolError> {
+        let workspace = if workspace_specific {
+            Some(root_string(&self.workspace)?)
+        } else {
+            None
+        };
+        let previous = self.inspection_profiles.clone();
+        self.inspection_profiles
+            .select(workspace.as_deref(), profile_name)
+            .map_err(inspection_error)?;
+        if let Err(error) = persist_desktop_settings(
+            self.settings_path.as_deref(),
+            &self.extension_setting_values,
+            &self.inspection_profiles,
+        ) {
+            self.inspection_profiles = previous;
+            return Err(settings_error(error));
+        }
+        self.list_inspection_rules()
+    }
+
+    fn set_inspection_rule(
+        &mut self,
+        rule_id: &str,
+        enabled: bool,
+        severity: Option<&str>,
+        workspace_specific: bool,
+        reset: bool,
+    ) -> Result<ResponseValue, ProtocolError> {
+        let rule = self
+            .inspections
+            .rules()
+            .into_iter()
+            .find(|rule| rule.id == rule_id)
+            .ok_or_else(|| not_found(format!("inspection rule '{rule_id}' is not active")))?;
+        let severity_override = severity
+            .map(parse_severity_name)
+            .transpose()
+            .map_err(|()| {
+                invalid("inspection severity must be error, warning, information, or hint")
+            })?;
+        let workspace = if workspace_specific {
+            Some(root_string(&self.workspace)?)
+        } else {
+            None
+        };
+        let profile_name = self
+            .inspection_profiles
+            .selected_for(workspace.as_deref())
+            .map(|profile| profile.name.clone())
+            .ok_or_else(|| invalid("no inspection profile is selected"))?;
+        let previous = self.inspection_profiles.clone();
+        let profile = self
+            .inspection_profiles
+            .profiles
+            .get_mut(&profile_name)
+            .expect("selected profile is present");
+        if reset {
+            let destination = if let Some(workspace) = workspace.as_deref() {
+                profile.workspace_overrides.get_mut(workspace)
+            } else {
+                Some(&mut profile.rules)
+            };
+            if let Some(settings) = destination {
+                settings.remove(rule_id);
+            }
+        } else {
+            let effective = profile.effective_rule(workspace.as_deref(), &rule);
+            let setting = RuleProfile {
+                enabled,
+                severity: severity_override.or(effective.severity),
+                options: effective.options,
+            };
+            profile
+                .set_rule(workspace.as_deref(), &rule, setting)
+                .map_err(inspection_error)?;
+        }
+        if let Err(error) = persist_desktop_settings(
+            self.settings_path.as_deref(),
+            &self.extension_setting_values,
+            &self.inspection_profiles,
+        ) {
+            self.inspection_profiles = previous;
+            return Err(settings_error(error));
+        }
+        self.list_inspection_rules()
+    }
+
     fn active_tool_windows(&self) -> Vec<ExtensionToolWindowSummary> {
         let mut panels = Vec::new();
         for extension in self
@@ -1267,7 +1433,11 @@ impl DesktopBackend {
         let previous = self
             .extension_setting_values
             .insert(setting_id.into(), value);
-        if let Err(error) = persist_extension_settings(&self.extension_setting_values) {
+        if let Err(error) = persist_desktop_settings(
+            self.settings_path.as_deref(),
+            &self.extension_setting_values,
+            &self.inspection_profiles,
+        ) {
             if let Some(previous) = previous {
                 self.extension_setting_values
                     .insert(setting_id.into(), previous);
@@ -2854,7 +3024,8 @@ fn workspace_error(error: koren_workspace::WorkspaceError) -> ProtocolError {
 fn document_error(error: koren_documents::DocumentError) -> ProtocolError {
     let code = match error {
         koren_documents::DocumentError::Conflict(_)
-        | koren_documents::DocumentError::ConflictChangedAgain(_) => ErrorCode::Conflict,
+        | koren_documents::DocumentError::ConflictChangedAgain(_)
+        | koren_documents::DocumentError::StaleRevision { .. } => ErrorCode::Conflict,
         koren_documents::DocumentError::NotOpen(_) => ErrorCode::NotOpen,
         koren_documents::DocumentError::Workspace(_) => ErrorCode::InvalidPath,
         _ => ErrorCode::InvalidRequest,
@@ -3176,17 +3347,41 @@ fn extension_settings_path() -> Option<PathBuf> {
         .then(|| base.join("koren/extension-settings.json"))
 }
 
-fn load_extension_settings() -> BTreeMap<String, ExtensionSettingValue> {
-    extension_settings_path()
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct PersistedDesktopSettings {
+    #[serde(default)]
+    extension_settings: BTreeMap<String, ExtensionSettingValue>,
+    #[serde(default)]
+    inspection_profiles: InspectionProfiles,
 }
 
-fn persist_extension_settings(
-    values: &BTreeMap<String, ExtensionSettingValue>,
+fn load_desktop_settings(path: Option<&Path>) -> PersistedDesktopSettings {
+    let Some(bytes) = path.and_then(|path| std::fs::read(path).ok()) else {
+        return PersistedDesktopSettings::default();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return PersistedDesktopSettings::default();
+    };
+    parse_desktop_settings(value)
+}
+
+fn parse_desktop_settings(value: serde_json::Value) -> PersistedDesktopSettings {
+    if value.get("extension_settings").is_some() || value.get("inspection_profiles").is_some() {
+        serde_json::from_value(value).unwrap_or_default()
+    } else {
+        PersistedDesktopSettings {
+            extension_settings: serde_json::from_value(value).unwrap_or_default(),
+            inspection_profiles: InspectionProfiles::default(),
+        }
+    }
+}
+
+fn persist_desktop_settings(
+    path: Option<&Path>,
+    extension_settings: &BTreeMap<String, ExtensionSettingValue>,
+    inspection_profiles: &InspectionProfiles,
 ) -> std::io::Result<()> {
-    let Some(path) = extension_settings_path() else {
+    let Some(path) = path else {
         return Err(std::io::Error::other(
             "no user configuration directory is available",
         ));
@@ -3196,9 +3391,39 @@ fn persist_extension_settings(
         .ok_or_else(|| std::io::Error::other("settings path has no parent"))?;
     std::fs::create_dir_all(parent)?;
     let temp_path = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec(values).map_err(std::io::Error::other)?;
+    let bytes = serde_json::to_vec(&PersistedDesktopSettings {
+        extension_settings: extension_settings.clone(),
+        inspection_profiles: inspection_profiles.clone(),
+    })
+    .map_err(std::io::Error::other)?;
     std::fs::write(&temp_path, bytes)?;
     std::fs::rename(temp_path, path)
+}
+
+fn settings_error(error: std::io::Error) -> ProtocolError {
+    ProtocolError {
+        code: ErrorCode::Internal,
+        message: format!("could not save editor settings: {error}"),
+    }
+}
+
+fn severity_name(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Information => "information",
+        Severity::Hint => "hint",
+    }
+}
+
+fn parse_severity_name(value: &str) -> Result<Severity, ()> {
+    match value {
+        "error" => Ok(Severity::Error),
+        "warning" => Ok(Severity::Warning),
+        "information" => Ok(Severity::Information),
+        "hint" => Ok(Severity::Hint),
+        _ => Err(()),
+    }
 }
 
 fn extension_install_root() -> Option<PathBuf> {
@@ -3228,6 +3453,140 @@ mod tests {
     };
 
     struct Temp(PathBuf);
+
+    struct TestInspectionProvider;
+
+    impl InspectionProvider for TestInspectionProvider {
+        fn id(&self) -> &str {
+            "org.example.rules"
+        }
+
+        fn rules(&self) -> Vec<koren_inspections::RuleMetadata> {
+            vec![koren_inspections::RuleMetadata {
+                id: "org.example.rules.todo".into(),
+                provider_id: self.id().into(),
+                title: "TODO marker".into(),
+                description: "Find TODO markers".into(),
+                category: "maintenance".into(),
+                languages: ["plaintext".into()].into_iter().collect(),
+                default_severity: Severity::Warning,
+                supports_fixes: false,
+                options: BTreeMap::new(),
+            }]
+        }
+
+        fn inspect(
+            &self,
+            _document: &koren_inspections::InspectionDocument,
+            _profile: &InspectionProfile,
+            _workspace: Option<&str>,
+            _cancellation: &CancellationToken,
+        ) -> Result<Vec<koren_inspections::Finding>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn desktop_settings_migrate_legacy_values_and_round_trip_profiles() {
+        let legacy = serde_json::json!({
+            "org.example.sample.enabled": true,
+            "org.example.sample.count": 3
+        });
+        let migrated = parse_desktop_settings(legacy);
+        assert_eq!(migrated.extension_settings.len(), 2);
+        assert!(migrated.inspection_profiles.profiles.is_empty());
+
+        let mut profiles = InspectionProfiles::default();
+        profiles.insert(InspectionProfile::new("Default"));
+        profiles.insert(InspectionProfile::new("Strict"));
+        profiles.select(None, "Strict").unwrap();
+        let stored = PersistedDesktopSettings {
+            extension_settings: migrated.extension_settings,
+            inspection_profiles: profiles,
+        };
+        let reloaded = parse_desktop_settings(serde_json::to_value(&stored).unwrap());
+        assert_eq!(reloaded.extension_settings, stored.extension_settings);
+        assert_eq!(reloaded.inspection_profiles, stored.inspection_profiles);
+    }
+
+    #[test]
+    fn inspection_severity_setting_rejects_unknown_names() {
+        assert_eq!(parse_severity_name("error"), Ok(Severity::Error));
+        assert_eq!(parse_severity_name("hint"), Ok(Severity::Hint));
+        assert_eq!(parse_severity_name("critical"), Err(()));
+    }
+
+    #[test]
+    fn desktop_profile_api_applies_workspace_overrides_and_persists_them() {
+        let temp = Temp::new();
+        let config_path = temp.0.join("settings.json");
+        let workspace = temp.0.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend.settings_path = Some(config_path.clone());
+        backend
+            .inspection_profiles
+            .insert(InspectionProfile::new("Strict"));
+        backend
+            .inspections
+            .register(Arc::new(TestInspectionProvider))
+            .unwrap();
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: workspace.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            backend
+                .method(RequestMethod::SelectInspectionProfile {
+                    profile_name: "Strict".into(),
+                    workspace_specific: true,
+                })
+                .unwrap(),
+            ResponseValue::InspectionConfiguration(config)
+                if config.selected_profile == "Strict" && config.workspace_specific
+        ));
+        let configuration = backend
+            .method(RequestMethod::SetInspectionRule {
+                rule_id: "org.example.rules.todo".into(),
+                enabled: false,
+                severity: Some("error".into()),
+                workspace_specific: true,
+                reset: false,
+            })
+            .unwrap();
+        assert!(matches!(configuration,
+            ResponseValue::InspectionConfiguration(config)
+                if config.rules.len() == 1 && !config.rules[0].enabled &&
+                   config.rules[0].severity == "error" && config.rules[0].workspace_override
+        ));
+        let persisted = load_desktop_settings(Some(&config_path));
+        assert_eq!(
+            persisted.inspection_profiles.selected,
+            Some("Default".into())
+        );
+        assert_eq!(
+            persisted
+                .inspection_profiles
+                .workspace_selection
+                .get(&workspace.to_string_lossy().to_string()),
+            Some(&"Strict".into())
+        );
+        let profile = persisted
+            .inspection_profiles
+            .profiles
+            .get("Strict")
+            .unwrap();
+        let rule = profile
+            .workspace_overrides
+            .get(&workspace.to_string_lossy().to_string())
+            .unwrap()
+            .get("org.example.rules.todo")
+            .unwrap();
+        assert!(!rule.enabled);
+        assert_eq!(rule.severity, Some(Severity::Error));
+        backend.shutdown();
+    }
 
     #[test]
     fn extension_setting_values_must_match_declared_type_and_range() {
@@ -3331,6 +3690,190 @@ mod tests {
                 && disabled.themes.is_empty()
         );
         backend.shutdown();
+    }
+
+    #[test]
+    fn lua_inspection_reaches_desktop_ipc_and_stale_edits_are_rejected() {
+        let temp = Temp::new();
+        let workspace = temp.0.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("notes.txt"), "TODO").unwrap();
+        let install_root = temp.0.join("extensions");
+        let extension = install_root.join("org.example.text-inspection");
+        fs::create_dir_all(&extension).unwrap();
+        fs::write(
+            extension.join("koren-extension.toml"),
+            "schema_version=1\nid='org.example.text-inspection'\nname='Text Inspection'\npublisher='Tests'\nversion='0.1.0'\ndescription='fixture'\nentry_point='main.lua'\napi_version='1.0.0'\ncapabilities=['diagnostics','document_read']\n",
+        )
+        .unwrap();
+        fs::write(
+            extension.join("main.lua"),
+            r#"
+              local extension = {}
+              function extension.activate()
+                koren.inspections.register_rule({
+                  id='todo', title='TODO marker', description='Find TODO',
+                  category='maintenance', languages={'plaintext'}, severity='warning'
+                }, function(document, settings)
+                  if not settings.enabled then return {} end
+                  local first, last = document.text:find('TODO', 1, true)
+                  if not first then return {} end
+                  return {{start_line=0, start_column=first - 1, end_line=0,
+                    end_column=last, message='TODO found', explanation='Replace this marker.',
+                    replacement='DONE'}}
+                end)
+              end
+              return extension
+            "#,
+        )
+        .unwrap();
+        let mut state = DesktopBackend::new().unwrap();
+        state.extension_root = Some(install_root);
+        let backend = spawn_backend_with_state(state);
+        let mut request_id = 0;
+        call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::OpenWorkspace {
+                path: workspace.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+        call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::SetExtensionEnabled {
+                extension_id: "org.example.text-inspection".into(),
+                enabled: true,
+            },
+        )
+        .unwrap();
+        call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::ActivateExtension {
+                extension_id: "org.example.text-inspection".into(),
+            },
+        )
+        .unwrap();
+        let document_id = match call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::OpenDocument {
+                path: "notes.txt".into(),
+            },
+        )
+        .unwrap()
+        {
+            ResponseValue::DocumentOpened { document_id, .. } => document_id,
+            other => panic!("unexpected response {other:?}"),
+        };
+        let findings = match call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::InspectDocument {
+                document_id,
+                expected_revision: 0,
+                language: "plaintext".into(),
+            },
+        )
+        .unwrap()
+        {
+            ResponseValue::InspectionFindings {
+                document_revision,
+                findings,
+            } => {
+                assert_eq!(document_revision, 0);
+                findings
+            }
+            other => panic!("unexpected response {other:?}"),
+        };
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].provider_id, "org.example.text-inspection");
+        assert_eq!(findings[0].rule_id, "org.example.text-inspection.todo");
+        assert_eq!(findings[0].actions[0].edits[0].new_text, "DONE");
+
+        call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::ApplyDocumentEdits {
+                document_id,
+                expected_revision: 0,
+                edits: vec![TextEdit {
+                    range: koren_protocol::TextRange {
+                        start: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 4,
+                        },
+                    },
+                    new_text: "LATER".into(),
+                }],
+            },
+        )
+        .unwrap();
+        let stale_edit = call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::ApplyDocumentEdits {
+                document_id,
+                expected_revision: 0,
+                edits: vec![TextEdit {
+                    range: koren_protocol::TextRange {
+                        start: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 4,
+                        },
+                    },
+                    new_text: "DONE".into(),
+                }],
+            },
+        );
+        assert!(
+            matches!(
+                stale_edit,
+                Err(ProtocolError {
+                    code: ErrorCode::Conflict,
+                    ..
+                })
+            ),
+            "stale edit response: {stale_edit:?}"
+        );
+        assert!(matches!(
+            call_backend(
+                &backend,
+                &mut request_id,
+                RequestMethod::ReadDocument { document_id }
+            )
+            .unwrap(),
+            ResponseValue::DocumentContents { contents, revision: 1, .. } if contents == "LATER"
+        ));
+        call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::SetExtensionEnabled {
+                extension_id: "org.example.text-inspection".into(),
+                enabled: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            call_backend(
+                &backend,
+                &mut request_id,
+                RequestMethod::ListInspectionRules
+            )
+            .unwrap(),
+            ResponseValue::InspectionConfiguration(config) if config.rules.is_empty()
+        ));
+        backend.send(BackendCommand::Shutdown).unwrap();
     }
     impl Temp {
         fn new() -> Self {

@@ -3,7 +3,7 @@ import { EditorState } from '@codemirror/state';
 import { basicSetup, EditorView } from 'codemirror';
 import { linter, setDiagnostics, type Diagnostic as CodeMirrorDiagnostic } from '@codemirror/lint';
 import { KorenClient, KorenError, createDesktopTransport } from './services/client';
-import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary, ExtensionSettingSummary, ExtensionSettingValue, ExtensionSummary, ExtensionThemeSummary, ExtensionToolWindowSummary, ExtensionUiDocument, InspectionFinding, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ResponseValue, TaskSummary, TextRange } from './services/protocol';
+import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary, ExtensionSettingSummary, ExtensionSettingValue, ExtensionSummary, ExtensionThemeSummary, ExtensionToolWindowSummary, ExtensionUiDocument, InspectionConfigurationSummary, InspectionFinding, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ResponseValue, TaskSummary, TextRange } from './services/protocol';
 import { approvalChoice, conflictChoice } from './app/dialogs';
 import { commandShortcutMatches, filterCommands, nextCommandSelection } from './app/commands';
 import { activePanelLayout, diagnosticDetailMatches, extensionMenusAt, safeThemeVariables, validExtensionSettingValue } from './app/extensions';
@@ -150,7 +150,7 @@ app.innerHTML = `
   <dialog id="command-dialog" class="dialog command-dialog"><form method="dialog"><header>Command Palette</header><input id="command-search" type="search" placeholder="Search available commands" autocomplete="off" aria-label="Search commands"><div id="command-results" role="listbox" aria-label="Available commands"></div><footer><kbd>↑</kbd><kbd>↓</kbd> navigate <kbd>Enter</kbd> run <kbd>Esc</kbd> close</footer></form></dialog>
   <dialog id="extensions-dialog" class="dialog extensions-dialog"><form method="dialog"><header>Extensions</header><p class="subtle">Local extensions from the configured Koren extensions folder. Code runs only after you enable and activate it.</p><div id="extension-list" class="extension-list"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="language-server-approval-dialog" class="dialog"><form method="dialog"><header>Start language server?</header><p class="subtle">This starts an external program with your user account permissions. Approval is not a sandbox. Review the exact command and workspace.</p><dl id="language-server-approval-details"></dl><div class="dialog-actions"><button value="deny" class="secondary">Deny</button><button value="approve" class="primary">Approve and start</button></div></form></dialog>
-  <dialog id="settings-dialog" class="dialog settings-dialog"><form method="dialog"><header>Settings</header><label for="theme-setting">Color theme</label><select id="theme-setting"><option value="dark">OLED Black</option><option value="light">Light</option></select><div id="extension-settings" class="extension-settings"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
+  <dialog id="settings-dialog" class="dialog settings-dialog"><form method="dialog"><header>Settings</header><label for="theme-setting">Color theme</label><select id="theme-setting"><option value="dark">OLED Black</option><option value="light">Light</option></select><div id="extension-settings" class="extension-settings"></div><section class="inspection-settings"><h3>Inspections</h3><div id="inspection-settings"></div></section><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="info-dialog" class="dialog"><form method="dialog"><header id="info-title"></header><div id="info-content" class="info-content"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="project-wizard-dialog" class="dialog"><form id="project-wizard-form"><header id="project-wizard-title"></header><div id="project-wizard-fields" class="extension-panel-view"></div><p class="subtle">Submitting validates these fields only. Project creation must be performed by a host-authorized extension operation.</p><div class="dialog-actions"><button type="button" class="secondary" data-action="close-wizard">Cancel</button><button type="submit" class="primary">Validate form</button></div></form></dialog>
   <div id="status-toast" role="status" aria-live="polite"></div>`;
@@ -752,7 +752,13 @@ function applyExtensionTheme(theme: ExtensionThemeSummary): void {
   document.querySelector<HTMLSelectElement>('#theme-setting')!.value = `extension:${theme.id}`;
 }
 async function openSettings(): Promise<void> {
-  try { const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value; renderExtensions(catalog); document.querySelector<HTMLDialogElement>('#settings-dialog')!.showModal(); }
+  try {
+    const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value;
+    renderExtensions(catalog);
+    const configuration = expect(await client.call({ method: 'list_inspection_rules' }), 'inspection_configuration').value;
+    renderInspectionSettings(configuration);
+    document.querySelector<HTMLDialogElement>('#settings-dialog')!.showModal();
+  }
   catch (error) { showError(error); }
 }
 function toggleTheme(): void { setTheme(nextTheme(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')); }
@@ -1117,6 +1123,58 @@ async function updateExtensionSetting(settingId: string, value: ExtensionSetting
     await client.call({ method: 'set_extension_setting', params: { setting_id: settingId, value } }); const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value; renderExtensions(catalog); setStatus(`Updated ${settingId}`);
   }
   catch (error) { showError(error); }
+}
+
+function renderInspectionSettings(configuration: InspectionConfigurationSummary): void {
+  const host = document.querySelector<HTMLDivElement>('#inspection-settings')!; host.replaceChildren();
+  const profileLabel = document.createElement('label'); profileLabel.textContent = 'Profile';
+  const profile = document.createElement('select');
+  for (const name of configuration.profiles) { const option = document.createElement('option'); option.value = name; option.textContent = name; profile.append(option); }
+  profile.value = configuration.selected_profile;
+  const workspaceOnly = document.createElement('input'); workspaceOnly.type = 'checkbox';
+  workspaceOnly.checked = configuration.workspace_specific;
+  const workspaceLabel = document.createElement('label'); workspaceLabel.append(workspaceOnly, document.createTextNode('Apply changes to this workspace only'));
+  profile.addEventListener('change', () => void updateInspectionProfile(profile.value, workspaceOnly.checked));
+  profileLabel.append(profile); host.append(profileLabel, workspaceLabel);
+  if (!configuration.rules.length) {
+    const note = document.createElement('p'); note.className = 'subtle'; note.textContent = 'Enable and activate an inspection extension to configure its rules.'; host.append(note); return;
+  }
+  for (const rule of configuration.rules) {
+    const row = document.createElement('div'); row.className = 'inspection-rule';
+    const enabled = document.createElement('input'); enabled.type = 'checkbox'; enabled.checked = rule.enabled;
+    enabled.setAttribute('aria-label', `Enable ${rule.title}`);
+    const label = document.createElement('div'); label.className = 'inspection-rule-description';
+    const title = document.createElement('strong'); title.textContent = rule.title;
+    const detail = document.createElement('small'); detail.textContent = `${rule.id} · ${rule.category}${rule.workspace_override ? ' · workspace override' : ''}`;
+    label.append(title, detail);
+    const severity = document.createElement('select'); severity.setAttribute('aria-label', `${rule.title} severity`);
+    for (const value of ['error', 'warning', 'information', 'hint'] as const) { const option = document.createElement('option'); option.value = value; option.textContent = value; severity.append(option); }
+    severity.value = rule.severity;
+    const save = (): void => void updateInspectionRule(rule.id, enabled.checked, severity.value, workspaceOnly.checked, false);
+    enabled.addEventListener('change', save); severity.addEventListener('change', save);
+    const reset = document.createElement('button'); reset.type = 'button'; reset.className = 'secondary'; reset.textContent = 'Reset';
+    reset.title = 'Restore this rule to provider defaults';
+    reset.addEventListener('click', () => void updateInspectionRule(rule.id, true, null, workspaceOnly.checked, true));
+    row.append(enabled, label, severity, reset); host.append(row);
+  }
+}
+
+async function updateInspectionProfile(profileName: string, workspaceSpecific: boolean): Promise<void> {
+  try {
+    const value = expect(await client.call({ method: 'select_inspection_profile', params: { profile_name: profileName, workspace_specific: workspaceSpecific } }), 'inspection_configuration').value;
+    renderInspectionSettings(value); refreshInspectionsForOpenDocuments();
+  } catch (error) { showError(error); }
+}
+
+async function updateInspectionRule(ruleId: string, enabled: boolean, severity: string | null, workspaceSpecific: boolean, reset: boolean): Promise<void> {
+  try {
+    const value = expect(await client.call({ method: 'set_inspection_rule', params: { rule_id: ruleId, enabled, severity, workspace_specific: workspaceSpecific, reset } }), 'inspection_configuration').value;
+    renderInspectionSettings(value); refreshInspectionsForOpenDocuments();
+  } catch (error) { showError(error); }
+}
+
+function refreshInspectionsForOpenDocuments(): void {
+  for (const tab of tabs.tabs) scheduleInspection(tab.id);
 }
 
 function renderProjectWizards(wizards: ExtensionProjectWizardSummary[]): void {

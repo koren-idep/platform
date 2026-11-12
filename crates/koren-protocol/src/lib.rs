@@ -65,6 +65,28 @@ pub enum RequestMethod {
         /// JSON-compatible primitive value.
         value: ExtensionSettingValue,
     },
+    /// List inspection profiles and rules currently registered by enabled providers.
+    ListInspectionRules,
+    /// Select an existing inspection profile globally or for the active workspace.
+    SelectInspectionProfile {
+        /// Existing profile name.
+        profile_name: String,
+        /// Apply this choice only to the current workspace.
+        workspace_specific: bool,
+    },
+    /// Update one registered rule in the selected profile, or reset it to provider defaults.
+    SetInspectionRule {
+        /// Stable registered rule ID.
+        rule_id: String,
+        /// Enable the rule.
+        enabled: bool,
+        /// Optional severity override.
+        severity: Option<String>,
+        /// Apply this override only to the current workspace.
+        workspace_specific: bool,
+        /// Remove the override and restore provider defaults.
+        reset: bool,
+    },
     /// Explicitly enable an installed extension without executing its code.
     SetExtensionEnabled {
         /// Reverse-DNS extension identifier.
@@ -452,6 +474,8 @@ pub enum ResponseValue {
         /// Fully qualified setting identifier.
         setting_id: String,
     },
+    /// Current inspection profile and rule configuration.
+    InspectionConfiguration(InspectionConfigurationSummary),
     /// Extension lifecycle transition result.
     ExtensionChanged(ExtensionSummary),
     /// Installed extension language-server configurations.
@@ -1096,6 +1120,44 @@ pub struct InspectionFinding {
     pub origin: String,
 }
 
+/// Inspection profile settings exposed to a desktop host.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InspectionConfigurationSummary {
+    /// Available profile names.
+    pub profiles: Vec<String>,
+    /// Selected profile for the current workspace.
+    pub selected_profile: String,
+    /// Whether the active workspace selects its own profile.
+    pub workspace_specific: bool,
+    /// Registered rules and effective values.
+    pub rules: Vec<InspectionRuleSummary>,
+}
+
+/// Registered inspection rule plus the currently effective settings.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InspectionRuleSummary {
+    /// Stable namespaced rule ID.
+    pub id: String,
+    /// Owning provider ID.
+    pub provider_id: String,
+    /// User-facing title.
+    pub title: String,
+    /// Rule description.
+    pub description: String,
+    /// Grouping category.
+    pub category: String,
+    /// Supported language IDs.
+    pub languages: Vec<String>,
+    /// Provider default severity.
+    pub default_severity: String,
+    /// Effective enablement.
+    pub enabled: bool,
+    /// Effective severity.
+    pub severity: String,
+    /// Whether the current workspace overrides the profile setting.
+    pub workspace_override: bool,
+}
+
 /// Related source location for an inspection finding.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InspectionRelatedLocation {
@@ -1514,6 +1576,49 @@ mod tests {
         let encoded = serde_json::to_string(&response).unwrap();
         assert_eq!(
             serde_json::from_str::<Response>(&encoded).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn inspection_profile_contract_round_trips() {
+        let request = Request::new(
+            22,
+            RequestMethod::SetInspectionRule {
+                rule_id: "org.example.todo".into(),
+                enabled: false,
+                severity: Some("error".into()),
+                workspace_specific: true,
+                reset: false,
+            },
+        );
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("set_inspection_rule"));
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), request);
+        let response = Response::new(
+            22,
+            Ok(ResponseValue::InspectionConfiguration(
+                InspectionConfigurationSummary {
+                    profiles: vec!["Default".into()],
+                    selected_profile: "Default".into(),
+                    workspace_specific: true,
+                    rules: vec![InspectionRuleSummary {
+                        id: "org.example.todo".into(),
+                        provider_id: "org.example".into(),
+                        title: "TODO".into(),
+                        description: "Find TODO".into(),
+                        category: "style".into(),
+                        languages: vec!["plaintext".into()],
+                        default_severity: "warning".into(),
+                        enabled: false,
+                        severity: "error".into(),
+                        workspace_override: true,
+                    }],
+                },
+            )),
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(&serde_json::to_string(&response).unwrap()).unwrap(),
             response
         );
     }

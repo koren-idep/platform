@@ -124,6 +124,14 @@ export interface InspectionFinding {
     disabled_reason: string | null }>;
   origin: string;
 }
+export interface InspectionRuleSummary {
+  id: string; provider_id: string; title: string; description: string; category: string;
+  languages: string[]; default_severity: 'error' | 'warning' | 'information' | 'hint';
+  enabled: boolean; severity: 'error' | 'warning' | 'information' | 'hint'; workspace_override: boolean;
+}
+export interface InspectionConfigurationSummary {
+  profiles: string[]; selected_profile: string; workspace_specific: boolean; rules: InspectionRuleSummary[];
+}
 
 export type RequestMethod =
   | { method: 'ping' }
@@ -131,6 +139,9 @@ export type RequestMethod =
   | { method: 'execute_command'; params: { command_id: string } }
   | { method: 'list_extensions' }
   | { method: 'set_extension_setting'; params: { setting_id: string; value: ExtensionSettingValue } }
+  | { method: 'list_inspection_rules' }
+  | { method: 'select_inspection_profile'; params: { profile_name: string; workspace_specific: boolean } }
+  | { method: 'set_inspection_rule'; params: { rule_id: string; enabled: boolean; severity: string | null; workspace_specific: boolean; reset: boolean } }
   | { method: 'set_extension_enabled'; params: { extension_id: string; enabled: boolean } }
   | { method: 'activate_extension'; params: { extension_id: string } }
   | { method: 'start_language_server'; params: { extension_id: string; configuration_id: string } }
@@ -184,6 +195,7 @@ export type ResponseValue =
   | { kind: 'command_output'; value: string }
   | { kind: 'extensions'; value: ExtensionCatalog }
   | { kind: 'extension_setting_updated'; value: { setting_id: string } }
+  | { kind: 'inspection_configuration'; value: InspectionConfigurationSummary }
   | { kind: 'extension_changed'; value: ExtensionSummary }
   | { kind: 'language_servers'; value: LanguageServerSummary[] }
   | { kind: 'language_server_approval_required'; value: LanguageServerApprovalSummary }
