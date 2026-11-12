@@ -138,8 +138,44 @@ export interface ProjectInspectionSummary {
   job_id: number; state: string; completed_documents: number; total_documents: number;
   current_path: string | null; result_count: number; error: string | null;
 }
+export type DebugRequestType = 'launch' | 'attach';
+export type DebugSessionState = 'created' | 'initializing' | 'configuring' | 'running' | 'paused' | 'terminating' | 'terminated' | 'failed';
+export interface DebugCapabilities {
+  requests: { configuration_done: boolean; restart: boolean; cancel: boolean };
+  execution: { terminate: boolean };
+  inspection: { variable_paging: boolean; evaluate_for_hovers: boolean };
+}
+export interface DebugSessionInfo {
+  session_id: number; adapter_id: string; configuration_id: string; request: DebugRequestType;
+  state: DebugSessionState; capabilities: DebugCapabilities; stop_generation: number;
+  stopped_thread_id: number | null; exit_code: number | null; error: string | null;
+}
+export interface DebugConfigurationSummary {
+  id: string; name: string; adapter_id: string; adapter_name: string; request: DebugRequestType;
+  program: string | null; process_id: number | null;
+}
+export interface DebugApprovalSummary {
+  approval_id: number; adapter_name: string; adapter_command: string; adapter_arguments: string[];
+  adapter_working_directory: string; adapter_environment_keys: string[]; request: DebugRequestType;
+  program: string | null; process_id: number | null; arguments: string[]; working_directory: string;
+  environment_keys: string[]; expires_in_ms: number;
+}
+export interface DebugBreakpointSpec {
+  line: number; column: number | null; condition: string | null; hit_condition: string | null;
+  log_message: string | null; enabled: boolean;
+}
+export interface DebugSourceBreakpoint extends DebugBreakpointSpec {
+  id: number; verified: boolean | null; actual_line: number | null; message: string | null;
+}
+export interface DebugVariableReference { session_id: number; stop_generation: number; adapter_reference: number }
+export interface DebugEvent {
+  kind: 'state_changed' | 'response' | 'output' | 'adapter_diagnostic' | 'breakpoint_changed' | 'adapter_event' | 'error' | 'closed';
+  session_id: number; info?: DebugSessionInfo; request_id?: number; command?: string; success?: boolean;
+  body?: unknown; message?: string | null; category?: string; output?: string; source?: string | null;
+  line?: number | null; breakpoint?: DebugSourceBreakpoint; event?: string;
+}
 
-export type RequestMethod =
+export type ExistingRequestMethod =
   | { method: 'ping' }
   | { method: 'list_commands' }
   | { method: 'execute_command'; params: { command_id: string } }
@@ -212,6 +248,19 @@ export type RequestMethod =
   | { method: 'terminal_write'; params: { session_id: number; input_base64: string } }
   | { method: 'terminal_resize'; params: { session_id: number; rows: number; columns: number } }
   | { method: 'close_terminal'; params: { session_id: number; terminate_active: boolean } };
+// Debug operations use the same typed protocol-v2 bridge and host event stream.
+export type DebugRequestMethod =
+  | { method: 'register_debug_configuration'; params: { adapter: { id: string; name: string; command: string; arguments: string[]; working_directory: string; environment: Record<string, string> }; configuration: { id: string; name: string; adapter_id: string; request: DebugRequestType; program: string | null; process_id: number | null; arguments: string[]; working_directory: string; environment: Record<string, string>; adapter_settings: Record<string, unknown>; stop_on_entry: boolean } } }
+  | { method: 'list_debug_configurations' }
+  | { method: 'request_debug_start'; params: { configuration_id: string } }
+  | { method: 'approve_debug_start'; params: { approval_id: number } }
+  | { method: 'deny_debug_start'; params: { approval_id: number } }
+  | { method: 'list_debug_sessions' }
+  | { method: 'debug_action'; params: { session_id: number; action: string; thread_id: number | null } }
+  | { method: 'debug_inspect'; params: { session_id: number; operation: string; thread_id: number | null; frame_id: number | null; reference: DebugVariableReference | null; start: number; count: number } }
+  | { method: 'set_debug_breakpoints'; params: { source: string; breakpoints: DebugBreakpointSpec[] } }
+  | { method: 'stop_debug_session'; params: { session_id: number } };
+export type RequestMethod = ExistingRequestMethod | DebugRequestMethod;
 
 export interface TextPosition { line: number; character: number }
 export interface TextRange { start: TextPosition; end: TextPosition }
@@ -284,7 +333,14 @@ export type ResponseValue =
   | { kind: 'terminal_sessions'; value: TerminalSessionSummary[] }
   | { kind: 'terminal_approved'; value: { request_id: number; session: TerminalSessionSummary } }
   | { kind: 'terminal_denied'; value: { request_id: number } }
-  | { kind: 'terminal_action'; value: { session_id: number } };
+  | { kind: 'terminal_action'; value: { session_id: number } }
+  | { kind: 'debug_configurations'; value: DebugConfigurationSummary[] }
+  | { kind: 'debug_approval_required'; value: DebugApprovalSummary }
+  | { kind: 'debug_session_started'; value: DebugSessionInfo }
+  | { kind: 'debug_sessions'; value: DebugSessionInfo[] }
+  | { kind: 'debug_request_accepted'; value: { session_id: number; request_id: number } }
+  | { kind: 'debug_breakpoints'; value: DebugSourceBreakpoint[] }
+  | { kind: 'debug_denied'; value: { approval_id: number } };
 
 export interface GitRepositorySummary { root: string; branch: string | null; has_head: boolean }
 export interface GitChangedFile { path: string; staged: boolean; unstaged: boolean; untracked: boolean; deleted: boolean; conflicted: boolean }
@@ -307,4 +363,5 @@ export interface PlatformEvent {
   root?: string; path?: string; previous_path?: string; operation?: string; commit?: string;
   diagnostics?: LanguageDiagnosticSet; message?: string; terminal_id?: number; sequence?: number;
   data_base64?: string; terminal_state?: TerminalSessionSummary['state']; exit_code?: number; terminal_process_group_active?: boolean;
+  debug_id?: number; debug_event?: DebugEvent;
 }

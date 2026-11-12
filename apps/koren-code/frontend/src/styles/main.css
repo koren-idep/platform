@@ -306,6 +306,31 @@ kbd {
 .terminal-toolbar { display: flex; align-items: center; gap: 6px; min-height: 32px; padding: 3px 8px; border-bottom: 1px solid var(--border); }
 .terminal-toolbar button { padding: 3px 8px; }
 .terminal-toolbar [data-terminal-status] { min-width: 0; overflow: hidden; margin-left: auto; text-overflow: ellipsis; white-space: nowrap; }
+.debug-panel { display: flex; flex-direction: column; gap: 6px; overflow: hidden; padding: 0; }
+.debug-toolbar { display: flex; align-items: center; gap: 5px; min-height: 32px; padding: 3px 8px; border-bottom: 1px solid var(--border); }
+.debug-toolbar button { padding: 3px 7px; }
+.debug-toolbar select { max-width: 200px; }
+.debug-toolbar [data-debug-state] { margin-left: auto; }
+.debug-config-editor { margin: 0 8px; }
+.debug-config-editor summary { color: var(--muted); cursor: pointer; font-size: 11px; }
+.debug-config-form { display: grid; grid-template-columns: repeat(5, minmax(130px, 1fr)); gap: 5px; padding: 6px 0; }
+.debug-config-form label { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: 10px; }
+.debug-config-form input { min-width: 0; height: 25px; padding: 3px 6px; font-size: 11px; }
+.debug-config-form .subtle { align-self: center; font-size: 10px; }
+.debug-columns { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(280px, 1.5fr); gap: 12px; min-height: 0; flex: 1; overflow: auto; padding: 0 10px 8px; }
+.debug-columns h3 { margin: 5px 0 3px; color: var(--muted); font-size: 11px; font-weight: 600; }
+.debug-columns section > div:not(.debug-output) { display: flex; flex-direction: column; align-items: stretch; }
+.debug-columns section button { border: 0; padding: 3px 5px; text-align: left; font-size: 11px; }
+.debug-output { max-height: 120px; overflow: auto; border-top: 1px solid var(--border); padding-top: 4px; font: 11px/1.5 var(--mono); white-space: pre-wrap; }
+.debug-variable-list { margin: 0; padding-left: 16px; list-style: none; font: 11px/1.5 var(--mono); }
+.debug-variable-name { color: var(--accent); }
+.debug-variable-value { color: var(--text); }
+.cm-debug-gutter { width: 16px; cursor: pointer; }
+.cm-debug-marker { display: block; width: 100%; text-align: center; line-height: 1.4; font-size: 11px; }
+.cm-debug-marker-active { color: #f05d61; }
+.cm-debug-marker-disabled { color: #777; }
+.cm-debug-marker-unverified { color: #d7a64a; }
+.cm-debug-marker-execution { color: #5aabff; }
 .terminal-session-tabs { display: flex; gap: 2px; min-height: 29px; overflow-x: auto; border-bottom: 1px solid var(--border); }
 .terminal-session-tab { max-width: 190px; overflow: hidden; padding: 4px 10px; color: var(--muted); background: transparent; border: 0; border-bottom: 2px solid transparent; text-overflow: ellipsis; white-space: nowrap; }
 .terminal-session-tab.selected { color: var(--text); border-bottom-color: var(--accent); }

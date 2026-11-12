@@ -23,6 +23,7 @@ import { editsFromViewUpdate } from './editor/transactions';
 import { languageForPath, languageIdForPath, languageNameForPath } from './editor/languages';
 import { flushAndSave } from './editor/save';
 import { languageServiceExtensions } from './editor/languageServices';
+import { debugGutter } from './editor/debugGutter';
 import './styles/main.css';
 
 const client = new KorenClient(createDesktopTransport());
@@ -135,7 +136,7 @@ app.innerHTML = `
       <div class="bottom-resizer" id="bottom-resizer" role="separator" aria-label="Resize bottom panel" aria-orientation="horizontal" tabindex="0"></div>
       <section class="bottom-panel" id="bottom-panel">
         <div class="bottom-heading"><div class="tool-tabs" role="tablist" aria-label="Tool panels">
-          <button class="selected" data-panel="output" role="tab" aria-selected="true">Output</button><button data-panel="problems" role="tab" aria-selected="false">Problems <span id="problem-count" class="count-badge">0</span></button><button data-panel="tasks" role="tab" aria-selected="false">Tasks</button><button data-panel="projects" role="tab" aria-selected="false">Projects</button><button data-panel="search" role="tab" aria-selected="false">Search</button><button data-panel="terminal" role="tab" aria-selected="false">Terminal</button>
+          <button class="selected" data-panel="output" role="tab" aria-selected="true">Output</button><button data-panel="problems" role="tab" aria-selected="false">Problems <span id="problem-count" class="count-badge">0</span></button><button data-panel="tasks" role="tab" aria-selected="false">Tasks</button><button data-panel="projects" role="tab" aria-selected="false">Projects</button><button data-panel="search" role="tab" aria-selected="false">Search</button><button data-panel="terminal" role="tab" aria-selected="false">Terminal</button><button data-panel="debug" role="tab" aria-selected="false">Debug</button>
         </div><span id="bottom-task-state" class="task-state"></span><span class="panel-actions"><button data-action="cancel-task" title="Cancel active task" aria-label="Cancel active task" disabled>■</button><button data-action="toggle-bottom" title="Collapse bottom panel" aria-label="Collapse bottom panel">⌄</button></span></div>
         <div id="output" class="panel-content output"><div class="panel-empty">Task output will appear here.</div></div>
         <div id="problems" class="panel-content problem-list hidden"><div class="problem-filters"><label>Severity <select id="problem-severity-filter"><option value="all">All</option><option value="error">Errors</option><option value="warning">Warnings</option><option value="information">Information</option><option value="hint">Hints</option></select></label><label>Group by <select id="problem-grouping"><option value="file">File</option><option value="provider">Provider</option><option value="category">Category</option><option value="severity">Severity</option></select></label></div><div id="problem-entries"><div class="panel-empty">No problems reported by installed language integrations.</div></div></div>
@@ -143,6 +144,11 @@ app.innerHTML = `
         <div id="projects" class="panel-content project-list hidden"><div class="project-analysis-controls"><button data-action="start-project-analysis">Analyze Open Documents</button><button data-action="cancel-project-analysis" disabled>Cancel</button><button data-action="load-project-findings" hidden>Load More Findings</button><span id="project-analysis-status">Uses a bounded snapshot of currently open documents.</span></div><div id="project-list"><div class="panel-empty">Project information will appear here.</div></div></div>
         <div id="search" class="panel-content developer-panel hidden"><form id="search-form" class="developer-controls"><input id="search-query" type="search" placeholder="Search workspace" aria-label="Search workspace"><input id="search-filter" type="text" placeholder="Files to include (glob)" aria-label="File name filter"><label><input id="search-case" type="checkbox"> Match case</label><label><input id="search-regex" type="checkbox"> Regex</label><button type="submit">Search</button><button type="button" data-action="cancel-search" disabled>Cancel</button></form><div id="search-status" class="subtle">Search starts only when requested. Results are limited to 5,000.</div><div id="search-results" class="developer-results"></div></div>
         <div id="terminal" class="panel-content terminal-panel hidden"><div class="terminal-toolbar"><button type="button" data-terminal-new>＋ New</button><button type="button" data-terminal-rename disabled>Rename</button><button type="button" data-terminal-restart disabled>Restart</button><button type="button" data-terminal-close disabled>Close</button><span data-terminal-status class="subtle">No terminal sessions.</span></div><div class="terminal-session-tabs" data-terminal-tabs role="tablist" aria-label="Terminal sessions"></div><div class="terminal-session-views" data-terminal-views></div><div class="terminal-shortcut-hint">Ctrl+Shift+C copy · Ctrl+Shift+V paste · Ctrl+L clear display</div></div>
+        <div id="debug" class="panel-content debug-panel hidden">
+          <div class="debug-toolbar"><select data-debug-configuration aria-label="Debug configuration"></select><button type="button" data-debug-start disabled>Start</button><button type="button" data-debug-continue disabled>Continue</button><button type="button" data-debug-pause disabled>Pause</button><button type="button" data-debug-step-over disabled>Step Over</button><button type="button" data-debug-step-into disabled>Step Into</button><button type="button" data-debug-step-out disabled>Step Out</button><button type="button" data-debug-stop disabled>Stop</button><select data-debug-session aria-label="Active debug session"></select><button type="button" data-debug-refresh title="Refresh sessions">↻</button><span data-debug-state class="subtle">No active debug session</span></div>
+          <details data-debug-config-editor class="debug-config-editor"><summary>Configure local DAP profile</summary><form data-debug-config-form class="debug-config-form"><label>Adapter ID <input name="adapter_id" required placeholder="local.dap"></label><label>Adapter name <input name="adapter_name" placeholder="Debug Adapter"></label><label>Adapter executable <input name="adapter_command" required placeholder="/path/to/adapter"></label><label>Adapter arguments <input name="adapter_arguments" placeholder="--stdio"></label><label>Adapter working directory <input name="adapter_directory" required placeholder="/workspace"></label><label>Configuration ID <input name="configuration_id" required placeholder="app.launch"></label><label>Configuration name <input name="configuration_name" placeholder="Launch application"></label><label>Program <input name="program" required placeholder="/workspace/target/debug/app"></label><label>Program arguments <input name="arguments" placeholder="--help"></label><label>Target working directory <input name="working_directory" required placeholder="/workspace"></label><button class="primary" type="submit">Save profile</button><span class="subtle">Saved profiles never start until you review and approve each exact launch.</span></form></details>
+          <div class="debug-columns"><section><h3>Threads</h3><div data-debug-threads></div><h3>Call Stack</h3><div data-debug-stack></div></section><section><h3>Variables</h3><div data-debug-variables></div><h3>Breakpoints</h3><div data-debug-breakpoints></div><h3>Debug Output</h3><div data-debug-output class="debug-output" role="log" aria-live="polite"></div></section></div>
+        </div>
         <div id="source-control" class="panel-content developer-panel hidden"><div class="developer-controls"><select id="git-repository" aria-label="Git repository"><option value="">No repository selected</option></select><button data-action="refresh-git">↻ Refresh</button></div><div id="git-branch" class="subtle"></div><div class="git-columns"><section><h3>Changes</h3><div id="git-unstaged" class="developer-results"></div></section><section><h3>Staged</h3><div id="git-staged" class="developer-results"></div></section></div><pre id="git-diff" class="git-diff" aria-label="Git diff preview"></pre><form id="git-commit-form" class="developer-controls"><input id="git-commit-message" type="text" placeholder="Commit message" aria-label="Commit message"><button type="submit">Commit staged</button></form></div>
         <div id="extension-panel-content"></div>
       </section>
@@ -162,6 +168,7 @@ app.innerHTML = `
   <dialog id="extensions-dialog" class="dialog extensions-dialog"><form method="dialog"><header>Extensions</header><p class="subtle">Local extensions from the configured Koren extensions folder. Code runs only after you enable and activate it.</p><div id="extension-list" class="extension-list"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="language-server-approval-dialog" class="dialog"><form method="dialog"><header>Start language server?</header><p class="subtle">This starts an external program with your user account permissions. Approval is not a sandbox. Review the exact command and workspace.</p><dl id="language-server-approval-details"></dl><div class="dialog-actions"><button value="deny" class="secondary">Deny</button><button value="approve" class="primary">Approve and start</button></div></form></dialog>
   <dialog id="terminal-approval-dialog" class="dialog"><form><header>Start interactive shell?</header><p class="subtle">Approval grants this shell interactive access using your account permissions. Commands entered later are not individually reviewed, and this is not a filesystem sandbox.</p><dl data-terminal-approval-details></dl><div class="dialog-actions"><button type="submit" value="deny" class="secondary">Deny</button><button type="submit" value="approve" class="primary">Approve and start</button></div></form></dialog>
+  <dialog id="debug-approval-dialog" class="dialog"><form><header>Authorize debugger and target?</header><p class="subtle">The adapter can inspect the target process. Approval is not a sandbox. Environment values are hidden.</p><dl data-debug-approval-details></dl><div class="dialog-actions"><button type="submit" value="deny" class="secondary">Deny</button><button type="submit" value="approve" class="primary">Approve once</button></div></form></dialog>
   <dialog id="settings-dialog" class="dialog settings-dialog"><form method="dialog"><header>Settings</header><label for="theme-setting">Color theme</label><select id="theme-setting"><option value="dark">OLED Black</option><option value="light">Light</option></select><div id="extension-settings" class="extension-settings"></div><section class="inspection-settings"><h3>Inspections</h3><div id="inspection-settings"></div></section><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="info-dialog" class="dialog"><form method="dialog"><header id="info-title"></header><div id="info-content" class="info-content"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="workspace-input-dialog" class="dialog"><form id="workspace-input-form"><header id="workspace-input-title"></header><label id="workspace-input-label" for="workspace-input"></label><input id="workspace-input" type="text" autocomplete="off"><div class="dialog-actions"><button type="button" value="cancel" class="secondary">Cancel</button><button type="submit" class="primary">Continue</button></div></form></dialog>
@@ -170,10 +177,20 @@ app.innerHTML = `
   <div id="status-toast" role="status" aria-live="polite"></div>`;
 
 let terminalPanel: import('./app/terminal').TerminalPanel | null = null;
+let debugPanel: import('./app/debug').DebugPanel | null = null;
+const debugGutterRefreshers = new Map<number, () => void>();
 async function loadTerminalPanel(): Promise<void> {
   if (terminalPanel) return;
   const { TerminalPanel } = await import('./app/terminal');
   terminalPanel ??= new TerminalPanel(document.querySelector<HTMLElement>('#terminal')!, client);
+}
+async function loadDebugPanel(): Promise<void> {
+  if (debugPanel) return;
+  const { DebugPanel } = await import('./app/debug');
+  debugPanel ??= new DebugPanel(
+    document.querySelector<HTMLElement>('#debug')!, client, navigateDebugSource, showError,
+    () => debugGutterRefreshers.forEach((refresh) => refresh()),
+  );
 }
 
 const treeState = new ProjectTreeState();
@@ -459,7 +476,8 @@ async function openDocument(path: string): Promise<void> {
       dirty: content.dirty, language: languageNameForPath(path), lineEnding: lineEndingFor(content.contents),
     };
     tabs.open(tab); selectedPath = path;
-    const { state, pipeline, lineEnding, languageConfig } = await createDocumentState(tab, content.contents, content.revision);
+    const { state, pipeline, lineEnding, languageConfig, refreshDebugGutter } = await createDocumentState(tab, content.contents, content.revision);
+    debugGutterRefreshers.set(tab.id, refreshDebugGutter);
     documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig });
     if (!editor) editor = new EditorView({ state, parent: editorHost }); else editor.setState(state);
     welcome.classList.add('hidden'); editorHost.classList.remove('hidden');
@@ -468,11 +486,35 @@ async function openDocument(path: string): Promise<void> {
   } catch (error) { showError(error); }
 }
 
-async function createDocumentState(tab: EditorTab, contents: string, revision: number): Promise<{ state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment }> {
+async function navigateDebugSource(path: string, zeroBasedLine: number): Promise<void> {
+  const rootPath = workspaceRoot.replaceAll('\\', '/').replace(/\/+$/, '');
+  const absolute = path.replaceAll('\\', '/');
+  if (!rootPath || !absolute.startsWith(`${rootPath}/`)) {
+    setStatus('Debug source is outside the open workspace; navigation was skipped.'); return;
+  }
+  const relative = absolute.slice(rootPath.length + 1);
+  if (relative.split('/').some((part) => part === '..' || part === '')) {
+    setStatus('Debug source path is not a safe workspace path.'); return;
+  }
+  await openDocument(relative);
+  const tab = tabs.active;
+  if (!tab || !editor) return;
+  const line = Math.max(1, Math.min(editor.state.doc.lines, zeroBasedLine + 1));
+  const position = editor.state.doc.line(line).from;
+  editor.dispatch({ selection: { anchor: position }, effects: EditorView.scrollIntoView(position, { y: 'center' }) });
+  editor.focus();
+}
+
+async function createDocumentState(tab: EditorTab, contents: string, revision: number): Promise<{ state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment; refreshDebugGutter: () => void }> {
   const lineEnding = lineEndingFor(contents);
   const lineSeparator = lineEnding === 'CRLF' ? '\r\n' : '\n';
   const languageExtensions = await languageForPath(tab.path);
   const languageConfig = new Compartment();
+  const gutter = debugGutter(tab.path,
+    (source, line) => debugPanel?.breakpointState(source, line) ?? null,
+    (source) => debugPanel?.executionLine(source) ?? null,
+    (source, line) => { void loadDebugPanel().then(() => debugPanel?.toggleBreakpoint(source, line)).catch(showError); });
+  const refreshDebugGutter = () => { if (tabs.activeId === tab.id && editor) gutter.refresh(editor); };
   const serviceExtensions = languageServiceExtensions(client, {
     documentId: tab.id,
     revision: () => documentViews.get(tab.id)?.pipeline.currentRevision ?? revision,
@@ -490,7 +532,7 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
   });
   const state = EditorState.create({
     doc: contents,
-    extensions: [basicSetup, linter(() => []), theme, EditorState.tabSize.of(4), EditorState.lineSeparator.of(lineSeparator), EditorView.lineWrapping, languageConfig.of(languageExtensions), ...serviceExtensions,
+    extensions: [basicSetup, linter(() => []), theme, EditorState.tabSize.of(4), EditorState.lineSeparator.of(lineSeparator), EditorView.lineWrapping, languageConfig.of(languageExtensions), ...serviceExtensions, gutter.extension,
       EditorView.updateListener.of((update) => {
         const entry = documentViews.get(tab.id);
         if (!entry) return;
@@ -513,7 +555,7 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
     },
   }, () => documentViews.get(tab.id)?.state.doc.toString() ?? contents,
   (newRevision, dirty) => { tabs.update(tab.id, { revision: newRevision, dirty }); renderTabs(); updateStatusDocument(); }, showError);
-  return { state, pipeline, lineEnding, languageConfig };
+  return { state, pipeline, lineEnding, languageConfig, refreshDebugGutter };
 }
 
 async function refreshDocumentLanguage(documentId: number): Promise<void> {
@@ -598,7 +640,7 @@ async function closeTab(tab: EditorTab): Promise<void> {
     await documentViews.get(tab.id)?.pipeline.flush();
     await client.call({ method: 'close_document', params: { document_id: tab.id, discard_unsaved_changes: action === 'discard' } });
     const wasActive = tabs.activeId === tab.id;
-    tabs.close(tab.id); documentViews.delete(tab.id); diagnosticsByDocument.delete(tab.id); inspectionFindingsByDocument.delete(tab.id);
+    tabs.close(tab.id); documentViews.delete(tab.id); debugGutterRefreshers.delete(tab.id); diagnosticsByDocument.delete(tab.id); inspectionFindingsByDocument.delete(tab.id);
     const inspectionTimer = inspectionTimers.get(tab.id); if (inspectionTimer !== undefined) window.clearTimeout(inspectionTimer);
     inspectionTimers.delete(tab.id); inspectionGenerations.delete(tab.id); renderProblems();
     if (wasActive && tabs.activeId !== null) selectTab(tabs.activeId); else renderTabs();
@@ -649,9 +691,10 @@ async function showConflict(tab: EditorTab): Promise<void> {
     tabs.update(tab.id, { revision: decision.revision, dirty: decision.dirty });
     if (action === 'reload') {
       const content = expect(await client.call({ method: 'read_document', params: { document_id: tab.id } }), 'document_contents').value;
-      const { state, pipeline, lineEnding, languageConfig } = await createDocumentState(tab, content.contents, content.revision);
+      const { state, pipeline, lineEnding, languageConfig, refreshDebugGutter } = await createDocumentState(tab, content.contents, content.revision);
       tabs.update(tab.id, { lineEnding });
       documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig });
+      debugGutterRefreshers.set(tab.id, refreshDebugGutter);
       if (tabs.activeId === tab.id && editor) editor.setState(state);
     }
     renderTabs(); updateStatusDocument();
@@ -677,7 +720,7 @@ async function chooseWorkspace(): Promise<void> {
       await client.call({ method: 'close_document', params: { document_id: tab.id, discard_unsaved_changes: discard } });
     }
     await client.call({ method: 'close_workspace' });
-    for (const tab of [...tabs.tabs]) { tabs.close(tab.id); documentViews.delete(tab.id); }
+    for (const tab of [...tabs.tabs]) { tabs.close(tab.id); documentViews.delete(tab.id); debugGutterRefreshers.delete(tab.id); }
     workspaceRoot = ''; selectedPath = ''; taskById.clear();
     rootLabel.textContent = 'No Workspace'; rootLabel.removeAttribute('title');
     document.querySelector('#status-workspace')!.textContent = '';
@@ -850,6 +893,7 @@ function queueOutputRefresh(id: number): void {
   outputRefreshTimer = window.setTimeout(() => { outputRefreshTimer = 0; void updateTaskOutput(id); }, 100);
 }
 function handlePlatformEvent(event: PlatformEvent): void {
+  if (event.kind === 'debug_event') { debugPanel?.handleEvent(event); return; }
   if (event.kind.startsWith('terminal_')) { terminalPanel?.handleEvents([event]); return; }
   if (event.kind === 'git_status_changed' && gitStatus?.root === event.root) void refreshGitStatus();
   if (event.kind === 'git_operation_completed' && event.operation) setStatus(`Git ${event.operation}${event.commit ? ` · ${event.commit.slice(0, 8)}` : ''}`);
@@ -869,7 +913,7 @@ function handlePlatformEvent(event: PlatformEvent): void {
     if (event.document_id) { diagnosticsByDocument.delete(event.document_id); inspectionFindingsByDocument.delete(event.document_id); renderProblems(); scheduleInspection(event.document_id); }
   }
   if (event.kind === 'document_closed' && event.document_id && tabs.tabs.some((tab) => tab.id === event.document_id)) {
-    documentViews.delete(event.document_id); tabs.close(event.document_id); renderTabs();
+    documentViews.delete(event.document_id); debugGutterRefreshers.delete(event.document_id); tabs.close(event.document_id); renderTabs();
     if (tabs.active) selectTab(tabs.active.id); else { editorHost.classList.add('hidden'); welcome.classList.remove('hidden'); editor = null; updateStatusDocument(); }
   }
   if (event.kind === 'task_output_available' && event.run_id) queueOutputRefresh(event.run_id);
@@ -919,11 +963,12 @@ function toggleTheme(): void { setTheme(nextTheme(document.documentElement.datas
 
 function showPanel(panel: 'output' | 'problems' | 'tasks' | 'projects' | string): void {
   if (panel === 'terminal') void loadTerminalPanel().catch(showError);
+  if (panel === 'debug') void loadDebugPanel().catch(showError);
   for (const button of document.querySelectorAll<HTMLButtonElement>('[data-panel]')) {
     const selected = button.dataset.panel === panel;
     button.classList.toggle('selected', selected); button.setAttribute('aria-selected', String(selected));
   }
-  for (const id of ['output', 'problems', 'tasks', 'projects', 'search', 'source-control', 'terminal']) document.querySelector(`#${id}`)!.classList.toggle('hidden', id !== panel);
+  for (const id of ['output', 'problems', 'tasks', 'projects', 'search', 'source-control', 'terminal', 'debug']) document.querySelector(`#${id}`)!.classList.toggle('hidden', id !== panel);
   for (const host of document.querySelectorAll<HTMLElement>('[data-extension-panel]')) host.classList.toggle('hidden', host.dataset.extensionPanel !== panel);
   if (panel.startsWith('org.') || panel.includes('.')) { activeDynamicPanel = panel; localStorage.setItem('koren.activeExtensionPanel', panel); }
   setBottomCollapsed(false);
