@@ -210,7 +210,7 @@ One local run on 2026-11-11, Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, In
 | One-file text diff | 50 runs | 1.36 ms mean, 1.14 ms minimum | Bounded libgit2 patch generation |
 | Stage plus unstage | 50 runs | 1.60 ms mean, 1.31 ms minimum | One selected tracked file per operation pair |
 | Search result grouping | 5,000 results / 100 files, 50 runs | 0.337 ms mean, 0.206 ms median | Production grouping helper; excludes DOM construction and browser paint |
-| Desktop startup | 1 smoke run | 177.3 ms to window; 403,556 KiB process-tree RSS after 1 s | Debug executable, one local Linux/Xvfb run; same smoke timing and RSS boundary as above |
+| Desktop startup | 1 smoke run | 173.9 ms to window; 403,380 KiB process-tree RSS after 1 s | Debug executable, one local Linux/Xvfb run; same smoke timing and RSS boundary as above |
 
 These fixtures are small local microbenchmarks on a temporary filesystem. They do not measure cold disks, network filesystems, very large repositories, UI paint, or concurrent editing. The Git dependency's native build/link size is platform/toolchain dependent. The startup result above is one local debug run; it measures process-start to window appearance and one-second process-tree RSS, not interactive latency. Windows and macOS were not measured.
 
