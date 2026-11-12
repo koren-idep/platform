@@ -6,8 +6,9 @@
 //! operating-system security sandbox. No task/process or network API is exposed here.
 
 use koren_extensions::{
-    Capability, CommandCallback, CommandContext, ContributionBuilder, ExtensionError,
-    ExtensionManifest, MenuLocation,
+    Capability, CommandCallback, CommandContext, CommandEnablement, CommandOptions,
+    ContributionBuilder, DesignToken, DiagnosticDetailDefinition, ExtensionError,
+    ExtensionManifest, MenuLocation, SettingKind, SettingValue, ThemeBase, UiDocument, UiElement,
 };
 use koren_protocol::{TextPosition, TextRange};
 use mlua::{Function, HookTriggers, Lua, LuaOptions, RegistryKey, StdLib, Table, Value, VmState};
@@ -51,6 +52,8 @@ pub struct LuaHostContext {
     pub workspace_root: Option<PathBuf>,
     /// Active document snapshot, supplied by the host for the duration it chooses.
     pub active_document: Option<LuaDocumentContext>,
+    /// Effective host-validated namespaced extension settings.
+    pub settings: BTreeMap<String, SettingValue>,
 }
 
 /// Active document data made available to extensions that declare `document_read`.
@@ -84,12 +87,40 @@ struct StagedCommand {
     id: String,
     title: String,
     description: String,
+    options: CommandOptions,
 }
 #[derive(Clone)]
 struct StagedMenu {
     command_id: String,
     label: String,
     location: MenuLocation,
+}
+#[derive(Clone)]
+struct StagedToolWindow {
+    id: String,
+    title: String,
+    text: String,
+}
+#[derive(Clone)]
+struct StagedSetting {
+    id: String,
+    title: String,
+    kind: SettingKind,
+}
+#[derive(Clone)]
+struct StagedTheme {
+    id: String,
+    title: String,
+    base: ThemeBase,
+    tokens: BTreeMap<DesignToken, String>,
+}
+#[derive(Clone)]
+struct StagedDiagnosticDetail {
+    id: String,
+    source: Option<String>,
+    code: Option<String>,
+    title: String,
+    explanation: String,
 }
 struct VmStateData {
     lua: Lua,
@@ -99,6 +130,7 @@ struct VmStateData {
     module_key: Option<RegistryKey>,
     context: Arc<Mutex<LuaHostContext>>,
     edit_requests: Arc<Mutex<VecDeque<DocumentEditRequest>>>,
+    ui_updates: Arc<Mutex<VecDeque<(String, String)>>>,
     instructions: Arc<AtomicU64>,
     limits: LuaLimits,
 }
@@ -206,19 +238,29 @@ impl LuaExtensionRuntime {
 
         let context = Arc::new(Mutex::new(context));
         let edit_requests = Arc::new(Mutex::new(VecDeque::new()));
+        let ui_updates = Arc::new(Mutex::new(VecDeque::new()));
         let command_keys = Arc::new(Mutex::new(BTreeMap::<String, RegistryKey>::new()));
         let event_keys = Arc::new(Mutex::new(BTreeMap::<String, Vec<RegistryKey>>::new()));
         let staged_commands = Arc::new(Mutex::new(Vec::<StagedCommand>::new()));
         let staged_menus = Arc::new(Mutex::new(Vec::<StagedMenu>::new()));
+        let staged_tool_windows = Arc::new(Mutex::new(Vec::<StagedToolWindow>::new()));
+        let staged_settings = Arc::new(Mutex::new(Vec::<StagedSetting>::new()));
+        let staged_themes = Arc::new(Mutex::new(Vec::<StagedTheme>::new()));
+        let staged_diagnostic_details = Arc::new(Mutex::new(Vec::<StagedDiagnosticDetail>::new()));
         let api = create_api(
             &lua,
             manifest,
             &context,
             edit_requests.clone(),
-            command_keys.clone(),
+            &command_keys,
             event_keys.clone(),
-            staged_commands.clone(),
+            &staged_commands,
             staged_menus.clone(),
+            staged_tool_windows.clone(),
+            staged_settings.clone(),
+            staged_themes.clone(),
+            staged_diagnostic_details.clone(),
+            ui_updates.clone(),
         )
         .map_err(|error| lua_error(&error))?;
         lua.globals()
@@ -256,6 +298,7 @@ impl LuaExtensionRuntime {
                 module_key: Some(module_key),
                 context,
                 edit_requests,
+                ui_updates,
                 instructions,
                 limits,
             })),
@@ -274,7 +317,13 @@ impl LuaExtensionRuntime {
                     .map_err(|error| error.to_string())
             });
             contributions
-                .command(&command.id, command.title, command.description, callback)
+                .command_with_options(
+                    &command.id,
+                    command.title,
+                    command.description,
+                    command.options,
+                    callback,
+                )
                 .map_err(|error| extension_error(&error))?;
         }
         let menus = staged_menus
@@ -284,6 +333,65 @@ impl LuaExtensionRuntime {
         for menu in menus {
             contributions
                 .menu(&menu.command_id, menu.label, menu.location)
+                .map_err(|error| extension_error(&error))?;
+        }
+        for panel in staged_tool_windows
+            .lock()
+            .map_err(|_| LuaRuntimeError::Host("tool-window registration lock poisoned".into()))?
+            .clone()
+        {
+            let full_id = contributions
+                .tool_window(
+                    &panel.id,
+                    panel.title,
+                    UiDocument {
+                        id: "main".into(),
+                        elements: vec![UiElement::Text {
+                            id: "body".into(),
+                            text: panel.text,
+                        }],
+                    },
+                )
+                .map_err(|error| extension_error(&error))?;
+            let _ = full_id;
+        }
+        for setting in staged_settings
+            .lock()
+            .map_err(|_| LuaRuntimeError::Host("setting registration lock poisoned".into()))?
+            .clone()
+        {
+            contributions
+                .setting(&setting.id, setting.title, "", setting.kind)
+                .map_err(|error| extension_error(&error))?;
+        }
+        for theme in staged_themes
+            .lock()
+            .map_err(|_| LuaRuntimeError::Host("theme registration lock poisoned".into()))?
+            .clone()
+        {
+            contributions
+                .theme(&theme.id, theme.title, theme.base, theme.tokens)
+                .map_err(|error| extension_error(&error))?;
+        }
+        for detail in staged_diagnostic_details
+            .lock()
+            .map_err(|_| {
+                LuaRuntimeError::Host("diagnostic detail registration lock poisoned".into())
+            })?
+            .clone()
+        {
+            contributions
+                .diagnostic_detail(
+                    &detail.id,
+                    DiagnosticDetailDefinition {
+                        source: detail.source,
+                        code: detail.code,
+                        title: detail.title,
+                        explanation: detail.explanation,
+                        suggested_command: None,
+                        related: Vec::new(),
+                    },
+                )
                 .map_err(|error| extension_error(&error))?;
         }
         let subscriptions = runtime
@@ -461,6 +569,23 @@ impl LuaExtensionRuntime {
             .collect())
     }
 
+    /// Drains bounded plain-text panel update requests for host-side validation and display.
+    ///
+    /// # Errors
+    /// Returns an error if the runtime or update queue lock is poisoned.
+    pub fn take_ui_updates(&self) -> Result<Vec<(String, String)>, LuaRuntimeError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| LuaRuntimeError::Host("Lua VM lock is poisoned".into()))?;
+        Ok(state
+            .ui_updates
+            .lock()
+            .map_err(|_| LuaRuntimeError::Host("UI update queue lock is poisoned".into()))?
+            .drain(..)
+            .collect())
+    }
+
     /// Calls the extension's optional `deactivate()` function and releases callback references.
     ///
     /// # Errors
@@ -488,6 +613,11 @@ impl LuaExtensionRuntime {
             .lock()
             .map_err(|_| LuaRuntimeError::Host("Lua event map is poisoned".into()))?
             .clear();
+        state
+            .ui_updates
+            .lock()
+            .map_err(|_| LuaRuntimeError::Host("UI update queue lock is poisoned".into()))?
+            .clear();
         state.deactivate_key = None;
         state.module_key = None;
         Ok(())
@@ -503,25 +633,92 @@ fn create_api(
     manifest: &ExtensionManifest,
     context: &Arc<Mutex<LuaHostContext>>,
     edit_requests: Arc<Mutex<VecDeque<DocumentEditRequest>>>,
-    command_keys: Arc<Mutex<BTreeMap<String, RegistryKey>>>,
+    command_keys: &Arc<Mutex<BTreeMap<String, RegistryKey>>>,
     event_keys: Arc<Mutex<BTreeMap<String, Vec<RegistryKey>>>>,
-    staged_commands: Arc<Mutex<Vec<StagedCommand>>>,
+    staged_commands: &Arc<Mutex<Vec<StagedCommand>>>,
     staged_menus: Arc<Mutex<Vec<StagedMenu>>>,
+    staged_tool_windows: Arc<Mutex<Vec<StagedToolWindow>>>,
+    staged_settings: Arc<Mutex<Vec<StagedSetting>>>,
+    staged_themes: Arc<Mutex<Vec<StagedTheme>>>,
+    staged_diagnostic_details: Arc<Mutex<Vec<StagedDiagnosticDetail>>>,
+    ui_updates: Arc<Mutex<VecDeque<(String, String)>>>,
 ) -> mlua::Result<Table> {
     let api = lua.create_table()?;
 
     if manifest.capabilities.contains(&Capability::Commands) {
         let commands = lua.create_table()?;
-        let pending = staged_commands;
+        let pending = Arc::clone(staged_commands);
+        let command_registry = Arc::clone(command_keys);
         commands.set("register", lua.create_function(move |lua, (id, title, description, callback): (String, String, String, Function)| {
             if id.trim().is_empty() || id.contains('.') { return Err(mlua::Error::RuntimeError("command id must be a non-empty local name".into())); }
             let mut registrations = pending.lock().map_err(|_| mlua::Error::RuntimeError("command registration lock poisoned".into()))?;
             if registrations.iter().any(|command| command.id == id) { return Err(mlua::Error::RuntimeError(format!("duplicate command '{id}'"))); }
             let key = lua.create_registry_value(callback)?;
-            command_keys.lock().map_err(|_| mlua::Error::RuntimeError("command registry lock poisoned".into()))?.insert(id.clone(), key);
-            registrations.push(StagedCommand { id, title, description });
+            command_registry.lock().map_err(|_| mlua::Error::RuntimeError("command registry lock poisoned".into()))?.insert(id.clone(), key);
+            registrations.push(StagedCommand { id, title, description, options: CommandOptions::default() });
             Ok(())
         })?)?;
+        let pending = Arc::clone(staged_commands);
+        let command_registry = Arc::clone(command_keys);
+        commands.set(
+            "register_with_options",
+            lua.create_function(
+                move |lua,
+                      (id, title, description, options, callback): (
+                    String,
+                    String,
+                    String,
+                    Table,
+                    Function,
+                )| {
+                    if id.trim().is_empty() || id.contains('.') {
+                        return Err(mlua::Error::RuntimeError(
+                            "command id must be a non-empty local name".into(),
+                        ));
+                    }
+                    let shortcut: Option<String> = options.get("shortcut")?;
+                    let enablement = match options
+                        .get::<Option<String>>("enablement")?
+                        .as_deref()
+                        .unwrap_or("always")
+                    {
+                        "always" => CommandEnablement::Always,
+                        "workspace_open" => CommandEnablement::WorkspaceOpen,
+                        "active_document" => CommandEnablement::ActiveDocument,
+                        _ => {
+                            return Err(mlua::Error::RuntimeError(
+                                "unsupported command enablement condition".into(),
+                            ));
+                        }
+                    };
+                    let mut registrations = pending.lock().map_err(|_| {
+                        mlua::Error::RuntimeError("command registration lock poisoned".into())
+                    })?;
+                    if registrations.iter().any(|command| command.id == id) {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "duplicate command '{id}'"
+                        )));
+                    }
+                    let key = lua.create_registry_value(callback)?;
+                    command_registry
+                        .lock()
+                        .map_err(|_| {
+                            mlua::Error::RuntimeError("command registry lock poisoned".into())
+                        })?
+                        .insert(id.clone(), key);
+                    registrations.push(StagedCommand {
+                        id,
+                        title,
+                        description,
+                        options: CommandOptions {
+                            shortcut,
+                            enablement,
+                        },
+                    });
+                    Ok(())
+                },
+            )?,
+        )?;
         api.set("commands", commands)?;
     }
 
@@ -658,6 +855,7 @@ fn create_api(
                         | "document_changed"
                         | "document_saved"
                         | "document_closed"
+                        | "settings_changed"
                 ) {
                     return Err(mlua::Error::RuntimeError(format!(
                         "unsupported event '{event}'"
@@ -678,6 +876,53 @@ fn create_api(
 
     if manifest.capabilities.contains(&Capability::UiContributions) {
         let ui = lua.create_table()?;
+        let pending_panels = staged_tool_windows;
+        ui.set(
+            "register_tool_window",
+            lua.create_function(move |_, (id, title, text): (String, String, String)| {
+                if id.trim().is_empty()
+                    || id.contains('.')
+                    || title.trim().is_empty()
+                    || text.len() > 16 * 1024
+                {
+                    return Err(mlua::Error::RuntimeError(
+                        "tool window requires a local id, title, and text no longer than 16 KiB"
+                            .into(),
+                    ));
+                }
+                let mut panels = pending_panels.lock().map_err(|_| {
+                    mlua::Error::RuntimeError("tool-window registration lock poisoned".into())
+                })?;
+                if panels.iter().any(|panel| panel.id == id) {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "duplicate tool window '{id}'"
+                    )));
+                }
+                panels.push(StagedToolWindow { id, title, text });
+                Ok(())
+            })?,
+        )?;
+        let updates = ui_updates;
+        ui.set(
+            "update_tool_window",
+            lua.create_function(move |_, (id, text): (String, String)| {
+                if id.trim().is_empty() || id.contains('.') || text.len() > 16 * 1024 {
+                    return Err(mlua::Error::RuntimeError(
+                        "panel update needs a local id and text no longer than 16 KiB".into(),
+                    ));
+                }
+                let mut pending = updates.lock().map_err(|_| {
+                    mlua::Error::RuntimeError("UI update queue lock poisoned".into())
+                })?;
+                if pending.len() >= 32 {
+                    return Err(mlua::Error::RuntimeError(
+                        "too many pending panel updates".into(),
+                    ));
+                }
+                pending.push_back((id, text));
+                Ok(())
+            })?,
+        )?;
         ui.set(
             "add_menu_action",
             lua.create_function(
@@ -686,6 +931,8 @@ fn create_api(
                         "tools" => MenuLocation::Tools,
                         "navigate" => MenuLocation::Navigate,
                         "editor_context" => MenuLocation::EditorContext,
+                        "project_explorer_context" => MenuLocation::ProjectExplorerContext,
+                        "command_palette" => MenuLocation::CommandPalette,
                         _ => {
                             return Err(mlua::Error::RuntimeError(
                                 "menu location must be tools, navigate, or editor_context".into(),
@@ -709,7 +956,204 @@ fn create_api(
         api.set("ui", ui)?;
     }
 
+    if manifest.capabilities.contains(&Capability::Settings) {
+        let settings = lua.create_table()?;
+        let settings_context = context.clone();
+        let owner = manifest.id.clone();
+        settings.set(
+            "get",
+            lua.create_function(move |lua, id: String| {
+                let key = format!("{owner}.{id}");
+                let context = settings_context.lock().map_err(|_| {
+                    mlua::Error::RuntimeError("settings context unavailable".into())
+                })?;
+                Ok(match context.settings.get(&key) {
+                    Some(SettingValue::Boolean(value)) => Value::Boolean(*value),
+                    Some(SettingValue::Integer(value)) => Value::Integer(*value),
+                    Some(SettingValue::Text(value)) => Value::String(lua.create_string(value)?),
+                    None => Value::Nil,
+                })
+            })?,
+        )?;
+        let pending = staged_settings.clone();
+        settings.set(
+            "register_boolean",
+            lua.create_function(move |_, (id, title, default): (String, String, bool)| {
+                stage_setting(
+                    &pending,
+                    StagedSetting {
+                        id,
+                        title,
+                        kind: SettingKind::Boolean { default },
+                    },
+                )
+            })?,
+        )?;
+        let pending = staged_settings.clone();
+        settings.set(
+            "register_integer",
+            lua.create_function(
+                move |_, (id, title, default, min, max): (String, String, i64, i64, i64)| {
+                    stage_setting(
+                        &pending,
+                        StagedSetting {
+                            id,
+                            title,
+                            kind: SettingKind::Integer { default, min, max },
+                        },
+                    )
+                },
+            )?,
+        )?;
+        let pending = staged_settings.clone();
+        settings.set(
+            "register_text",
+            lua.create_function(
+                move |_, (id, title, default, max_length): (String, String, String, usize)| {
+                    stage_setting(
+                        &pending,
+                        StagedSetting {
+                            id,
+                            title,
+                            kind: SettingKind::Text {
+                                default,
+                                max_length,
+                            },
+                        },
+                    )
+                },
+            )?,
+        )?;
+        settings.set(
+            "register_choice",
+            lua.create_function(
+                move |_, (id, title, default, options): (String, String, String, Vec<String>)| {
+                    stage_setting(
+                        &staged_settings,
+                        StagedSetting {
+                            id,
+                            title,
+                            kind: SettingKind::Choice { default, options },
+                        },
+                    )
+                },
+            )?,
+        )?;
+        api.set("settings", settings)?;
+    }
+
+    if manifest.capabilities.contains(&Capability::Themes) {
+        let themes = lua.create_table()?;
+        themes.set(
+            "register",
+            lua.create_function(
+                move |_, (id, title, base, values): (String, String, String, Table)| {
+                    let base = match base.as_str() {
+                        "dark" => ThemeBase::Dark,
+                        "light" => ThemeBase::Light,
+                        _ => {
+                            return Err(mlua::Error::RuntimeError(
+                                "theme base must be dark or light".into(),
+                            ));
+                        }
+                    };
+                    let mut tokens = BTreeMap::new();
+                    for pair in values.pairs::<String, String>() {
+                        let (key, value) = pair?;
+                        let token = match key.as_str() {
+                            "background" => DesignToken::Background,
+                            "panel" => DesignToken::Panel,
+                            "raised" => DesignToken::Raised,
+                            "text" => DesignToken::Text,
+                            "muted" => DesignToken::Muted,
+                            "border" => DesignToken::Border,
+                            "accent" => DesignToken::Accent,
+                            "selection" => DesignToken::Selection,
+                            _ => {
+                                return Err(mlua::Error::RuntimeError(format!(
+                                    "unsupported design token '{key}'"
+                                )));
+                            }
+                        };
+                        tokens.insert(token, value);
+                    }
+                    let mut pending = staged_themes.lock().map_err(|_| {
+                        mlua::Error::RuntimeError("theme registration lock poisoned".into())
+                    })?;
+                    if pending.iter().any(|theme| theme.id == id) {
+                        return Err(mlua::Error::RuntimeError(format!("duplicate theme '{id}'")));
+                    }
+                    pending.push(StagedTheme {
+                        id,
+                        title,
+                        base,
+                        tokens,
+                    });
+                    Ok(())
+                },
+            )?,
+        )?;
+        api.set("themes", themes)?;
+    }
+
+    if manifest.capabilities.contains(&Capability::Diagnostics) {
+        let diagnostics = lua.create_table()?;
+        diagnostics.set(
+            "provide_detail",
+            lua.create_function(
+                move |_,
+                      (id, source, code, title, explanation): (
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                )| {
+                    let mut pending = staged_diagnostic_details.lock().map_err(|_| {
+                        mlua::Error::RuntimeError("diagnostic registration lock poisoned".into())
+                    })?;
+                    if pending.iter().any(|detail| detail.id == id) {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "duplicate diagnostic detail '{id}'"
+                        )));
+                    }
+                    pending.push(StagedDiagnosticDetail {
+                        id,
+                        source,
+                        code,
+                        title,
+                        explanation,
+                    });
+                    Ok(())
+                },
+            )?,
+        )?;
+        api.set("diagnostics", diagnostics)?;
+    }
+
     Ok(api)
+}
+
+fn stage_setting(
+    pending: &Arc<Mutex<Vec<StagedSetting>>>,
+    setting: StagedSetting,
+) -> mlua::Result<()> {
+    if setting.id.trim().is_empty() || setting.id.contains('.') || setting.title.trim().is_empty() {
+        return Err(mlua::Error::RuntimeError(
+            "setting requires a local id and title".into(),
+        ));
+    }
+    let mut settings = pending
+        .lock()
+        .map_err(|_| mlua::Error::RuntimeError("setting registration lock poisoned".into()))?;
+    if settings.iter().any(|item| item.id == setting.id) {
+        return Err(mlua::Error::RuntimeError(format!(
+            "duplicate setting '{}'",
+            setting.id
+        )));
+    }
+    settings.push(setting);
+    Ok(())
 }
 
 fn context_table(lua: &Lua, context: &LuaHostContext) -> mlua::Result<Table> {
@@ -830,6 +1274,7 @@ mod tests {
             LuaHostContext {
                 workspace_root: Some(PathBuf::from("/workspace/demo")),
                 active_document: None,
+                ..LuaHostContext::default()
             },
             LuaLimits::default(),
             &mut contributions,
@@ -849,6 +1294,85 @@ mod tests {
         .unwrap();
         assert_eq!(result, "Hello /workspace/demo");
         runtime.deactivate().unwrap();
+    }
+
+    #[test]
+    fn lua_sdk_registers_panels_settings_themes_and_diagnostic_details() {
+        let manifest = manifest(&[
+            Capability::Commands,
+            Capability::UiContributions,
+            Capability::Settings,
+            Capability::Themes,
+            Capability::Diagnostics,
+        ]);
+        let source = r##"
+            local m = {}
+            function m.activate()
+              koren.commands.register_with_options("refresh", "Refresh", "Refresh workspace details", {shortcut="Ctrl+Alt+R", enablement="workspace_open"}, function(_args, context)
+                koren.ui.update_tool_window("workspace", "Workspace: " .. (context.workspace_root or "none"))
+                return tostring(koren.settings.get("show_path"))
+              end)
+              koren.ui.register_tool_window("workspace", "Workspace Info", "Not refreshed")
+              koren.settings.register_boolean("show_path", "Show path", true)
+              koren.themes.register("midnight", "Midnight", "dark", {accent="#123456"})
+              koren.diagnostics.provide_detail("type-help", "lsp", "E001", "Type detail", "A more detailed explanation")
+            end
+            return m
+        "##;
+        let mut context = LuaHostContext::default();
+        context.settings.insert(
+            "org.example.sample.show_path".into(),
+            SettingValue::Boolean(false),
+        );
+        let mut contributions = builder(&manifest);
+        let runtime = LuaExtensionRuntime::activate_source(
+            &manifest,
+            source,
+            context,
+            LuaLimits::default(),
+            &mut contributions,
+        )
+        .unwrap();
+        let owned = contributions.into_contributions();
+        assert_eq!(owned.tool_windows[0].id, "org.example.sample.workspace");
+        assert_eq!(owned.settings[0].id, "org.example.sample.show_path");
+        assert_eq!(
+            owned.themes[0]
+                .tokens
+                .get(&DesignToken::Accent)
+                .map(String::as_str),
+            Some("#123456")
+        );
+        assert_eq!(owned.diagnostic_details[0].code.as_deref(), Some("E001"));
+        assert_eq!(
+            owned.commands["org.example.sample.refresh"]
+                .shortcut
+                .as_deref(),
+            Some("Ctrl+Alt+R")
+        );
+        assert_eq!(
+            owned.commands["org.example.sample.refresh"].enablement,
+            CommandEnablement::WorkspaceOpen
+        );
+        assert_eq!(
+            runtime
+                .call_command(
+                    "refresh",
+                    &CommandContext {
+                        workspace_root: Some(PathBuf::from("/work")),
+                        ..CommandContext::default()
+                    },
+                    &[]
+                )
+                .unwrap(),
+            "false"
+        );
+        assert_eq!(
+            runtime.take_ui_updates().unwrap(),
+            vec![("workspace".into(), "Workspace: /work".into())]
+        );
+        runtime.deactivate().unwrap();
+        assert_eq!(runtime.take_ui_updates().unwrap(), []);
     }
 
     #[test]
@@ -883,6 +1407,7 @@ mod tests {
                     revision: 7,
                     contents: "hello".into(),
                 }),
+                ..LuaHostContext::default()
             },
             LuaLimits::default(),
             &mut contributions,

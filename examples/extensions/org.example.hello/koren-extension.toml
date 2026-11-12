@@ -3,8 +3,8 @@ id = "org.example.hello"
 name = "Hello from Koren"
 publisher = "Koren examples"
 version = "0.1.0"
-description = "A small Lua extension demonstrating workspace context and a Tools menu action."
+description = "Developer Tools example with a workspace panel, configurable setting, and safe theme contribution."
 entry_point = "main.lua"
 api_version = "1.0.0"
-capabilities = ["commands", "workspace_read", "ui_contributions"]
+capabilities = ["commands", "workspace_read", "ui_contributions", "settings", "themes", "diagnostics"]
 
