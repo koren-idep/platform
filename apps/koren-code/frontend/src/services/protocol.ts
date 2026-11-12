@@ -204,7 +204,14 @@ export type RequestMethod =
   | { method: 'task_status'; params: { run_id: number } }
   | { method: 'task_output'; params: { run_id: number } }
   | { method: 'cancel_task'; params: { run_id: number } }
-  | { method: 'cleanup_task'; params: { run_id: number } };
+  | { method: 'cleanup_task'; params: { run_id: number } }
+  | { method: 'request_terminal_start' }
+  | { method: 'list_terminal_sessions' }
+  | { method: 'approve_terminal_start'; params: { request_id: number } }
+  | { method: 'deny_terminal_start'; params: { request_id: number } }
+  | { method: 'terminal_write'; params: { session_id: number; input_base64: string } }
+  | { method: 'terminal_resize'; params: { session_id: number; rows: number; columns: number } }
+  | { method: 'close_terminal'; params: { session_id: number; terminate_active: boolean } };
 
 export interface TextPosition { line: number; character: number }
 export interface TextRange { start: TextPosition; end: TextPosition }
@@ -272,7 +279,12 @@ export type ResponseValue =
   | { kind: 'task_denied'; value: { request_id: number } }
   | { kind: 'task_snapshot'; value: TaskSnapshot }
   | { kind: 'task_cancelled'; value: { run_id: number } }
-  | { kind: 'task_cleaned'; value: { run_id: number } };
+  | { kind: 'task_cleaned'; value: { run_id: number } }
+  | { kind: 'terminal_approval_required'; value: TerminalApprovalSummary }
+  | { kind: 'terminal_sessions'; value: TerminalSessionSummary[] }
+  | { kind: 'terminal_approved'; value: { request_id: number; session: TerminalSessionSummary } }
+  | { kind: 'terminal_denied'; value: { request_id: number } }
+  | { kind: 'terminal_action'; value: { session_id: number } };
 
 export interface GitRepositorySummary { root: string; branch: string | null; has_head: boolean }
 export interface GitChangedFile { path: string; staged: boolean; unstaged: boolean; untracked: boolean; deleted: boolean; conflicted: boolean }
@@ -280,4 +292,19 @@ export interface GitStatusSummary { root: string; branch: string | null; has_hea
 export interface SearchMatch { path: string; line: number; column_utf16: number; match_length_utf16: number; preview: string }
 export interface SearchProgress { files_scanned: number; matches_found: number; current_path: string | null }
 export interface SearchSummary { files_scanned: number; matches_found: number; skipped_binary_files: number; truncated: boolean; cancelled: boolean }
-export interface PlatformEvent { kind: string; document_id?: number; project_id?: number; run_id?: number; server_id?: number; revision?: number; root?: string; path?: string; previous_path?: string; operation?: string; commit?: string; diagnostics?: LanguageDiagnosticSet; message?: string }
+export interface TerminalApprovalSummary {
+  request_id: number; profile_id: string; profile_name: string; executable: string; arguments: string[];
+  working_directory: string; environment_keys: string[]; fallback_executable: string | null;
+  actor: string; workspace: string | null;
+}
+export interface TerminalSessionSummary {
+  session_id: number; profile_id: string; working_directory: string;
+  state: 'created' | 'starting' | 'running' | 'exited' | 'failed' | 'terminated';
+  exit_code: number | null; process_group_active: boolean; error: string | null; rows: number; columns: number;
+}
+export interface PlatformEvent {
+  kind: string; document_id?: number; project_id?: number; run_id?: number; server_id?: number; revision?: number;
+  root?: string; path?: string; previous_path?: string; operation?: string; commit?: string;
+  diagnostics?: LanguageDiagnosticSet; message?: string; terminal_id?: number; sequence?: number;
+  data_base64?: string; terminal_state?: TerminalSessionSummary['state']; exit_code?: number; terminal_process_group_active?: boolean;
+}

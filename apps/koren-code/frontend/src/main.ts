@@ -56,6 +56,7 @@ app.innerHTML = `
         <button role="menuitem" data-action="show-panel" data-panel-target="problems">Problems</button>
         <button role="menuitem" data-action="show-panel" data-panel-target="projects">Projects</button>
         <button role="menuitem" data-action="show-panel" data-panel-target="search">Search <kbd>Ctrl+Shift+F</kbd></button>
+        <button role="menuitem" data-action="show-panel" data-panel-target="terminal">Terminal <kbd>Ctrl+grave</kbd></button>
         <button role="menuitem" data-action="source-control">Source Control</button>
         <div id="extension-panel-menu-items"></div>
         <div id="extension-wizard-menu-items"></div>
@@ -134,13 +135,14 @@ app.innerHTML = `
       <div class="bottom-resizer" id="bottom-resizer" role="separator" aria-label="Resize bottom panel" aria-orientation="horizontal" tabindex="0"></div>
       <section class="bottom-panel" id="bottom-panel">
         <div class="bottom-heading"><div class="tool-tabs" role="tablist" aria-label="Tool panels">
-          <button class="selected" data-panel="output" role="tab" aria-selected="true">Output</button><button data-panel="problems" role="tab" aria-selected="false">Problems <span id="problem-count" class="count-badge">0</span></button><button data-panel="tasks" role="tab" aria-selected="false">Tasks</button><button data-panel="projects" role="tab" aria-selected="false">Projects</button><button data-panel="search" role="tab" aria-selected="false">Search</button>
+          <button class="selected" data-panel="output" role="tab" aria-selected="true">Output</button><button data-panel="problems" role="tab" aria-selected="false">Problems <span id="problem-count" class="count-badge">0</span></button><button data-panel="tasks" role="tab" aria-selected="false">Tasks</button><button data-panel="projects" role="tab" aria-selected="false">Projects</button><button data-panel="search" role="tab" aria-selected="false">Search</button><button data-panel="terminal" role="tab" aria-selected="false">Terminal</button>
         </div><span id="bottom-task-state" class="task-state"></span><span class="panel-actions"><button data-action="cancel-task" title="Cancel active task" aria-label="Cancel active task" disabled>■</button><button data-action="toggle-bottom" title="Collapse bottom panel" aria-label="Collapse bottom panel">⌄</button></span></div>
         <div id="output" class="panel-content output"><div class="panel-empty">Task output will appear here.</div></div>
         <div id="problems" class="panel-content problem-list hidden"><div class="problem-filters"><label>Severity <select id="problem-severity-filter"><option value="all">All</option><option value="error">Errors</option><option value="warning">Warnings</option><option value="information">Information</option><option value="hint">Hints</option></select></label><label>Group by <select id="problem-grouping"><option value="file">File</option><option value="provider">Provider</option><option value="category">Category</option><option value="severity">Severity</option></select></label></div><div id="problem-entries"><div class="panel-empty">No problems reported by installed language integrations.</div></div></div>
         <div id="tasks" class="panel-content task-list hidden"><div class="panel-empty">Discover Cargo projects to see available tasks.</div></div>
         <div id="projects" class="panel-content project-list hidden"><div class="project-analysis-controls"><button data-action="start-project-analysis">Analyze Open Documents</button><button data-action="cancel-project-analysis" disabled>Cancel</button><button data-action="load-project-findings" hidden>Load More Findings</button><span id="project-analysis-status">Uses a bounded snapshot of currently open documents.</span></div><div id="project-list"><div class="panel-empty">Project information will appear here.</div></div></div>
         <div id="search" class="panel-content developer-panel hidden"><form id="search-form" class="developer-controls"><input id="search-query" type="search" placeholder="Search workspace" aria-label="Search workspace"><input id="search-filter" type="text" placeholder="Files to include (glob)" aria-label="File name filter"><label><input id="search-case" type="checkbox"> Match case</label><label><input id="search-regex" type="checkbox"> Regex</label><button type="submit">Search</button><button type="button" data-action="cancel-search" disabled>Cancel</button></form><div id="search-status" class="subtle">Search starts only when requested. Results are limited to 5,000.</div><div id="search-results" class="developer-results"></div></div>
+        <div id="terminal" class="panel-content terminal-panel hidden"><div class="terminal-toolbar"><button type="button" data-terminal-new>＋ New</button><button type="button" data-terminal-rename disabled>Rename</button><button type="button" data-terminal-restart disabled>Restart</button><button type="button" data-terminal-close disabled>Close</button><span data-terminal-status class="subtle">No terminal sessions.</span></div><div class="terminal-session-tabs" data-terminal-tabs role="tablist" aria-label="Terminal sessions"></div><div class="terminal-session-views" data-terminal-views></div><div class="terminal-shortcut-hint">Ctrl+Shift+C copy · Ctrl+Shift+V paste · Ctrl+L clear display</div></div>
         <div id="source-control" class="panel-content developer-panel hidden"><div class="developer-controls"><select id="git-repository" aria-label="Git repository"><option value="">No repository selected</option></select><button data-action="refresh-git">↻ Refresh</button></div><div id="git-branch" class="subtle"></div><div class="git-columns"><section><h3>Changes</h3><div id="git-unstaged" class="developer-results"></div></section><section><h3>Staged</h3><div id="git-staged" class="developer-results"></div></section></div><pre id="git-diff" class="git-diff" aria-label="Git diff preview"></pre><form id="git-commit-form" class="developer-controls"><input id="git-commit-message" type="text" placeholder="Commit message" aria-label="Commit message"><button type="submit">Commit staged</button></form></div>
         <div id="extension-panel-content"></div>
       </section>
@@ -159,12 +161,20 @@ app.innerHTML = `
   <dialog id="command-dialog" class="dialog command-dialog"><form method="dialog"><header>Command Palette</header><input id="command-search" type="search" placeholder="Search available commands" autocomplete="off" aria-label="Search commands"><div id="command-results" role="listbox" aria-label="Available commands"></div><footer><kbd>↑</kbd><kbd>↓</kbd> navigate <kbd>Enter</kbd> run <kbd>Esc</kbd> close</footer></form></dialog>
   <dialog id="extensions-dialog" class="dialog extensions-dialog"><form method="dialog"><header>Extensions</header><p class="subtle">Local extensions from the configured Koren extensions folder. Code runs only after you enable and activate it.</p><div id="extension-list" class="extension-list"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="language-server-approval-dialog" class="dialog"><form method="dialog"><header>Start language server?</header><p class="subtle">This starts an external program with your user account permissions. Approval is not a sandbox. Review the exact command and workspace.</p><dl id="language-server-approval-details"></dl><div class="dialog-actions"><button value="deny" class="secondary">Deny</button><button value="approve" class="primary">Approve and start</button></div></form></dialog>
+  <dialog id="terminal-approval-dialog" class="dialog"><form><header>Start interactive shell?</header><p class="subtle">Approval grants this shell interactive access using your account permissions. Commands entered later are not individually reviewed, and this is not a filesystem sandbox.</p><dl data-terminal-approval-details></dl><div class="dialog-actions"><button type="submit" value="deny" class="secondary">Deny</button><button type="submit" value="approve" class="primary">Approve and start</button></div></form></dialog>
   <dialog id="settings-dialog" class="dialog settings-dialog"><form method="dialog"><header>Settings</header><label for="theme-setting">Color theme</label><select id="theme-setting"><option value="dark">OLED Black</option><option value="light">Light</option></select><div id="extension-settings" class="extension-settings"></div><section class="inspection-settings"><h3>Inspections</h3><div id="inspection-settings"></div></section><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="info-dialog" class="dialog"><form method="dialog"><header id="info-title"></header><div id="info-content" class="info-content"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="workspace-input-dialog" class="dialog"><form id="workspace-input-form"><header id="workspace-input-title"></header><label id="workspace-input-label" for="workspace-input"></label><input id="workspace-input" type="text" autocomplete="off"><div class="dialog-actions"><button type="button" value="cancel" class="secondary">Cancel</button><button type="submit" class="primary">Continue</button></div></form></dialog>
   <dialog id="workspace-delete-dialog" class="dialog"><form method="dialog"><header>Delete workspace entry?</header><p id="workspace-delete-path"></p><p class="subtle">This permanently deletes the selected entry from disk. Open dirty documents are protected.</p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="delete" class="danger">Delete</button></div></form></dialog>
   <dialog id="project-wizard-dialog" class="dialog"><form id="project-wizard-form"><header id="project-wizard-title"></header><div id="project-wizard-fields" class="extension-panel-view"></div><p class="subtle">Submitting validates these fields only. Project creation must be performed by a host-authorized extension operation.</p><div class="dialog-actions"><button type="button" class="secondary" data-action="close-wizard">Cancel</button><button type="submit" class="primary">Validate form</button></div></form></dialog>
   <div id="status-toast" role="status" aria-live="polite"></div>`;
+
+let terminalPanel: import('./app/terminal').TerminalPanel | null = null;
+async function loadTerminalPanel(): Promise<void> {
+  if (terminalPanel) return;
+  const { TerminalPanel } = await import('./app/terminal');
+  terminalPanel ??= new TerminalPanel(document.querySelector<HTMLElement>('#terminal')!, client);
+}
 
 const treeState = new ProjectTreeState();
 const tabs = new TabState();
@@ -840,6 +850,7 @@ function queueOutputRefresh(id: number): void {
   outputRefreshTimer = window.setTimeout(() => { outputRefreshTimer = 0; void updateTaskOutput(id); }, 100);
 }
 function handlePlatformEvent(event: PlatformEvent): void {
+  if (event.kind.startsWith('terminal_')) { terminalPanel?.handleEvents([event]); return; }
   if (event.kind === 'git_status_changed' && gitStatus?.root === event.root) void refreshGitStatus();
   if (event.kind === 'git_operation_completed' && event.operation) setStatus(`Git ${event.operation}${event.commit ? ` · ${event.commit.slice(0, 8)}` : ''}`);
   if (event.kind.startsWith('workspace_entry_') && event.path) {
@@ -907,11 +918,12 @@ async function openSettings(): Promise<void> {
 function toggleTheme(): void { setTheme(nextTheme(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')); }
 
 function showPanel(panel: 'output' | 'problems' | 'tasks' | 'projects' | string): void {
+  if (panel === 'terminal') void loadTerminalPanel().catch(showError);
   for (const button of document.querySelectorAll<HTMLButtonElement>('[data-panel]')) {
     const selected = button.dataset.panel === panel;
     button.classList.toggle('selected', selected); button.setAttribute('aria-selected', String(selected));
   }
-  for (const id of ['output', 'problems', 'tasks', 'projects', 'search', 'source-control']) document.querySelector(`#${id}`)!.classList.toggle('hidden', id !== panel);
+  for (const id of ['output', 'problems', 'tasks', 'projects', 'search', 'source-control', 'terminal']) document.querySelector(`#${id}`)!.classList.toggle('hidden', id !== panel);
   for (const host of document.querySelectorAll<HTMLElement>('[data-extension-panel]')) host.classList.toggle('hidden', host.dataset.extensionPanel !== panel);
   if (panel.startsWith('org.') || panel.includes('.')) { activeDynamicPanel = panel; localStorage.setItem('koren.activeExtensionPanel', panel); }
   setBottomCollapsed(false);
@@ -1903,6 +1915,7 @@ document.addEventListener('keydown', (event) => {
   else if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'p') { event.preventDefault(); void openCommandPalette(); }
   else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'b') { event.preventDefault(); setExplorerCollapsed(!layout.explorerCollapsed); }
   else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'j') { event.preventDefault(); setBottomCollapsed(!layout.bottomCollapsed); }
+  else if ((event.ctrlKey || event.metaKey) && event.key === '`') { event.preventDefault(); if (layout.bottomCollapsed || !document.querySelector<HTMLButtonElement>('[data-panel="terminal"]')!.classList.contains('selected')) showPanel('terminal'); else setBottomCollapsed(true); }
   else if ((event.ctrlKey || event.metaKey) && event.key === 'Tab') { event.preventDefault(); cycleTab(event.shiftKey ? -1 : 1); }
   else if (event.altKey && event.key.toLowerCase() === 't') { event.preventDefault(); toggleTheme(); }
   else if (event.key === 'F6') { event.preventDefault(); editor?.focus(); }
@@ -1914,7 +1927,7 @@ document.querySelector<HTMLInputElement>('#command-search')!.addEventListener('i
   commandSelection = 0; renderCommandResults((event.target as HTMLInputElement).value);
 });
 
-document.querySelectorAll<HTMLButtonElement>('[data-panel]').forEach((button) => button.addEventListener('click', () => showPanel(button.dataset.panel as 'output' | 'problems' | 'tasks' | 'projects')));
+document.querySelectorAll<HTMLButtonElement>('[data-panel]').forEach((button) => button.addEventListener('click', () => showPanel(button.dataset.panel ?? 'output')));
 document.querySelector<HTMLSelectElement>('#git-repository')!.addEventListener('change', (event) => {
   gitRepositoryPath = (event.currentTarget as HTMLSelectElement).value; void refreshGitStatus();
 });
