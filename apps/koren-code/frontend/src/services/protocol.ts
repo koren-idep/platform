@@ -72,9 +72,31 @@ export interface ExtensionSummary {
   id: string; name: string; publisher: string; version: string; description: string;
   enabled: boolean; state: 'disabled' | 'installed' | 'activating' | 'active' | 'failed'; error: string | null;
 }
-export interface ExtensionCommandSummary { id: string; title: string; description: string }
-export interface ExtensionMenuSummary { command_id: string; label: string; location: string }
-export interface ExtensionCatalog { extensions: ExtensionSummary[]; commands: ExtensionCommandSummary[]; menu_items: ExtensionMenuSummary[]; language_servers: LanguageServerSummary[] }
+export interface ExtensionCommandSummary { id: string; title: string; description: string; shortcut: string | null; enabled: boolean }
+export interface CommandCatalogSummary { id: string; title: string; description: string; shortcut: string | null; enabled: boolean }
+export interface ExtensionMenuSummary { command_id: string; label: string; location: string; enabled: boolean }
+export type ExtensionUiElement =
+  | { kind: 'text' | 'heading'; id: string; text: string }
+  | { kind: 'button'; id: string; label: string; command_id: string }
+  | { kind: 'list'; id: string; items: string[] }
+  | { kind: 'table'; id: string; rows: [string, string][] }
+  | { kind: 'input'; id: string; label: string; value: string; required: boolean; max_length: number }
+  | { kind: 'select'; id: string; label: string; options: string[]; value: string }
+  | { kind: 'checkbox'; id: string; label: string; checked: boolean }
+  | { kind: 'status'; id: string; label: string; tone: string };
+export interface ExtensionUiDocument { id: string; elements: ExtensionUiElement[] }
+export type ExtensionSettingValue = boolean | number | string;
+export type ExtensionSettingKind =
+  | { type: 'boolean'; default: boolean }
+  | { type: 'integer'; default: number; min: number; max: number }
+  | { type: 'text'; default: string; max_length: number }
+  | { type: 'choice'; default: string; options: string[] };
+export interface ExtensionSettingSummary { id: string; title: string; description: string; kind: ExtensionSettingKind; value: ExtensionSettingValue }
+export interface ExtensionToolWindowSummary { id: string; title: string; initial_view: ExtensionUiDocument }
+export interface ExtensionProjectWizardSummary { id: string; title: string; form: ExtensionUiDocument }
+export interface ExtensionThemeSummary { id: string; title: string; base: string; tokens: Record<string, string> }
+export interface ExtensionDiagnosticDetailSummary { id: string; source: string | null; code: string | null; title: string; explanation: string; suggested_command: string | null; related: string[] }
+export interface ExtensionCatalog { extensions: ExtensionSummary[]; commands: ExtensionCommandSummary[]; built_in_commands: CommandCatalogSummary[]; menu_items: ExtensionMenuSummary[]; language_servers: LanguageServerSummary[]; tool_windows: ExtensionToolWindowSummary[]; settings: ExtensionSettingSummary[]; themes: ExtensionThemeSummary[]; diagnostic_details: ExtensionDiagnosticDetailSummary[]; project_wizards: ExtensionProjectWizardSummary[] }
 export interface LanguageServerSummary {
   extension_id: string; configuration_id: string; command: string; arguments: string[];
   languages: string[]; file_extensions: string[]; environment_keys: string[];
@@ -98,6 +120,7 @@ export type RequestMethod =
   | { method: 'list_commands' }
   | { method: 'execute_command'; params: { command_id: string } }
   | { method: 'list_extensions' }
+  | { method: 'set_extension_setting'; params: { setting_id: string; value: ExtensionSettingValue } }
   | { method: 'set_extension_enabled'; params: { extension_id: string; enabled: boolean } }
   | { method: 'activate_extension'; params: { extension_id: string } }
   | { method: 'start_language_server'; params: { extension_id: string; configuration_id: string } }
@@ -145,6 +168,7 @@ export type ResponseValue =
   | { kind: 'commands'; value: string[] }
   | { kind: 'command_output'; value: string }
   | { kind: 'extensions'; value: ExtensionCatalog }
+  | { kind: 'extension_setting_updated'; value: { setting_id: string } }
   | { kind: 'extension_changed'; value: ExtensionSummary }
   | { kind: 'language_servers'; value: LanguageServerSummary[] }
   | { kind: 'language_server_approval_required'; value: LanguageServerApprovalSummary }

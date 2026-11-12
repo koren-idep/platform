@@ -3,9 +3,10 @@ import { EditorState } from '@codemirror/state';
 import { basicSetup, EditorView } from 'codemirror';
 import { linter, setDiagnostics, type Diagnostic as CodeMirrorDiagnostic } from '@codemirror/lint';
 import { KorenClient, KorenError, createDesktopTransport } from './services/client';
-import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionMenuSummary, ExtensionSummary, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ResponseValue, TaskSummary, TextRange } from './services/protocol';
+import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary, ExtensionSettingSummary, ExtensionSettingValue, ExtensionSummary, ExtensionThemeSummary, ExtensionToolWindowSummary, ExtensionUiDocument, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ResponseValue, TaskSummary, TextRange } from './services/protocol';
 import { approvalChoice, conflictChoice } from './app/dialogs';
-import { filterCommands, nextCommandSelection } from './app/commands';
+import { commandShortcutMatches, filterCommands, nextCommandSelection } from './app/commands';
+import { activePanelLayout, diagnosticDetailMatches, extensionMenusAt, safeThemeVariables, validExtensionSettingValue } from './app/extensions';
 import { readLayout, persistLayout, type LayoutPreferences } from './app/layout';
 import { formatCursorPosition, lineEndingFor } from './app/status';
 import { runConfigurationTasks, selectedRunTask } from './app/toolbar';
@@ -51,6 +52,8 @@ app.innerHTML = `
         <button role="menuitem" data-action="show-panel" data-panel-target="tasks">Tasks</button>
         <button role="menuitem" data-action="show-panel" data-panel-target="problems">Problems</button>
         <button role="menuitem" data-action="show-panel" data-panel-target="projects">Projects</button>
+        <div id="extension-panel-menu-items"></div>
+        <div id="extension-wizard-menu-items"></div>
       </div></details>
       <details class="menu-group"><summary>Navigate</summary><div class="menu-popup" role="menu">
         <button role="menuitem" data-action="focus-explorer">Focus Project Explorer <kbd>Ctrl+B</kbd></button>
@@ -130,6 +133,7 @@ app.innerHTML = `
         <div id="problems" class="panel-content problem-list hidden"><div class="panel-empty">No problems reported by installed language integrations.</div></div>
         <div id="tasks" class="panel-content task-list hidden"><div class="panel-empty">Discover Cargo projects to see available tasks.</div></div>
         <div id="projects" class="panel-content project-list hidden"><div class="panel-empty">Project information will appear here.</div></div>
+        <div id="extension-panel-content"></div>
       </section>
     </section>
   </main>
@@ -146,8 +150,9 @@ app.innerHTML = `
   <dialog id="command-dialog" class="dialog command-dialog"><form method="dialog"><header>Command Palette</header><input id="command-search" type="search" placeholder="Search available commands" autocomplete="off" aria-label="Search commands"><div id="command-results" role="listbox" aria-label="Available commands"></div><footer><kbd>↑</kbd><kbd>↓</kbd> navigate <kbd>Enter</kbd> run <kbd>Esc</kbd> close</footer></form></dialog>
   <dialog id="extensions-dialog" class="dialog extensions-dialog"><form method="dialog"><header>Extensions</header><p class="subtle">Local extensions from the configured Koren extensions folder. Code runs only after you enable and activate it.</p><div id="extension-list" class="extension-list"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="language-server-approval-dialog" class="dialog"><form method="dialog"><header>Start language server?</header><p class="subtle">This starts an external program with your user account permissions. Approval is not a sandbox. Review the exact command and workspace.</p><dl id="language-server-approval-details"></dl><div class="dialog-actions"><button value="deny" class="secondary">Deny</button><button value="approve" class="primary">Approve and start</button></div></form></dialog>
-  <dialog id="settings-dialog" class="dialog settings-dialog"><form method="dialog"><header>Settings</header><label for="theme-setting">Color theme</label><select id="theme-setting"><option value="dark">OLED Black</option><option value="light">Light</option></select><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
+  <dialog id="settings-dialog" class="dialog settings-dialog"><form method="dialog"><header>Settings</header><label for="theme-setting">Color theme</label><select id="theme-setting"><option value="dark">OLED Black</option><option value="light">Light</option></select><div id="extension-settings" class="extension-settings"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
   <dialog id="info-dialog" class="dialog"><form method="dialog"><header id="info-title"></header><div id="info-content" class="info-content"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
+  <dialog id="project-wizard-dialog" class="dialog"><form id="project-wizard-form"><header id="project-wizard-title"></header><div id="project-wizard-fields" class="extension-panel-view"></div><p class="subtle">Submitting validates these fields only. Project creation must be performed by a host-authorized extension operation.</p><div class="dialog-actions"><button type="button" class="secondary" data-action="close-wizard">Cancel</button><button type="submit" class="primary">Validate form</button></div></form></dialog>
   <div id="status-toast" role="status" aria-live="polite"></div>`;
 
 const treeState = new ProjectTreeState();
@@ -172,8 +177,14 @@ const taskById = new Map<number, TaskSummary>();
 const activeLanguageServers = new Map<string, number>();
 const diagnosticsByDocument = new Map<number, Map<string, LanguageDiagnosticSet>>();
 let editorContextMenus: ExtensionMenuSummary[] = [];
+let projectExplorerMenus: ExtensionMenuSummary[] = [];
+let extensionCatalogCache: ExtensionCatalog | null = null;
+let openExtensionPanels = loadOpenExtensionPanels();
+let activeDynamicPanel = localStorage.getItem('koren.activeExtensionPanel') ?? '';
 let registeredCommands: string[] = [];
 const commandLabels = new Map<string, string>();
+const commandDescriptions = new Map<string, string>();
+const commandMetadata = new Map<string, { description: string; shortcut: string | null; enabled: boolean }>();
 let editor: EditorView | null = null;
 let outputRefreshTimer = 0;
 let toastTimer = 0;
@@ -709,21 +720,40 @@ function handlePlatformEvent(event: PlatformEvent): void {
     for (const [key, id] of activeLanguageServers) if (id === event.server_id) { activeLanguageServers.delete(key); clearDiagnosticProviders(key); }
     if (event.message) setStatus(event.message);
   }
+  if (extensionCatalogCache && ['workspace_opened', 'workspace_closed', 'document_opened', 'document_closed'].includes(event.kind)) {
+    void client.call({ method: 'list_extensions' }).then((response) => renderExtensions(expect(response, 'extensions').value)).catch(showError);
+  }
 }
 
 function setTheme(theme: 'dark' | 'light'): void {
+  document.documentElement.removeAttribute('data-extension-theme');
+  for (const token of ['--bg', '--panel', '--raised', '--text', '--muted', '--border', '--accent', '--selected']) document.documentElement.style.removeProperty(token);
   document.documentElement.dataset.theme = theme;
   persistTheme(localStorage, theme);
+  localStorage.removeItem('koren-code:theme-extension');
   document.querySelector<HTMLSelectElement>('#theme-setting')!.value = theme;
+}
+function applyExtensionTheme(theme: ExtensionThemeSummary): void {
+  setTheme(theme.base === 'light' ? 'light' : 'dark');
+  for (const [property, color] of Object.entries(safeThemeVariables(theme.tokens))) document.documentElement.style.setProperty(property, color);
+  document.documentElement.dataset.extensionTheme = theme.id;
+  localStorage.setItem('koren-code:theme-extension', theme.id);
+  document.querySelector<HTMLSelectElement>('#theme-setting')!.value = `extension:${theme.id}`;
+}
+async function openSettings(): Promise<void> {
+  try { const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value; renderExtensions(catalog); document.querySelector<HTMLDialogElement>('#settings-dialog')!.showModal(); }
+  catch (error) { showError(error); }
 }
 function toggleTheme(): void { setTheme(nextTheme(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')); }
 
-function showPanel(panel: 'output' | 'problems' | 'tasks' | 'projects'): void {
+function showPanel(panel: 'output' | 'problems' | 'tasks' | 'projects' | string): void {
   for (const button of document.querySelectorAll<HTMLButtonElement>('[data-panel]')) {
     const selected = button.dataset.panel === panel;
     button.classList.toggle('selected', selected); button.setAttribute('aria-selected', String(selected));
   }
   for (const id of ['output', 'problems', 'tasks', 'projects']) document.querySelector(`#${id}`)!.classList.toggle('hidden', id !== panel);
+  for (const host of document.querySelectorAll<HTMLElement>('[data-extension-panel]')) host.classList.toggle('hidden', host.dataset.extensionPanel !== panel);
+  if (panel.startsWith('org.') || panel.includes('.')) { activeDynamicPanel = panel; localStorage.setItem('koren.activeExtensionPanel', panel); }
   setBottomCollapsed(false);
 }
 
@@ -759,18 +789,30 @@ function renderProblems(): void {
   });
   document.querySelector('#problem-count')!.textContent = String(rows.length);
   for (const row of rows) {
+    const rowHost = document.createElement('div'); rowHost.className = 'problem-entry';
     const button = document.createElement('button'); button.className = 'problem-row';
     const severity = document.createElement('span'); severity.className = `problem-severity ${row.diagnostic.severity ?? 'information'}`; severity.textContent = row.diagnostic.severity ?? 'info';
     const message = document.createElement('span'); message.className = 'problem-message'; message.textContent = row.diagnostic.message;
     const tab = tabs.tabs.find((item) => item.id === row.documentId);
     const location = document.createElement('span'); location.className = 'problem-location'; location.textContent = `${tab?.title ?? row.provider}:${row.diagnostic.range.start.line + 1}`;
     button.append(severity, message, location);
+    const detail = extensionCatalogCache?.diagnostic_details.find((item: ExtensionDiagnosticDetailSummary) => diagnosticDetailMatches(item, row.diagnostic.source, row.diagnostic.code, row.provider));
+    if (detail) {
+      const details = document.createElement('details'); details.className = 'diagnostic-detail';
+      const summary = document.createElement('summary'); summary.textContent = detail.title;
+      const explanation = document.createElement('p'); explanation.textContent = detail.explanation; details.append(summary, explanation);
+      for (const related of detail.related) { const note = document.createElement('p'); note.textContent = related; details.append(note); }
+      if (detail.suggested_command) { const action = document.createElement('button'); action.textContent = 'Suggested action'; action.addEventListener('click', (event) => { event.stopPropagation(); void executeCommand(detail.suggested_command!); }); details.append(action); }
+      rowHost.append(button, details);
+    } else {
+      rowHost.append(button);
+    }
     button.addEventListener('click', () => {
       selectTab(row.documentId);
       if (editor) editor.dispatch({ selection: { anchor: editorPosition(editor.state.doc, row.diagnostic.range.start.line, row.diagnostic.range.start.character) }, scrollIntoView: true });
       showPanel('problems');
     });
-    host.append(button);
+    host.append(rowHost);
   }
   if (!rows.length) host.innerHTML = '<div class="panel-empty">No problems reported by installed language integrations.</div>';
 }
@@ -788,8 +830,8 @@ async function openCommandPalette(): Promise<void> {
   try {
     registeredCommands = expect(await client.call({ method: 'list_commands' }), 'commands').value;
     const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value;
-    commandLabels.clear();
-    for (const command of catalog.commands) commandLabels.set(command.id, command.title);
+    updateCommandCatalog(catalog);
+    extensionCatalogCache = catalog;
     renderCommandResults('');
     const dialog = document.querySelector<HTMLDialogElement>('#command-dialog')!;
     const input = document.querySelector<HTMLInputElement>('#command-search')!;
@@ -806,15 +848,22 @@ async function openExtensions(): Promise<void> {
 }
 
 function renderExtensions(catalog: ExtensionCatalog): void {
-  editorContextMenus = catalog.menu_items.filter((entry) => entry.location === 'editor_context');
+  extensionCatalogCache = catalog;
+  updateCommandCatalog(catalog);
+  editorContextMenus = extensionMenusAt(catalog.menu_items, 'editor_context');
+  projectExplorerMenus = extensionMenusAt(catalog.menu_items, 'project_explorer_context');
   for (const [location, hostId] of [['tools', 'extension-tools-items'], ['navigate', 'extension-navigate-items']] as const) {
     const menu = document.querySelector<HTMLDivElement>(`#${hostId}`)!; menu.replaceChildren();
-    for (const item of catalog.menu_items.filter((entry) => entry.location === location)) {
+    for (const item of extensionMenusAt(catalog.menu_items, location)) {
       const button = document.createElement('button'); button.setAttribute('role', 'menuitem'); button.textContent = item.label;
+      button.disabled = !item.enabled;
       button.addEventListener('click', () => void executeCommand(item.command_id)); menu.append(button);
     }
     if (menu.childElementCount) menu.prepend(Object.assign(document.createElement('div'), { className: 'menu-separator' }));
   }
+  renderToolWindows(catalog.tool_windows);
+  renderExtensionSettings(catalog.settings, catalog.themes);
+  renderProjectWizards(catalog.project_wizards);
   const host = document.querySelector<HTMLDivElement>('#extension-list')!;
   host.replaceChildren();
   for (const extension of catalog.extensions) {
@@ -848,6 +897,128 @@ function renderExtensions(catalog: ExtensionCatalog): void {
     host.append(row);
   }
   if (!catalog.extensions.length) host.innerHTML = '<div class="panel-empty">No local extensions installed.</div>';
+}
+
+function updateCommandCatalog(catalog: ExtensionCatalog): void {
+  commandLabels.clear(); commandDescriptions.clear(); commandMetadata.clear();
+  for (const command of [...catalog.built_in_commands, ...catalog.commands]) {
+    commandLabels.set(command.id, command.title); commandDescriptions.set(command.id, command.description);
+    commandMetadata.set(command.id, { description: command.description, shortcut: command.shortcut, enabled: command.enabled });
+  }
+  registeredCommands = [...catalog.built_in_commands, ...catalog.commands].map((command) => command.id);
+}
+
+function loadOpenExtensionPanels(): string[] {
+  try { const value: unknown = JSON.parse(localStorage.getItem('koren.openExtensionPanels') ?? '[]'); return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []; } catch { return []; }
+}
+function saveOpenExtensionPanels(): void { localStorage.setItem('koren.openExtensionPanels', JSON.stringify(openExtensionPanels)); }
+
+function renderToolWindows(windows: ExtensionToolWindowSummary[]): void {
+  const available = new Map(windows.map((panel) => [panel.id, panel]));
+  openExtensionPanels = activePanelLayout(openExtensionPanels, [...available.keys()]);
+  saveOpenExtensionPanels();
+  if (!available.has(activeDynamicPanel)) { activeDynamicPanel = ''; localStorage.removeItem('koren.activeExtensionPanel'); }
+  const menu = document.querySelector<HTMLDivElement>('#extension-panel-menu-items')!; menu.replaceChildren();
+  const hosts = document.querySelector<HTMLDivElement>('#extension-panel-content')!; hosts.replaceChildren();
+  const tabs = document.querySelector<HTMLDivElement>('.tool-tabs')!;
+  for (const panel of windows) {
+    const open = document.createElement('button'); open.setAttribute('role', 'menuitem'); open.textContent = panel.title;
+    open.addEventListener('click', () => openExtensionPanel(panel.id)); menu.append(open);
+    if (!openExtensionPanels.includes(panel.id)) continue;
+    const tab = document.createElement('button'); tab.dataset.panel = panel.id; tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(activeDynamicPanel === panel.id)); tab.classList.toggle('selected', activeDynamicPanel === panel.id);
+    const title = document.createElement('span'); title.textContent = panel.title;
+    const close = document.createElement('button'); close.type = 'button'; close.className = 'extension-panel-close'; close.textContent = '×'; close.setAttribute('aria-label', `Close ${panel.title}`);
+    close.addEventListener('click', (event) => {
+      event.stopPropagation(); openExtensionPanels = openExtensionPanels.filter((id) => id !== panel.id); saveOpenExtensionPanels();
+      if (activeDynamicPanel === panel.id) { activeDynamicPanel = ''; localStorage.removeItem('koren.activeExtensionPanel'); showPanel('output'); }
+      if (extensionCatalogCache) renderToolWindows(extensionCatalogCache.tool_windows);
+    });
+    tab.append(title);
+    tab.addEventListener('click', () => showPanel(panel.id)); tabs.append(tab, close);
+    const host = document.createElement('div'); host.className = 'panel-content extension-panel-view hidden'; host.dataset.extensionPanel = panel.id;
+    renderExtensionDocument(host, panel.initial_view); hosts.append(host);
+  }
+  if (activeDynamicPanel && openExtensionPanels.includes(activeDynamicPanel)) showPanel(activeDynamicPanel);
+}
+
+function openExtensionPanel(panelId: string): void {
+  if (!openExtensionPanels.includes(panelId)) openExtensionPanels.push(panelId);
+  activeDynamicPanel = panelId; saveOpenExtensionPanels();
+  if (extensionCatalogCache) renderToolWindows(extensionCatalogCache.tool_windows);
+  showPanel(panelId);
+}
+
+function renderExtensionDocument(host: HTMLElement, view: ExtensionUiDocument): void {
+  host.replaceChildren();
+  for (const element of view.elements) {
+    let node: HTMLElement;
+    switch (element.kind) {
+      case 'text': node = document.createElement('p'); node.textContent = element.text; break;
+      case 'heading': node = document.createElement('h3'); node.textContent = element.text; break;
+      case 'button': { const button = document.createElement('button'); button.textContent = element.label; button.addEventListener('click', () => void executeCommand(element.command_id)); node = button; break; }
+      case 'list': { const list = document.createElement('ul'); for (const text of element.items) { const item = document.createElement('li'); item.textContent = text; list.append(item); } node = list; break; }
+      case 'table': { const table = document.createElement('table'); for (const row of element.rows) { const tr = document.createElement('tr'); for (const text of row) { const cell = document.createElement('td'); cell.textContent = text; tr.append(cell); } table.append(tr); } node = table; break; }
+      case 'input': { const label = document.createElement('label'); label.textContent = element.label; const input = document.createElement('input'); input.value = element.value; input.maxLength = element.max_length; input.required = element.required; label.append(input); node = label; break; }
+      case 'select': { const label = document.createElement('label'); label.textContent = element.label; const select = document.createElement('select'); for (const value of element.options) { const option = document.createElement('option'); option.value = value; option.textContent = value; select.append(option); } select.value = element.value; label.append(select); node = label; break; }
+      case 'checkbox': { const label = document.createElement('label'); const input = document.createElement('input'); input.type = 'checkbox'; input.checked = element.checked; label.append(input, document.createTextNode(element.label)); node = label; break; }
+      case 'status': node = document.createElement('p'); node.className = `extension-status ${element.tone}`; node.textContent = element.label; break;
+    }
+    node.dataset.componentId = element.id; host.append(node);
+  }
+  if (!view.elements.length) { const empty = document.createElement('div'); empty.className = 'panel-empty'; empty.textContent = 'This extension panel has no content yet.'; host.append(empty); }
+}
+
+function renderExtensionSettings(settings: ExtensionSettingSummary[], themes: ExtensionThemeSummary[]): void {
+  const host = document.querySelector<HTMLDivElement>('#extension-settings')!; host.replaceChildren();
+  const themeSelect = document.querySelector<HTMLSelectElement>('#theme-setting')!;
+  const selected = themeSelect.value;
+  for (const option of [...themeSelect.options].filter((item) => item.value.startsWith('extension:'))) option.remove();
+  for (const theme of themes) { const option = document.createElement('option'); option.value = `extension:${theme.id}`; option.textContent = theme.title; themeSelect.append(option); }
+  if ([...themeSelect.options].some((option) => option.value === selected)) themeSelect.value = selected;
+  const persistedTheme = localStorage.getItem('koren-code:theme-extension');
+  const selectedTheme = themes.find((theme) => theme.id === persistedTheme);
+  if (selectedTheme) { themeSelect.value = `extension:${selectedTheme.id}`; applyExtensionTheme(selectedTheme); }
+  else if (persistedTheme) setTheme(readTheme(localStorage));
+  if (!settings.length) return;
+  const heading = document.createElement('h3'); heading.textContent = 'Extension settings'; host.append(heading);
+  for (const setting of settings) {
+    const label = document.createElement('label'); label.textContent = setting.title;
+    let control: HTMLInputElement | HTMLSelectElement;
+    if (setting.kind.type === 'choice') { const select = document.createElement('select'); for (const value of setting.kind.options) { const option = document.createElement('option'); option.value = value; option.textContent = value; select.append(option); } select.value = String(setting.value); control = select; }
+    else { const input = document.createElement('input'); input.type = setting.kind.type === 'boolean' ? 'checkbox' : setting.kind.type === 'integer' ? 'number' : 'text'; if (input.type === 'checkbox') input.checked = Boolean(setting.value); else { input.value = String(setting.value); if (setting.kind.type === 'integer') { input.min = String(setting.kind.min); input.max = String(setting.kind.max); } if (setting.kind.type === 'text') input.maxLength = setting.kind.max_length; } control = input; }
+    control.dataset.settingId = setting.id;
+    control.addEventListener('change', () => { const value: ExtensionSettingValue = setting.kind.type === 'boolean' ? (control as HTMLInputElement).checked : setting.kind.type === 'integer' ? Number(control.value) : control.value; void updateExtensionSetting(setting.id, value); });
+    label.append(control); if (setting.description) { const help = document.createElement('small'); help.textContent = setting.description; label.append(help); } host.append(label);
+  }
+}
+
+async function updateExtensionSetting(settingId: string, value: ExtensionSettingValue): Promise<void> {
+  try {
+    const setting = extensionCatalogCache?.settings.find((item) => item.id === settingId);
+    if (!setting || !validExtensionSettingValue(setting.kind, value)) throw new Error('The setting value is outside the extension’s declared schema.');
+    await client.call({ method: 'set_extension_setting', params: { setting_id: settingId, value } }); const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value; renderExtensions(catalog); setStatus(`Updated ${settingId}`);
+  }
+  catch (error) { showError(error); }
+}
+
+function renderProjectWizards(wizards: ExtensionProjectWizardSummary[]): void {
+  const menu = document.querySelector<HTMLDivElement>('#extension-wizard-menu-items')!; menu.replaceChildren();
+  for (const wizard of wizards) { const button = document.createElement('button'); button.setAttribute('role', 'menuitem'); button.textContent = `New ${wizard.title}…`; button.addEventListener('click', () => showProjectWizard(wizard)); menu.append(button); }
+}
+
+function showProjectWizard(wizard: ExtensionProjectWizardSummary): void {
+  document.querySelector('#project-wizard-title')!.textContent = wizard.title;
+  const fields = document.querySelector<HTMLDivElement>('#project-wizard-fields')!;
+  renderExtensionDocument(fields, wizard.form);
+  const form = document.querySelector<HTMLFormElement>('#project-wizard-form')!;
+  form.onsubmit = (event) => {
+    event.preventDefault();
+    const invalidField = [...fields.querySelectorAll<HTMLInputElement | HTMLSelectElement>('input,select')].find((control) => !control.checkValidity());
+    if (invalidField) { invalidField.reportValidity(); return; }
+    document.querySelector<HTMLDialogElement>('#project-wizard-dialog')!.close();
+    setStatus(`Validated ${wizard.title} fields. No project files were created.`);
+  };
+  document.querySelector<HTMLDialogElement>('#project-wizard-dialog')!.showModal();
 }
 
 async function startLanguageServer(server: LanguageServerSummary): Promise<void> {
@@ -917,13 +1088,19 @@ async function activateExtension(id: string): Promise<void> {
 }
 let commandSelection = 0;
 function renderCommandResults(query: string): void {
-  const results = filterCommands(registeredCommands, query);
-  commandSelection = results.length ? Math.min(commandSelection, results.length - 1) : -1;
+  const results = filterCommands(registeredCommands, query, commandLabels, commandDescriptions);
+  const enabled = results.map((command) => commandMetadata.get(command)?.enabled !== false);
+  if (commandSelection < 0 || commandSelection >= results.length || !enabled[commandSelection]) commandSelection = nextCommandSelection(-1, results.length, 1, enabled);
   const host = document.querySelector<HTMLDivElement>('#command-results')!; host.replaceChildren();
   for (const [index, command] of results.entries()) {
     const button = document.createElement('button'); button.setAttribute('role', 'option');
-    button.setAttribute('aria-selected', String(index === commandSelection)); button.textContent = commandLabels.has(command) ? `${commandLabels.get(command)} · ${command}` : command;
+    button.setAttribute('aria-selected', String(index === commandSelection)); button.disabled = commandMetadata.get(command)?.enabled === false;
+    const label = document.createElement('span'); label.textContent = commandLabels.has(command) ? `${commandLabels.get(command)} · ${command}` : command; button.append(label);
+    const metadata = commandMetadata.get(command);
+    if (metadata?.description) button.title = metadata.description;
+    if (metadata?.shortcut) { const shortcut = document.createElement('kbd'); shortcut.textContent = metadata.shortcut; button.append(shortcut); }
     button.addEventListener('mouseenter', () => {
+      if (!enabled[index]) return;
       commandSelection = index;
       for (const option of host.querySelectorAll<HTMLButtonElement>('[role="option"]')) {
         option.setAttribute('aria-selected', String(Number(option.dataset.commandIndex) === commandSelection));
@@ -943,6 +1120,7 @@ async function executeCommand(command: string): Promise<void> {
       await client.call({ method: 'read_document', params: { document_id: active.id } });
     }
     const result = expect(await client.call({ method: 'execute_command', params: { command_id: command } }), 'command_output').value;
+    renderExtensions(expect(await client.call({ method: 'list_extensions' }), 'extensions').value);
     setStatus(`${command}: ${result}`);
   } catch (error) { showError(error); }
 }
@@ -963,11 +1141,9 @@ function handleAction(action: string, target: HTMLElement): void {
     case 'show-panel': showPanel(target.dataset.panelTarget as 'output' | 'problems' | 'tasks' | 'projects'); break;
     case 'run-selected': void runSelectedConfiguration(); break;
     case 'settings': {
-      const settings = document.querySelector<HTMLDialogElement>('#settings-dialog')!;
-      document.querySelector<HTMLSelectElement>('#theme-setting')!.value = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
-      settings.showModal();
-      break;
+      void openSettings(); break;
     }
+    case 'close-wizard': document.querySelector<HTMLDialogElement>('#project-wizard-dialog')!.close(); break;
     case 'focus-explorer': setExplorerCollapsed(false); treeRoot.querySelector<HTMLButtonElement>('.tree-row')?.focus(); break;
     case 'focus-editor': editor?.focus(); break;
     case 'next-tab': cycleTab(1); break;
@@ -1021,12 +1197,14 @@ async function navigateToDefinition(uri: string, range: TextRange): Promise<void
 
 document.addEventListener('contextmenu', (event) => {
   const target = event.target as HTMLElement;
-  if (!target.closest('#editor') || !editorContextMenus.length) return;
+  const items = target.closest('#editor') ? editorContextMenus : target.closest('#tree') ? projectExplorerMenus : [];
+  if (!items.length) return;
   event.preventDefault();
   document.querySelector('#editor-context-menu')?.remove();
   const menu = document.createElement('div'); menu.id = 'editor-context-menu'; menu.className = 'editor-context-menu'; menu.setAttribute('role', 'menu');
-  for (const item of editorContextMenus) {
+  for (const item of items) {
     const button = document.createElement('button'); button.setAttribute('role', 'menuitem'); button.textContent = item.label;
+    button.disabled = !item.enabled;
     button.addEventListener('click', () => { menu.remove(); void executeCommand(item.command_id); }); menu.append(button);
   }
   menu.style.left = `${event.clientX}px`; menu.style.top = `${event.clientY}px`; document.body.append(menu);
@@ -1047,13 +1225,18 @@ document.addEventListener('keydown', (event) => {
   const commandDialog = document.querySelector<HTMLDialogElement>('#command-dialog')!;
   if (commandDialog.open) {
     const input = document.querySelector<HTMLInputElement>('#command-search')!;
-    const results = filterCommands(registeredCommands, input.value);
+    const results = filterCommands(registeredCommands, input.value, commandLabels, commandDescriptions);
+    const enabled = results.map((command) => commandMetadata.get(command)?.enabled !== false);
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-      event.preventDefault(); commandSelection = nextCommandSelection(commandSelection, results.length, event.key === 'ArrowDown' ? 1 : -1); renderCommandResults(input.value);
-    } else if (event.key === 'Enter' && results[commandSelection]) {
+      event.preventDefault(); commandSelection = nextCommandSelection(commandSelection, results.length, event.key === 'ArrowDown' ? 1 : -1, enabled); renderCommandResults(input.value);
+    } else if (event.key === 'Enter' && results[commandSelection] && enabled[commandSelection]) {
       event.preventDefault(); void executeCommand(results[commandSelection]!);
     }
     return;
+  }
+  if (!event.isComposing) {
+    const shortcut = [...commandMetadata.entries()].find(([_, metadata]) => metadata.enabled && metadata.shortcut && commandShortcutMatches(event, metadata.shortcut));
+    if (shortcut) { event.preventDefault(); void executeCommand(shortcut[0]); return; }
   }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'o') { event.preventDefault(); event.shiftKey ? void chooseFile() : void chooseWorkspace(); }
   else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); void saveActive(); }
@@ -1074,7 +1257,11 @@ document.querySelector<HTMLInputElement>('#command-search')!.addEventListener('i
 
 document.querySelectorAll<HTMLButtonElement>('[data-panel]').forEach((button) => button.addEventListener('click', () => showPanel(button.dataset.panel as 'output' | 'problems' | 'tasks' | 'projects')));
 document.querySelector<HTMLSelectElement>('#theme-setting')!.addEventListener('change', (event) => {
-  setTheme((event.currentTarget as HTMLSelectElement).value === 'light' ? 'light' : 'dark');
+  const value = (event.currentTarget as HTMLSelectElement).value;
+  if (value.startsWith('extension:')) {
+    const theme = extensionCatalogCache?.themes.find((item) => item.id === value.slice('extension:'.length));
+    if (theme) applyExtensionTheme(theme);
+  } else setTheme(value === 'light' ? 'light' : 'dark');
 });
 runConfiguration.addEventListener('change', syncRunButton);
 
