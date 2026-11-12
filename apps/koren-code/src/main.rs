@@ -375,7 +375,7 @@ fn route_request(
     }
     if path == "/events" && request.method() == "GET" {
         thread::spawn(move || {
-            let (sender, receiver) = mpsc::channel::<Vec<DesktopEvent>>();
+            let (sender, receiver) = mpsc::sync_channel::<Vec<DesktopEvent>>(2);
             if bridge::subscribe(&backend, sender).is_err() {
                 responder.respond(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,

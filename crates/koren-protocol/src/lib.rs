@@ -498,6 +498,43 @@ pub enum RequestMethod {
         /// Task run identifier.
         run_id: u64,
     },
+    /// Request an interactive shell session; the host always requires explicit approval.
+    RequestTerminalStart,
+    /// List current PTY-backed terminal sessions.
+    ListTerminalSessions,
+    /// Approve one exact pending interactive shell request.
+    ApproveTerminalStart {
+        /// One-time approval request identity.
+        request_id: u64,
+    },
+    /// Deny one pending interactive shell request.
+    DenyTerminalStart {
+        /// One-time approval request identity.
+        request_id: u64,
+    },
+    /// Send one base64-encoded binary input chunk to a running session.
+    TerminalWrite {
+        /// Terminal session identity.
+        session_id: u64,
+        /// Base64-encoded raw terminal input bytes.
+        input_base64: String,
+    },
+    /// Resize a running session's PTY.
+    TerminalResize {
+        /// Terminal session identity.
+        session_id: u64,
+        /// New row count.
+        rows: u16,
+        /// New column count.
+        columns: u16,
+    },
+    /// Close a terminal session, optionally confirming active process termination.
+    CloseTerminal {
+        /// Terminal session identity.
+        session_id: u64,
+        /// Whether the user confirmed terminating a live process.
+        terminate_active: bool,
+    },
 }
 
 /// Versioned request envelope for internal consumers.
@@ -543,6 +580,10 @@ pub enum ErrorCode {
     Internal,
     /// The host authorization policy denied task execution.
     Unauthorized,
+    /// The request cannot be completed while the target resource is busy.
+    Busy,
+    /// The requested operation is invalid for the resource's current state.
+    InvalidState,
 }
 
 /// Structured error payload.
@@ -996,6 +1037,93 @@ pub enum ResponseValue {
         /// Run identifier.
         run_id: u64,
     },
+    /// Interactive shell request awaiting explicit approval.
+    TerminalApprovalRequired(TerminalApprovalSummary),
+    /// Current terminal sessions.
+    TerminalSessions(Vec<TerminalSessionSummary>),
+    /// Approved shell request and started PTY session.
+    TerminalApproved {
+        /// Consumed approval request identity.
+        request_id: u64,
+        /// Newly running terminal session.
+        session: TerminalSessionSummary,
+    },
+    /// Denied shell request was consumed without spawning a process.
+    TerminalDenied {
+        /// Consumed approval request identity.
+        request_id: u64,
+    },
+    /// Terminal input, resize, or close operation completed.
+    TerminalAction {
+        /// Terminal session identity.
+        session_id: u64,
+    },
+}
+
+/// Exact interactive shell details shown to the user before approval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalApprovalSummary {
+    /// One-time approval request identifier.
+    pub request_id: u64,
+    /// Configured terminal profile identifier.
+    pub profile_id: String,
+    /// User-facing profile name.
+    pub profile_name: String,
+    /// Shell executable path.
+    pub executable: String,
+    /// Direct argv values.
+    pub arguments: Vec<String>,
+    /// Initial working directory.
+    pub working_directory: String,
+    /// Environment variable names; values are never exposed.
+    pub environment_keys: Vec<String>,
+    /// Detected-shell fallback executable, if any.
+    pub fallback_executable: Option<String>,
+    /// Requesting actor.
+    pub actor: String,
+    /// Associated workspace root, if one is open.
+    pub workspace: Option<String>,
+}
+
+/// Current public state of a PTY-backed terminal session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalSessionSummary {
+    /// Unique terminal session identifier.
+    pub session_id: u64,
+    /// Configured profile identifier.
+    pub profile_id: String,
+    /// Working directory resolved before approval.
+    pub working_directory: String,
+    /// Session lifecycle state.
+    pub state: TerminalLifecycle,
+    /// Process exit status, if known.
+    pub exit_code: Option<u32>,
+    /// Whether the owned process group still has live processes.
+    pub process_group_active: bool,
+    /// Safe-to-display startup or PTY error.
+    pub error: Option<String>,
+    /// Current PTY rows.
+    pub rows: u16,
+    /// Current PTY columns.
+    pub columns: u16,
+}
+
+/// PTY session lifecycle states exposed to desktop consumers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalLifecycle {
+    /// Reserved without allocating a PTY.
+    Created,
+    /// PTY and shell startup are in progress.
+    Starting,
+    /// Shell process is running.
+    Running,
+    /// Shell exited.
+    Exited,
+    /// PTY or shell startup failed.
+    Failed,
+    /// Host terminated the session.
+    Terminated,
 }
 
 /// Extension metadata exposed to the desktop without implementation details.
@@ -1842,6 +1970,41 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Response>(&encoded).unwrap(),
             approval
+        );
+    }
+
+    #[test]
+    fn terminal_contracts_round_trip_with_typed_lifecycle() {
+        let request = Request::new(
+            12,
+            RequestMethod::TerminalWrite {
+                session_id: 5,
+                input_base64: "AP8=".into(),
+            },
+        );
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), request);
+        let response = Response::new(
+            12,
+            Ok(ResponseValue::TerminalSessions(vec![
+                TerminalSessionSummary {
+                    session_id: 5,
+                    profile_id: "default".into(),
+                    working_directory: "/tmp".into(),
+                    state: TerminalLifecycle::Created,
+                    exit_code: None,
+                    process_group_active: false,
+                    error: None,
+                    rows: 24,
+                    columns: 80,
+                },
+            ])),
+        );
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(encoded.contains("\"state\":\"created\""));
+        assert_eq!(
+            serde_json::from_str::<Response>(&encoded).unwrap(),
+            response
         );
     }
 

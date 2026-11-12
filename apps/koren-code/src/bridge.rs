@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use koren_cargo::CargoProvider;
 use koren_commands::{CommandError, CommandRegistry};
 use koren_core::{EventQueue, Platform, PlatformEvent};
@@ -32,13 +33,18 @@ use koren_protocol::{
     ProjectInspectionFindingPage, ProjectInspectionSummary, ProjectLifecycle, ProjectSummary,
     ProtocolError, Request, RequestMethod, Response, ResponseValue, SearchMatch,
     SearchProgress as ProtocolSearchProgress, SearchSummary as ProtocolSearchSummary,
-    TaskLifecycle, TaskSummary, TextEdit, validate_version,
+    TaskLifecycle, TaskSummary, TerminalApprovalSummary, TerminalLifecycle, TerminalSessionSummary,
+    TextEdit, validate_version,
 };
 use koren_search::{SearchEvent, SearchJob, SearchOptions, SearchService};
 use koren_tasks::{
     ExecutionRequestId, TaskApprovalManager, TaskAuthorizationDecision, TaskCaller, TaskDefinition,
     TaskExecutionPolicy, TaskExecutionRequest, TaskExecutionRequestOutcome, TaskId, TaskManager,
     TaskOptions, TaskRunId, TaskSnapshot, TaskState,
+};
+use koren_terminal::{
+    MAX_TERMINAL_INPUT_BYTES, TerminalApprovalDetails, TerminalEvent, TerminalId, TerminalManager,
+    TerminalSessionInfo,
 };
 use koren_workspace::{EntryKind, WorkspaceManager};
 use serde::{Deserialize, Serialize};
@@ -104,6 +110,18 @@ pub struct DesktopEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_process_group_active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub server_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
@@ -125,8 +143,13 @@ pub struct DesktopEvent {
 
 pub(crate) enum BackendCommand {
     Request(Box<Request>, Sender<Response>),
-    Subscribe(Sender<Vec<DesktopEvent>>),
+    Subscribe(SyncSender<Vec<DesktopEvent>>),
     Shutdown,
+}
+
+struct EventSubscriber {
+    sender: SyncSender<Vec<DesktopEvent>>,
+    pending: Option<Vec<DesktopEvent>>,
 }
 
 pub(crate) type BackendSender = Sender<BackendCommand>;
@@ -162,7 +185,7 @@ pub(crate) fn send_request(sender: &BackendSender, request: Request) -> Result<R
 
 pub(crate) fn subscribe(
     sender: &BackendSender,
-    events: Sender<Vec<DesktopEvent>>,
+    events: SyncSender<Vec<DesktopEvent>>,
 ) -> Result<(), String> {
     sender
         .send(BackendCommand::Subscribe(events))
@@ -186,7 +209,7 @@ fn backend_loop(receiver: Receiver<BackendCommand>) {
 
 fn backend_loop_with_state(receiver: Receiver<BackendCommand>, mut state: DesktopBackend) {
     let language_features = LanguageFeaturePool::new();
-    let mut subscribers: Vec<Sender<Vec<DesktopEvent>>> = Vec::new();
+    let mut subscribers: Vec<EventSubscriber> = Vec::new();
     let mut ticks_without_events = 0u16;
     loop {
         match receiver.recv_timeout(Duration::from_millis(50)) {
@@ -199,15 +222,34 @@ fn backend_loop_with_state(receiver: Receiver<BackendCommand>, mut state: Deskto
             }
             Ok(BackendCommand::Subscribe(sender)) => {
                 if subscribers.len() < 8 {
-                    subscribers.push(sender);
+                    subscribers.push(EventSubscriber {
+                        sender,
+                        pending: None,
+                    });
                 } else {
-                    let _ = sender.send(Vec::new());
+                    let _ = sender.try_send(Vec::new());
                 }
             }
             Ok(BackendCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
-        let events = state.drain_events();
+        let was_blocked = subscribers
+            .iter()
+            .any(|subscriber| subscriber.pending.is_some());
+        subscribers.retain_mut(|subscriber| {
+            if let Some(pending) = subscriber.pending.as_ref() {
+                match subscriber.sender.try_send(pending.clone()) {
+                    Ok(()) => subscriber.pending = None,
+                    Err(TrySendError::Full(_)) => return true,
+                    Err(TrySendError::Disconnected(_)) => return false,
+                }
+            }
+            true
+        });
+        if was_blocked {
+            continue;
+        }
+        let events = state.drain_events_for_subscribers(!subscribers.is_empty());
         if events.is_empty() {
             ticks_without_events = ticks_without_events.saturating_add(1);
             if ticks_without_events < 400 {
@@ -218,7 +260,16 @@ fn backend_loop_with_state(receiver: Receiver<BackendCommand>, mut state: Deskto
             ticks_without_events = 0;
         }
         if !subscribers.is_empty() {
-            subscribers.retain(|subscriber| subscriber.send(events.clone()).is_ok());
+            subscribers.retain_mut(
+                |subscriber| match subscriber.sender.try_send(events.clone()) {
+                    Ok(()) => true,
+                    Err(TrySendError::Full(events)) => {
+                        subscriber.pending = Some(events);
+                        true
+                    }
+                    Err(TrySendError::Disconnected(_)) => false,
+                },
+            );
         }
     }
     state.shutdown();
@@ -240,6 +291,9 @@ struct DesktopBackend {
     cargo: CargoProvider,
     tasks: TaskManager,
     approvals: TaskApprovalManager,
+    terminals: TerminalManager,
+    terminal_approvals: BTreeMap<u64, PendingTerminalApproval>,
+    next_terminal_approval_id: u64,
     extensions: ExtensionManager,
     inspections: InspectionService,
     inspection_profiles: InspectionProfiles,
@@ -273,6 +327,12 @@ struct PendingLanguageServer {
     extension_id: String,
     configuration_id: String,
     configuration: ServerConfig,
+}
+
+struct PendingTerminalApproval {
+    session_id: TerminalId,
+    workspace: Option<PathBuf>,
+    expires_at: Instant,
 }
 
 struct ProjectInspectionState {
@@ -360,6 +420,9 @@ impl DesktopBackend {
             cargo,
             tasks: TaskManager::new(TaskOptions::default()).map_err(|error| error.to_string())?,
             approvals: TaskApprovalManager::new(),
+            terminals: TerminalManager::default(),
+            terminal_approvals: BTreeMap::new(),
+            next_terminal_approval_id: 0,
             extensions: ExtensionManager::new(),
             inspections: InspectionService::default(),
             inspection_profiles,
@@ -391,6 +454,8 @@ impl DesktopBackend {
     }
 
     fn shutdown(&mut self) {
+        self.terminal_approvals.clear();
+        self.terminals.shutdown();
         for job in self.search_jobs.values() {
             job.cancel();
         }
@@ -1452,8 +1517,131 @@ impl DesktopBackend {
                 .cleanup(TaskRunId::from_raw(run_id))
                 .map(|()| ResponseValue::TaskCleaned { run_id })
                 .map_err(task_error),
+            RequestMethod::RequestTerminalStart => self.request_terminal_start(),
+            RequestMethod::ListTerminalSessions => self
+                .terminals
+                .sessions()
+                .map(|sessions| {
+                    ResponseValue::TerminalSessions(sessions.iter().map(terminal_summary).collect())
+                })
+                .map_err(terminal_error),
+            RequestMethod::ApproveTerminalStart { request_id } => {
+                self.approve_terminal_start(request_id)
+            }
+            RequestMethod::DenyTerminalStart { request_id } => self.deny_terminal_start(request_id),
+            RequestMethod::TerminalWrite {
+                session_id,
+                input_base64,
+            } => {
+                if input_base64.len() > MAX_TERMINAL_INPUT_BYTES.div_ceil(3) * 4 {
+                    return Err(invalid("terminal input exceeds the 64 KiB limit"));
+                }
+                let bytes = BASE64.decode(input_base64).map_err(|error| {
+                    invalid(format!("invalid terminal input encoding: {error}"))
+                })?;
+                self.terminals
+                    .write(TerminalId::from_raw(session_id), &bytes)
+                    .map_err(terminal_error)?;
+                Ok(ResponseValue::TerminalAction { session_id })
+            }
+            RequestMethod::TerminalResize {
+                session_id,
+                rows,
+                columns,
+            } => {
+                self.terminals
+                    .resize(TerminalId::from_raw(session_id), rows, columns)
+                    .map_err(terminal_error)?;
+                Ok(ResponseValue::TerminalAction { session_id })
+            }
+            RequestMethod::CloseTerminal {
+                session_id,
+                terminate_active,
+            } => {
+                self.terminals
+                    .close_session(TerminalId::from_raw(session_id), terminate_active)
+                    .map_err(terminal_error)?;
+                Ok(ResponseValue::TerminalAction { session_id })
+            }
             _ => Err(invalid("operation is not supported by Koren Code Editor")),
         }
+    }
+
+    fn request_terminal_start(&mut self) -> Result<ResponseValue, ProtocolError> {
+        let now = Instant::now();
+        let expired = self
+            .terminal_approvals
+            .iter()
+            .filter_map(|(id, request)| (request.expires_at <= now).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in expired {
+            if let Some(request) = self.terminal_approvals.remove(&id) {
+                let _ = self.terminals.close_session(request.session_id, false);
+            }
+        }
+        if self.terminal_approvals.len() >= 16 {
+            return Err(invalid("too many pending terminal approvals"));
+        }
+        let workspace = self.workspace.root().ok().map(Path::to_path_buf);
+        let created = self
+            .terminals
+            .create_session("default", workspace.as_deref(), None, 24, 80)
+            .map_err(terminal_error)?;
+        let details = self
+            .terminals
+            .approval_details(created.id)
+            .map_err(terminal_error)?;
+        self.next_terminal_approval_id = self
+            .next_terminal_approval_id
+            .checked_add(1)
+            .ok_or_else(|| invalid("terminal approval identifiers exhausted"))?;
+        let request_id = self.next_terminal_approval_id;
+        let summary = terminal_approval_summary(request_id, &details, workspace.as_deref());
+        self.terminal_approvals.insert(
+            request_id,
+            PendingTerminalApproval {
+                session_id: created.id,
+                workspace,
+                expires_at: now + Duration::from_secs(120),
+            },
+        );
+        Ok(ResponseValue::TerminalApprovalRequired(summary))
+    }
+
+    fn approve_terminal_start(&mut self, request_id: u64) -> Result<ResponseValue, ProtocolError> {
+        let pending = self.terminal_approvals.remove(&request_id).ok_or_else(|| {
+            not_found("terminal approval request was not found or expired".into())
+        })?;
+        if pending.expires_at <= Instant::now()
+            || pending.workspace.as_deref() != self.workspace.root().ok()
+        {
+            let _ = self.terminals.close_session(pending.session_id, false);
+            return Err(ProtocolError {
+                code: ErrorCode::NotOpen,
+                message: "terminal approval expired or its workspace changed".into(),
+            });
+        }
+        let session = match self.terminals.start_session(pending.session_id) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = self.terminals.close_session(pending.session_id, false);
+                return Err(terminal_error(error));
+            }
+        };
+        Ok(ResponseValue::TerminalApproved {
+            request_id,
+            session: terminal_summary(&session),
+        })
+    }
+
+    fn deny_terminal_start(&mut self, request_id: u64) -> Result<ResponseValue, ProtocolError> {
+        let pending = self.terminal_approvals.remove(&request_id).ok_or_else(|| {
+            not_found("terminal approval request was not found or expired".into())
+        })?;
+        self.terminals
+            .close_session(pending.session_id, false)
+            .map_err(terminal_error)?;
+        Ok(ResponseValue::TerminalDenied { request_id })
     }
 
     fn poll_workspace_search(&mut self, job_id: u64) -> Result<ResponseValue, ProtocolError> {
@@ -2927,8 +3115,49 @@ impl DesktopBackend {
         Ok(())
     }
 
+    #[cfg(test)]
     fn drain_events(&mut self) -> Vec<DesktopEvent> {
+        self.drain_events_for_subscribers(true)
+    }
+
+    fn drain_events_for_subscribers(&mut self, has_subscribers: bool) -> Vec<DesktopEvent> {
+        self.expire_terminal_approvals();
         let mut events = Vec::new();
+        for event in self.terminals.drain_events(has_subscribers) {
+            match event {
+                TerminalEvent::Output {
+                    id,
+                    sequence,
+                    bytes,
+                } => events.push(DesktopEvent {
+                    kind: "terminal_output".into(),
+                    terminal_id: Some(id.get()),
+                    sequence: Some(sequence),
+                    data_base64: Some(BASE64.encode(bytes)),
+                    ..empty_event()
+                }),
+                TerminalEvent::StateChanged {
+                    id,
+                    state,
+                    exit_code,
+                    process_group_active,
+                    error,
+                } => events.push(DesktopEvent {
+                    kind: "terminal_state_changed".into(),
+                    terminal_id: Some(id.get()),
+                    terminal_state: Some(format!("{state:?}").to_lowercase()),
+                    exit_code,
+                    terminal_process_group_active: Some(process_group_active),
+                    message: error,
+                    ..empty_event()
+                }),
+                TerminalEvent::Closed { id } => events.push(DesktopEvent {
+                    kind: "terminal_closed".into(),
+                    terminal_id: Some(id.get()),
+                    ..empty_event()
+                }),
+            }
+        }
         events.extend(
             self.workspace
                 .drain_events()
@@ -3036,6 +3265,9 @@ impl DesktopBackend {
             }
         }
         for event in &events {
+            if event.kind.starts_with("terminal_") {
+                continue;
+            }
             if let Ok(payload) = serde_json::to_string(event) {
                 for runtime in self.lua_runtimes.values() {
                     let _ = runtime.dispatch_event(&event.kind, &payload);
@@ -3058,6 +3290,23 @@ impl DesktopBackend {
             }
         }
         events
+    }
+
+    fn expire_terminal_approvals(&mut self) {
+        let active_workspace = self.workspace.root().ok().map(Path::to_path_buf);
+        let now = Instant::now();
+        let expired = self
+            .terminal_approvals
+            .iter()
+            .filter_map(|(id, pending)| {
+                (pending.expires_at <= now || pending.workspace != active_workspace).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in expired {
+            if let Some(pending) = self.terminal_approvals.remove(&id) {
+                let _ = self.terminals.close_session(pending.session_id, false);
+            }
+        }
     }
 
     fn register_language_server(
@@ -3704,6 +3953,12 @@ fn event_from_platform(event: PlatformEvent) -> DesktopEvent {
 fn empty_event() -> DesktopEvent {
     DesktopEvent {
         kind: String::new(),
+        terminal_id: None,
+        sequence: None,
+        data_base64: None,
+        terminal_state: None,
+        exit_code: None,
+        terminal_process_group_active: None,
         document_id: None,
         project_id: None,
         run_id: None,
@@ -3716,6 +3971,65 @@ fn empty_event() -> DesktopEvent {
         commit: None,
         diagnostics: None,
         message: None,
+    }
+}
+
+fn terminal_summary(info: &TerminalSessionInfo) -> TerminalSessionSummary {
+    TerminalSessionSummary {
+        session_id: info.id.get(),
+        profile_id: info.profile_id.clone(),
+        working_directory: info.working_directory.to_string_lossy().into_owned(),
+        state: match info.state {
+            koren_terminal::TerminalState::Created => TerminalLifecycle::Created,
+            koren_terminal::TerminalState::Starting => TerminalLifecycle::Starting,
+            koren_terminal::TerminalState::Running => TerminalLifecycle::Running,
+            koren_terminal::TerminalState::Exited => TerminalLifecycle::Exited,
+            koren_terminal::TerminalState::Failed => TerminalLifecycle::Failed,
+            koren_terminal::TerminalState::Terminated => TerminalLifecycle::Terminated,
+        },
+        exit_code: info.exit_code,
+        process_group_active: info.process_group_active,
+        error: info.error.clone(),
+        rows: info.rows,
+        columns: info.columns,
+    }
+}
+
+fn terminal_approval_summary(
+    request_id: u64,
+    details: &TerminalApprovalDetails,
+    workspace: Option<&Path>,
+) -> TerminalApprovalSummary {
+    TerminalApprovalSummary {
+        request_id,
+        profile_id: details.profile_id.clone(),
+        profile_name: details.profile_name.clone(),
+        executable: details.executable.to_string_lossy().into_owned(),
+        arguments: details.arguments.clone(),
+        working_directory: details.working_directory.to_string_lossy().into_owned(),
+        environment_keys: details.environment_keys.clone(),
+        fallback_executable: details
+            .fallback_executable
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        actor: "interactive_user".into(),
+        workspace: workspace.map(|path| path.to_string_lossy().into_owned()),
+    }
+}
+
+fn terminal_error(error: koren_terminal::TerminalError) -> ProtocolError {
+    let code = match error {
+        koren_terminal::TerminalError::NotFound => ErrorCode::NotFound,
+        koren_terminal::TerminalError::InvalidState(_)
+        | koren_terminal::TerminalError::ActiveSession => ErrorCode::InvalidState,
+        koren_terminal::TerminalError::Backpressure => ErrorCode::Busy,
+        koren_terminal::TerminalError::Invalid(_) | koren_terminal::TerminalError::Io(_) => {
+            ErrorCode::InvalidRequest
+        }
+    };
+    ProtocolError {
+        code,
+        message: error.to_string(),
     }
 }
 
@@ -4445,6 +4759,43 @@ mod tests {
         let reloaded = parse_desktop_settings(serde_json::to_value(&stored).unwrap());
         assert_eq!(reloaded.extension_settings, stored.extension_settings);
         assert_eq!(reloaded.inspection_profiles, stored.inspection_profiles);
+    }
+
+    #[test]
+    fn terminal_request_requires_approval_and_denial_never_spawns_shell() {
+        let workspace = Temp::new();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: workspace.0.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        let requested = backend.method(RequestMethod::RequestTerminalStart).unwrap();
+        let approval = match requested {
+            ResponseValue::TerminalApprovalRequired(approval) => approval,
+            other => panic!("unexpected response {other:?}"),
+        };
+        assert_eq!(approval.actor, "interactive_user");
+        assert_eq!(
+            approval.workspace.as_deref(),
+            Some(workspace.0.to_string_lossy().as_ref())
+        );
+        assert!(!approval.executable.is_empty());
+        assert!(
+            matches!(backend.method(RequestMethod::ListTerminalSessions).unwrap(), ResponseValue::TerminalSessions(sessions) if sessions.len() == 1 && sessions[0].state == TerminalLifecycle::Created)
+        );
+        assert!(matches!(
+            backend
+                .method(RequestMethod::DenyTerminalStart {
+                    request_id: approval.request_id
+                })
+                .unwrap(),
+            ResponseValue::TerminalDenied { .. }
+        ));
+        assert!(
+            matches!(backend.method(RequestMethod::ListTerminalSessions).unwrap(), ResponseValue::TerminalSessions(sessions) if sessions.is_empty())
+        );
+        backend.shutdown();
     }
 
     #[test]
@@ -5543,7 +5894,7 @@ mod tests {
         let mut state = DesktopBackend::new().unwrap();
         state.extension_root = Some(install_root);
         let backend = spawn_backend_with_state(state);
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::sync_channel(2);
         subscribe(&backend, event_tx).unwrap();
         let mut request_id = 0;
         call_backend(
