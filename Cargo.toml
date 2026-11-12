@@ -12,6 +12,7 @@ members = [
     "crates/koren-search",
     "crates/koren-git",
     "crates/koren-terminal",
+    "crates/koren-debug",
     "crates/koren-documents",
     "crates/koren-projects",
     "crates/koren-tasks",
@@ -54,6 +55,7 @@ koren-workspace = { path = "crates/koren-workspace" }
 koren-search = { path = "crates/koren-search" }
 koren-git = { path = "crates/koren-git" }
 koren-terminal = { path = "crates/koren-terminal" }
+koren-debug = { path = "crates/koren-debug" }
 koren-documents = { path = "crates/koren-documents" }
 koren-projects = { path = "crates/koren-projects" }
 koren-tasks = { path = "crates/koren-tasks" }
