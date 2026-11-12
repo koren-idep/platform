@@ -235,6 +235,7 @@ Reproduce the deterministic fake-adapter workload with:
 
 ```sh
 cargo bench --locked -p koren-debug --bench phase9c
+npm run --prefix apps/koren-code/frontend benchmark:phase9c -- --silent=false
 ```
 
 One local run on 2026-11-11, Linux x86_64, optimized Rust bench profile, Python stdio fake adapter, 10 samples per workload:
@@ -247,5 +248,8 @@ One local run on 2026-11-11, Linux x86_64, optimized Rust bench profile, Python 
 | Scopes request/response | 8.127 / 8.073 ms | Same boundary |
 | Variables request/response | 8.089 / 8.074 ms | Same boundary |
 | Second session start while first is active | 26.932 / 25.862 ms | Includes fake process startup and paused-state observation for session two |
+| Debug panel output processing | 1,000 events in 76.83 ms | Production DebugPanel in jsdom; DOM updates only, excludes WebKit paint and adapter time |
 
-These are single-process means/minima with a tiny local fixture, not percentiles or real-debugger measurements. The differing response times reflect polling and scheduling noise in this harness. Breakpoint synchronization latency, debug panel paint/interaction latency, idle CPU/RSS split from WebKit, and session event throughput under load were not separately measured. The editor startup smoke has no active debugger, so it shows lazy startup behavior only; it cannot isolate debug-service overhead. See [DEBUGGING.md](docs/DEBUGGING.md) for compatibility limits.
+These are single-process means/minima with a tiny local fixture, not percentiles or real-debugger measurements. The differing response times reflect polling and scheduling noise in this harness. The panel workload excludes browser paint, and the startup smoke has no active debugger, so neither isolates real-adapter overhead. Breakpoint synchronization latency and session event throughput under load were not separately measured. See [DEBUGGING.md](docs/DEBUGGING.md) for compatibility limits.
+
+An additional no-debugger Linux/Xvfb idle sample over 5 seconds measured 3 process-tree CPU ticks (about 30 ms at this host's 100 Hz procfs tick rate) and 401,816 KiB RSS. This is one quantized sample of the full desktop process tree, not debugger-only overhead or a platform-wide estimate. The startup smoke above also measures desktop startup without an active debugger.

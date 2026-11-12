@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome lint --only correctness --skip correctness/useImportExtensions --skip correctness/useQwikValidLexicalScope src",
     "test": "vitest run",
-    "benchmark:phase9a": "vitest run src/app/developerTools.perf.test.ts"
+    "benchmark:phase9a": "vitest run src/app/developerTools.perf.test.ts",
+    "benchmark:phase9c": "vitest run src/app/debug.perf.test.ts"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.4",
