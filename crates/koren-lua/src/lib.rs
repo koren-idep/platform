@@ -1659,6 +1659,8 @@ mod tests {
             activation: ActivationConditions::default(),
             languages: Vec::new(),
             language_servers: Vec::new(),
+            debug_adapters: Vec::new(),
+            debug_configurations: Vec::new(),
         }
     }
 

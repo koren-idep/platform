@@ -40,6 +40,8 @@ pub enum Capability {
     LanguageDefinitions,
     /// Declare an external language-server process configuration (host approval is separate).
     LanguageServer,
+    /// Contribute declarative DAP adapters and profiles; every start still requires host approval.
+    DebugAdapters,
     /// Publish language-neutral diagnostics.
     Diagnostics,
     /// Register typed namespaced settings.
@@ -100,6 +102,68 @@ pub struct LanguageServerContribution {
     pub environment: BTreeMap<String, String>,
 }
 
+/// Launch or attach type for an extension-contributed DAP profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebugRequestContribution {
+    /// Start a new target using the adapter.
+    Launch,
+    /// Attach to an existing target; disconnect must leave it running.
+    Attach,
+}
+
+/// Declarative local DAP adapter. Registration never starts its executable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugAdapterContribution {
+    /// Stable identifier within the extension.
+    pub id: String,
+    /// User-visible adapter name.
+    pub name: String,
+    /// Executable passed directly to the process API.
+    pub command: String,
+    /// Direct adapter arguments.
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    /// Adapter working directory; `${workspaceFolder}` resolves when the host opens a profile.
+    pub working_directory: String,
+    /// Explicit environment overrides; values are shown only to the process and not in approval UI.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+}
+
+/// Suggested, language-neutral launch or attach profile.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugConfigurationContribution {
+    /// Stable identifier within the extension.
+    pub id: String,
+    /// User-visible profile name.
+    pub name: String,
+    /// Local adapter identifier from `debug_adapters`.
+    pub adapter_id: String,
+    /// Whether this profile launches or attaches.
+    pub request: DebugRequestContribution,
+    /// Target program path for launch or optional executable metadata for attach.
+    pub program: Option<String>,
+    /// Process ID required for attach profiles.
+    pub process_id: Option<u32>,
+    /// Program arguments.
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    /// Target working directory; `${workspaceFolder}` resolves when activated for a workspace.
+    pub working_directory: String,
+    /// Explicit target environment overrides.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    /// Adapter-specific JSON launch settings.
+    #[serde(default)]
+    pub adapter_settings: serde_json::Map<String, serde_json::Value>,
+    /// Stop at the first instruction when supported by the adapter.
+    #[serde(default)]
+    pub stop_on_entry: bool,
+}
+
 /// Versioned extension metadata loaded from `koren-extension.toml`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,6 +196,12 @@ pub struct ExtensionManifest {
     /// Optional LSP process declarations. The host must separately approve each configuration.
     #[serde(default)]
     pub language_servers: Vec<LanguageServerContribution>,
+    /// Optional declarative DAP adapters.
+    #[serde(default)]
+    pub debug_adapters: Vec<DebugAdapterContribution>,
+    /// Optional suggested DAP profiles.
+    #[serde(default)]
+    pub debug_configurations: Vec<DebugConfigurationContribution>,
 }
 
 impl ExtensionManifest {
@@ -202,6 +272,16 @@ impl ExtensionManifest {
                 Capability::LanguageServer,
             ));
         }
+        if (!self.debug_adapters.is_empty() || !self.debug_configurations.is_empty())
+            && !self.capabilities.contains(&Capability::DebugAdapters)
+        {
+            return Err(ExtensionError::MissingCapability(Capability::DebugAdapters));
+        }
+        self.validate_contributions()?;
+        Ok(())
+    }
+
+    fn validate_contributions(&self) -> Result<(), ExtensionError> {
         let mut ids = BTreeSet::new();
         for language in &self.languages {
             validate_language_id(&language.id).map_err(ExtensionError::InvalidManifest)?;
@@ -241,6 +321,74 @@ impl ExtensionManifest {
             {
                 return Err(ExtensionError::InvalidManifest(
                     "language-server commands and environment names contain invalid characters"
+                        .into(),
+                ));
+            }
+        }
+        self.validate_debug_contributions()?;
+        Ok(())
+    }
+
+    fn validate_debug_contributions(&self) -> Result<(), ExtensionError> {
+        let mut ids = BTreeSet::new();
+        ids.clear();
+        for adapter in &self.debug_adapters {
+            validate_language_id(&adapter.id).map_err(ExtensionError::InvalidManifest)?;
+            if !ids.insert(adapter.id.as_str())
+                || adapter.name.trim().is_empty()
+                || adapter.command.trim().is_empty()
+                || adapter.working_directory.trim().is_empty()
+                || adapter.command.contains('\0')
+                || adapter
+                    .arguments
+                    .iter()
+                    .any(|argument| argument.contains('\0'))
+                || adapter.environment.iter().any(|(key, value)| {
+                    key.is_empty()
+                        || key.contains('=')
+                        || key.contains('\0')
+                        || value.contains('\0')
+                })
+            {
+                return Err(ExtensionError::InvalidManifest(
+                    "debug adapters need unique ids and valid process settings".into(),
+                ));
+            }
+        }
+        ids.clear();
+        for configuration in &self.debug_configurations {
+            validate_language_id(&configuration.id).map_err(ExtensionError::InvalidManifest)?;
+            let adapter_exists = self
+                .debug_adapters
+                .iter()
+                .any(|adapter| adapter.id == configuration.adapter_id);
+            let valid_target = match configuration.request {
+                DebugRequestContribution::Launch => configuration
+                    .program
+                    .as_ref()
+                    .is_some_and(|program| !program.trim().is_empty()),
+                DebugRequestContribution::Attach => {
+                    configuration.process_id.is_some_and(|pid| pid > 0)
+                }
+            };
+            if !ids.insert(configuration.id.as_str())
+                || configuration.name.trim().is_empty()
+                || !adapter_exists
+                || !valid_target
+                || configuration.working_directory.trim().is_empty()
+                || configuration
+                    .arguments
+                    .iter()
+                    .any(|argument| argument.contains('\0'))
+                || configuration.environment.iter().any(|(key, value)| {
+                    key.is_empty()
+                        || key.contains('=')
+                        || key.contains('\0')
+                        || value.contains('\0')
+                })
+            {
+                return Err(ExtensionError::InvalidManifest(
+                    "debug profiles need a unique id, adapter, target, and valid process settings"
                         .into(),
                 ));
             }
@@ -691,6 +839,10 @@ pub struct ExtensionContributions {
     pub languages: Vec<LanguageContribution>,
     /// LSP process declarations from the manifest.
     pub language_servers: Vec<LanguageServerContribution>,
+    /// DAP adapter definitions from the manifest.
+    pub debug_adapters: Vec<DebugAdapterContribution>,
+    /// Suggested DAP launch and attach profiles from the manifest.
+    pub debug_configurations: Vec<DebugConfigurationContribution>,
     /// Diagnostic provider declarations.
     pub diagnostic_providers: Vec<DiagnosticProviderContribution>,
     /// Extension-owned panels.
@@ -748,6 +900,8 @@ impl<'a> ContributionBuilder<'a> {
             values: ExtensionContributions {
                 languages: manifest.languages.clone(),
                 language_servers: manifest.language_servers.clone(),
+                debug_adapters: manifest.debug_adapters.clone(),
+                debug_configurations: manifest.debug_configurations.clone(),
                 ..ExtensionContributions::default()
             },
         }
@@ -1511,6 +1665,8 @@ fn contribution_count(items: &ExtensionContributions) -> usize {
         + items.events.len()
         + items.languages.len()
         + items.language_servers.len()
+        + items.debug_adapters.len()
+        + items.debug_configurations.len()
         + items.diagnostic_providers.len()
         + items.tool_windows.len()
         + items.settings.len()
@@ -1560,6 +1716,7 @@ fn contribution_payload_bytes(items: &ExtensionContributions) -> usize {
                     .sum::<usize>(),
         );
     }
+    bytes = bytes.saturating_add(debug_contribution_payload_bytes(items));
     for provider in &items.diagnostic_providers {
         bytes = bytes.saturating_add(provider.id.len() + provider.name.len());
     }
@@ -1603,6 +1760,48 @@ fn contribution_payload_bytes(items: &ExtensionContributions) -> usize {
             .saturating_add(wizard.id.len() + wizard.title.len() + ui_document_bytes(&wizard.form));
     }
     bytes
+}
+
+fn debug_contribution_payload_bytes(items: &ExtensionContributions) -> usize {
+    let adapter_bytes = items
+        .debug_adapters
+        .iter()
+        .map(|adapter| {
+            adapter.id.len()
+                + adapter.name.len()
+                + adapter.command.len()
+                + adapter.working_directory.len()
+                + adapter.arguments.iter().map(String::len).sum::<usize>()
+                + adapter
+                    .environment
+                    .iter()
+                    .map(|(key, value)| key.len() + value.len())
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    let configuration_bytes = items
+        .debug_configurations
+        .iter()
+        .map(|configuration| {
+            configuration.id.len()
+                + configuration.name.len()
+                + configuration.adapter_id.len()
+                + configuration.program.as_ref().map_or(0, String::len)
+                + configuration.working_directory.len()
+                + configuration
+                    .arguments
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>()
+                + configuration
+                    .environment
+                    .iter()
+                    .map(|(key, value)| key.len() + value.len())
+                    .sum::<usize>()
+                + serde_json::to_vec(&configuration.adapter_settings).map_or(0, |value| value.len())
+        })
+        .sum::<usize>();
+    adapter_bytes.saturating_add(configuration_bytes)
 }
 
 /// Manager-local extension registry. It does not load code or communicate with the desktop.
@@ -2080,6 +2279,8 @@ mod tests {
             activation: ActivationConditions::default(),
             languages: Vec::new(),
             language_servers: Vec::new(),
+            debug_adapters: Vec::new(),
+            debug_configurations: Vec::new(),
         }
     }
 
@@ -2102,6 +2303,85 @@ mod tests {
         assert!(ExtensionManifest::parse(&good.replace("1.0.0", "2.0.0")).is_err());
         assert!(
             ExtensionManifest::parse(&good.replace("schema_version=1", "schema_version=2"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn debug_manifest_contributions_require_capability_and_are_removed_on_disable() {
+        let adapter = DebugAdapterContribution {
+            id: "python-debugger".into(),
+            name: "Python DAP".into(),
+            command: "debugpy-adapter".into(),
+            arguments: Vec::new(),
+            working_directory: "${workspaceFolder}".into(),
+            environment: BTreeMap::new(),
+        };
+        let configuration = DebugConfigurationContribution {
+            id: "launch-main".into(),
+            name: "Launch main".into(),
+            adapter_id: adapter.id.clone(),
+            request: DebugRequestContribution::Launch,
+            program: Some("${workspaceFolder}/main.py".into()),
+            process_id: None,
+            arguments: Vec::new(),
+            working_directory: "${workspaceFolder}".into(),
+            environment: BTreeMap::new(),
+            adapter_settings: serde_json::Map::new(),
+            stop_on_entry: false,
+        };
+        let mut invalid = manifest(&[]);
+        invalid.debug_adapters.push(adapter.clone());
+        invalid.debug_configurations.push(configuration.clone());
+        assert!(matches!(
+            invalid.validate(&Version::parse(EXTENSION_API_VERSION).unwrap()),
+            Err(ExtensionError::MissingCapability(Capability::DebugAdapters))
+        ));
+
+        let mut valid = manifest(&[Capability::DebugAdapters]);
+        valid.debug_adapters.push(adapter);
+        valid.debug_configurations.push(configuration);
+        valid
+            .validate(&Version::parse(EXTENSION_API_VERSION).unwrap())
+            .unwrap();
+
+        let dir = temp_dir();
+        fs::write(dir.join("main.lua"), "return {}\n").unwrap();
+        let mut manager = ExtensionManager::new();
+        manager.register_installed(valid, dir.clone()).unwrap();
+        manager.enable("org.example.hello").unwrap();
+        manager
+            .activate("org.example.hello", |_manifest, _builder| Ok(()))
+            .unwrap();
+        let contributions = manager.contributions("org.example.hello").unwrap();
+        assert_eq!(contributions.debug_adapters.len(), 1);
+        assert_eq!(contributions.debug_configurations.len(), 1);
+        manager.disable("org.example.hello").unwrap();
+        assert!(manager.contributions("org.example.hello").is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn debug_manifest_rejects_profiles_for_missing_adapters_and_invalid_process_values() {
+        let mut value = manifest(&[Capability::DebugAdapters]);
+        value
+            .debug_configurations
+            .push(DebugConfigurationContribution {
+                id: "launch-main".into(),
+                name: "Launch main".into(),
+                adapter_id: "missing".into(),
+                request: DebugRequestContribution::Launch,
+                program: Some("main.py".into()),
+                process_id: None,
+                arguments: Vec::new(),
+                working_directory: ".".into(),
+                environment: BTreeMap::new(),
+                adapter_settings: serde_json::Map::new(),
+                stop_on_entry: false,
+            });
+        assert!(
+            value
+                .validate(&Version::parse(EXTENSION_API_VERSION).unwrap())
                 .is_err()
         );
     }

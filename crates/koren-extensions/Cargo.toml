@@ -9,6 +9,7 @@ description = "Versioned extension manifests and lifecycle management for Koren 
 [dependencies]
 semver = "1"
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 
 [lints]
