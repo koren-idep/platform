@@ -155,17 +155,31 @@ Panel construction and multiple-command registration are measured as part of the
 
 ## Phase 8 inspection measurements
 
-Run the reproducible local inspection microbenchmark with:
+Run the reproducible local inspection and Lua callback microbenchmarks with:
 
 ```sh
 cargo bench --locked -p koren-inspections --bench phase8
+cargo bench --locked -p koren-lua --bench phase8
+cd apps/koren-code/frontend && node --experimental-strip-types scripts/bench_phase8_problems.mjs
 ```
 
 One local run on 2026-11-11, Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, Intel Core i7-1068NG7 at 2.30 GHz (8 CPUs), Rust `1.99.1`, optimized Cargo bench profile:
 
 | Workload | Iterations | Mean | Minimum |
 |---|---:|---:|---:|
-| Inspection profile lookup | 100,000 | 29.6 ns | 26 ns |
-| Document inspection and finding ingestion | 500 | 247.3 µs | 193.1 µs |
+| Inspection profile lookup | 100,000 | 34.5 ns | 26 ns |
+| Document inspection and finding ingestion | 500 | 239.3 µs | 196.5 µs |
 
-The document fixture is 200 lines with one text marker per line and one provider executed in the bounded job thread. The measurement includes job dispatch, scanning, result construction, and collection. It is not a desktop responsiveness or project-analysis measurement. Multi-provider merge, project cancellation latency, large-workspace memory, and Problems filtering have not yet been measured.
+The document fixture is 200 lines with one text marker per line and one provider executed in the bounded job thread. The measurement includes job dispatch, scanning, result construction, and collection. Additional bounded fixtures measured profile insert/select, explicit project analysis over 20 small documents (including result and latest progress retrieval), SARIF import/export for 200 findings, a Lua callback scanning 200 markers in one plain-text line, and frontend state publication plus the production Problems severity filter over 1,000 findings. One run on the same host and date:
+
+| Workload | Iterations | Mean | Minimum | Fixture boundary |
+|---|---:|---:|---:|---|
+| Profile insert and workspace select | 10,000 | 226.4 ns | 184 ns | Two profiles and one workspace selection in a fresh in-memory profile set |
+| Project progress and findings delivery | 100 | 368.6 µs | 315.4 µs | Bounded provider scans 20 documents, receives results, then drains the latest progress update; includes worker scheduling |
+| SARIF export, 200 findings | 100 | 1.460 ms | 1.183 ms | Serialize supported SARIF fields and validate output size |
+| SARIF import, 200 findings | 100 | 0.924 ms | 0.813 ms | Parse, validate paths/coordinates, and construct imported findings |
+| Lua inspection callback, 200 markers | 500 | 2.932 ms | 2.127 ms | One 2,400-character ASCII line; Lua `string.find`, finding allocation, conversion, and runtime callback |
+| Frontend diagnostic state publication, 1,000 findings | 10,000 | 1.029 µs | 0.078 µs | Assign the received finding array to the same Map-shaped cache used by the UI; excludes IPC decoding and DOM rendering |
+| Problems severity filter, 1,000 findings | 10,000 | 12.956 µs | 2.077 µs | Calls production `filterInspectionFindings`; excludes DOM creation and browser paint |
+
+The Rust figures are arithmetic means and minima from one process run. The frontend benchmark runs on Node `22.23.1` using `--experimental-strip-types`; it measures the production pure filter helper but only approximates the UI's cache write as publication. None of these measurements model desktop interaction latency, multiple extension providers, browser rendering, or large-workspace memory. They are local diagnostic baselines, not performance targets.

@@ -2,7 +2,8 @@
 
 use koren_inspections::{
     CancellationToken, Finding, FindingOrigin, InspectionDocument, InspectionProfile,
-    InspectionProvider, InspectionService, RuleMetadata, Severity,
+    InspectionProfiles, InspectionProvider, InspectionService, RuleMetadata, Severity,
+    export_sarif, import_sarif,
 };
 use koren_protocol::{TextPosition, TextRange};
 use std::{
@@ -114,5 +115,76 @@ fn main() {
             job.recv_timeout(Duration::from_secs(1))
                 .expect("receive findings"),
         );
+    });
+
+    measure("profile_update_insert_select", 10_000, || {
+        let mut profiles = InspectionProfiles::default();
+        profiles.insert(InspectionProfile::new("Default"));
+        profiles.insert(InspectionProfile::new("Strict"));
+        profiles.select(Some("/workspace/demo"), "Strict").unwrap();
+        std::hint::black_box(profiles);
+    });
+
+    measure("project_progress_delivery_20_documents", 100, || {
+        let docs: Vec<InspectionDocument> = (0..20)
+            .map(|index| InspectionDocument {
+                path: format!("src/file-{index}.txt"),
+                document_id: Some(index),
+                revision: Some(1),
+                language: "text".into(),
+                text: Arc::from("TODO marker\n".repeat(10)),
+            })
+            .collect();
+        let job = loop {
+            match service.inspect_project("bench-snapshot", docs.clone(), profile.clone(), None) {
+                Ok(job) => break job,
+                Err(koren_inspections::InspectionError::ConcurrencyLimit) => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("start bounded project inspection: {error}"),
+            }
+        };
+        std::hint::black_box(
+            job.recv_timeout(Duration::from_secs(1))
+                .expect("project results"),
+        );
+        std::hint::black_box(job.try_progress());
+    });
+
+    let finding = Finding {
+        id: "bench:todo".into(),
+        provider_id: "bench.marker".into(),
+        rule_id: "bench.marker.todo".into(),
+        path: "src/main.txt".into(),
+        document_id: Some(1),
+        document_revision: Some(1),
+        source_revision: Some("bench-revision".into()),
+        range: TextRange {
+            start: TextPosition {
+                line: 0,
+                character: 0,
+            },
+            end: TextPosition {
+                line: 0,
+                character: 4,
+            },
+        },
+        severity: Severity::Warning,
+        message: "TODO marker".into(),
+        explanation: Some("Benchmark explanation".into()),
+        category: Some("style".into()),
+        related: Vec::new(),
+        actions: Vec::new(),
+        documentation: None,
+        origin: FindingOrigin::Document,
+    };
+    let report = export_sarif("Koren benchmark", &vec![finding.clone(); 200])
+        .unwrap()
+        .document;
+    measure("sarif_export_200_findings", 100, || {
+        std::hint::black_box(export_sarif("Koren benchmark", &vec![finding.clone(); 200]).unwrap());
+    });
+    measure("sarif_import_200_findings", 100, || {
+        std::hint::black_box(import_sarif(&report, "bench-report", None).unwrap());
     });
 }
