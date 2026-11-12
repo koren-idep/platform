@@ -87,6 +87,8 @@ pub struct SaveConflict {
 pub enum DocumentError {
     /// Identifier does not refer to an open document.
     NotOpen(DocumentId),
+    /// A destination path is already associated with another open buffer.
+    PathAlreadyOpen(PathBuf),
     /// Closing a dirty document requires explicit discard authorization.
     UnsavedChanges(DocumentId),
     /// Document has no backing filesystem file to save to.
@@ -142,6 +144,9 @@ impl std::fmt::Display for DocumentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotOpen(id) => write!(f, "document {} is not open", id.0),
+            Self::PathAlreadyOpen(path) => {
+                write!(f, "another open document already uses '{}'", path.display())
+            }
             Self::UnsavedChanges(id) => write!(f, "document {} has unsaved changes", id.0),
             Self::NoBackingFile(id) => write!(f, "document {} has no backing file", id.0),
             Self::TooLarge {
@@ -812,6 +817,169 @@ impl DocumentManager {
         Ok(())
     }
 
+    /// Ensures no dirty open buffer is associated with a workspace path or its descendants.
+    ///
+    /// # Errors
+    /// Returns [`DocumentError::UnsavedChanges`] when the operation would move or remove dirty
+    /// content, or a workspace error when no workspace is open.
+    pub fn ensure_workspace_path_clean(
+        &self,
+        workspace: &WorkspaceManager,
+        relative: impl AsRef<Path>,
+    ) -> Result<(), DocumentError> {
+        let root = workspace.root()?;
+        let relative = relative.as_ref();
+        for document in self.documents.values().filter(|document| {
+            document.workspace_root.as_deref() == Some(root)
+                && document
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| path == relative || path.starts_with(relative))
+        }) {
+            if document.info().dirty {
+                return Err(DocumentError::UnsavedChanges(document.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// Updates backing-path associations after a successful workspace rename or move.
+    ///
+    /// Document contents, revisions, and save state are preserved. Call
+    /// [`Self::ensure_workspace_path_clean`] before changing the filesystem.
+    ///
+    /// # Errors
+    /// Returns an error when the workspace is closed or another open buffer already owns a
+    /// destination path. This method performs no filesystem operations.
+    pub fn relocate_workspace_path(
+        &mut self,
+        workspace: &WorkspaceManager,
+        old_path: impl AsRef<Path>,
+        new_path: impl AsRef<Path>,
+    ) -> Result<Vec<DocumentInfo>, DocumentError> {
+        let root = workspace.root()?.to_path_buf();
+        let old_path = old_path.as_ref();
+        let new_path = new_path.as_ref();
+        self.ensure_workspace_path_clean(workspace, old_path)?;
+        self.ensure_workspace_path_relocation_available(workspace, old_path, new_path)?;
+        let moves = self
+            .documents
+            .values()
+            .filter_map(|document| {
+                if document.workspace_root.as_deref() != Some(root.as_path()) {
+                    return None;
+                }
+                let path = document.path.as_ref()?;
+                let suffix = if path == old_path {
+                    Path::new("")
+                } else {
+                    path.strip_prefix(old_path).ok()?
+                };
+                let destination = if suffix.as_os_str().is_empty() {
+                    new_path.to_path_buf()
+                } else {
+                    new_path.join(suffix)
+                };
+                Some((document.id, destination))
+            })
+            .collect::<Vec<_>>();
+        let mut infos = Vec::with_capacity(moves.len());
+        for (id, new_relative) in moves {
+            let document = self
+                .documents
+                .get_mut(&id)
+                .ok_or(DocumentError::NotOpen(id))?;
+            if let Some(old_absolute) = document.absolute_path.replace(root.join(&new_relative)) {
+                self.paths.remove(&old_absolute);
+            }
+            self.paths.insert(root.join(&new_relative), id);
+            document.path = Some(new_relative.clone());
+            self.events.push(PlatformEvent::DocumentPathChanged {
+                document_id: id.0,
+                path: new_relative,
+            });
+            infos.push(document.info());
+        }
+        Ok(infos)
+    }
+
+    /// Checks that relocating a workspace path will not collide with another open buffer.
+    ///
+    /// # Errors
+    /// Returns an error when either path is invalid or an open document already occupies the
+    /// destination path.
+    pub fn ensure_workspace_path_relocation_available(
+        &self,
+        workspace: &WorkspaceManager,
+        old_path: impl AsRef<Path>,
+        new_path: impl AsRef<Path>,
+    ) -> Result<(), DocumentError> {
+        let root = workspace.root()?.to_path_buf();
+        let old_path = old_path.as_ref();
+        let new_path = new_path.as_ref();
+        let moves = self
+            .documents
+            .values()
+            .filter_map(|document| {
+                if document.workspace_root.as_deref() != Some(root.as_path()) {
+                    return None;
+                }
+                let path = document.path.as_ref()?;
+                let suffix = if path == old_path {
+                    Path::new("")
+                } else {
+                    path.strip_prefix(old_path).ok()?
+                };
+                let destination = if suffix.as_os_str().is_empty() {
+                    new_path.to_path_buf()
+                } else {
+                    new_path.join(suffix)
+                };
+                Some((document.id, destination))
+            })
+            .collect::<Vec<_>>();
+        for (_, destination) in &moves {
+            if self
+                .paths
+                .get(&root.join(destination))
+                .is_some_and(|owner| !moves.iter().any(|(id, _)| id == owner))
+            {
+                return Err(DocumentError::PathAlreadyOpen(destination.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Closes clean buffers whose backing paths were removed after a confirmed delete.
+    ///
+    /// # Errors
+    /// Returns [`DocumentError::UnsavedChanges`] before closing anything if a matching buffer is dirty.
+    pub fn close_workspace_path(
+        &mut self,
+        workspace: &WorkspaceManager,
+        relative: impl AsRef<Path>,
+    ) -> Result<Vec<DocumentId>, DocumentError> {
+        let relative = relative.as_ref();
+        self.ensure_workspace_path_clean(workspace, relative)?;
+        let root = workspace.root()?;
+        let ids = self
+            .documents
+            .values()
+            .filter(|document| {
+                document.workspace_root.as_deref() == Some(root)
+                    && document
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| path == relative || path.starts_with(relative))
+            })
+            .map(|document| document.id)
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.close(*id, false)?;
+        }
+        Ok(ids)
+    }
+
     /// Returns whether the manager contains a document associated with a workspace root.
     #[must_use]
     pub fn has_documents_for_workspace(&self, root: &Path) -> bool {
@@ -1247,6 +1415,65 @@ mod tests {
         assert_eq!(
             fs::read(workspace.root().unwrap().join("source.rs")).unwrap(),
             b"\xef\xbb\xbfhello!\r\n"
+        );
+    }
+
+    #[test]
+    fn clean_buffers_relocate_and_dirty_buffers_block_filesystem_changes() {
+        let (temp, workspace, mut documents, id) = setup(b"initial");
+        documents
+            .ensure_workspace_path_clean(&workspace, "source.rs")
+            .unwrap();
+        fs::rename(temp.0.join("source.rs"), temp.0.join("renamed.rs")).unwrap();
+        let moved = documents
+            .relocate_workspace_path(&workspace, "source.rs", "renamed.rs")
+            .unwrap();
+        assert_eq!(moved[0].path.as_deref(), Some(Path::new("renamed.rs")));
+        assert_eq!(documents.open_file(&workspace, "renamed.rs").unwrap(), id);
+        documents
+            .insert_text(
+                id,
+                0,
+                TextPosition {
+                    line: 0,
+                    character: 7,
+                },
+                " dirty",
+            )
+            .unwrap();
+        assert!(
+            matches!(documents.ensure_workspace_path_clean(&workspace, "renamed.rs"), Err(DocumentError::UnsavedChanges(doc_id)) if doc_id == id)
+        );
+        assert!(
+            matches!(documents.close_workspace_path(&workspace, "renamed.rs"), Err(DocumentError::UnsavedChanges(doc_id)) if doc_id == id)
+        );
+        assert_eq!(documents.snapshot(id).unwrap().text, "initial dirty");
+    }
+
+    #[test]
+    fn deleting_clean_path_closes_its_open_buffer() {
+        let (temp, workspace, mut documents, id) = setup(b"initial");
+        fs::remove_file(temp.0.join("source.rs")).unwrap();
+        documents
+            .close_workspace_path(&workspace, "source.rs")
+            .unwrap();
+        assert!(matches!(documents.info(id), Err(DocumentError::NotOpen(_))));
+    }
+
+    #[test]
+    fn relocation_preflight_rejects_open_destination_before_filesystem_mutation() {
+        let (temp, workspace, mut documents, _) = setup(b"source");
+        fs::write(temp.0.join("destination.rs"), b"destination").unwrap();
+        let destination_id = documents.open_file(&workspace, "destination.rs").unwrap();
+        fs::remove_file(temp.0.join("destination.rs")).unwrap();
+        assert!(matches!(
+            documents.ensure_workspace_path_relocation_available(&workspace, "source.rs", "destination.rs"),
+            Err(DocumentError::PathAlreadyOpen(path)) if path == Path::new("destination.rs")
+        ));
+        assert!(temp.0.join("source.rs").exists());
+        assert_eq!(
+            documents.snapshot(destination_id).unwrap().text,
+            "destination"
         );
     }
 

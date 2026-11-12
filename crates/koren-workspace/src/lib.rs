@@ -79,6 +79,10 @@ pub enum WorkspaceError {
     NotFile(PathBuf),
     /// A workspace-relative path is absolute or attempts to escape the root.
     InvalidRelativePath(PathBuf),
+    /// The requested destination already exists.
+    AlreadyExists(PathBuf),
+    /// Explicit confirmation is required for a delete operation.
+    ConfirmationRequired,
     /// Directory has more entries than the configured per-listing limit.
     DirectoryLimitExceeded {
         /// Relative path of the directory that exceeded the limit.
@@ -120,6 +124,8 @@ impl std::fmt::Display for WorkspaceError {
                 "'{}' is not a safe workspace-relative path",
                 path.display()
             ),
+            Self::AlreadyExists(path) => write!(f, "'{}' already exists", path.display()),
+            Self::ConfirmationRequired => f.write_str("filesystem deletion requires confirmation"),
             Self::DirectoryLimitExceeded { path, limit } => write!(
                 f,
                 "directory '{}' exceeds the entry limit of {limit}",
@@ -369,6 +375,185 @@ impl WorkspaceManager {
         Ok(canonical)
     }
 
+    /// Returns no-follow metadata for one existing workspace entry.
+    ///
+    /// # Errors
+    /// Returns a path or filesystem error for missing, invalid, or symlinked entries.
+    pub fn entry_metadata(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> Result<WorkspaceEntry, WorkspaceError> {
+        let relative = normalize_relative(relative.as_ref())?;
+        if relative.as_os_str().is_empty() {
+            return Err(WorkspaceError::InvalidRelativePath(relative));
+        }
+        let path = self.resolve_relative(&relative, false)?;
+        entry_for_path(&path, relative)
+    }
+
+    /// Creates a new empty file without overwriting an existing destination.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or symlinked parent paths, an existing destination,
+    /// or an operating system failure. Path checks are point-in-time checks and cannot
+    /// prevent hostile concurrent filesystem replacement.
+    pub fn create_file(
+        &mut self,
+        relative: impl AsRef<Path>,
+    ) -> Result<WorkspaceEntry, WorkspaceError> {
+        let relative = normalize_new_path(relative.as_ref())?;
+        let path = self.resolve_new_path(&relative)?;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|source| {
+                if source.kind() == io::ErrorKind::AlreadyExists {
+                    WorkspaceError::AlreadyExists(relative.clone())
+                } else {
+                    WorkspaceError::Io {
+                        operation: "create file",
+                        path: path.clone(),
+                        source,
+                    }
+                }
+            })?;
+        drop(file);
+        let entry = entry_for_path(&path, relative.clone())?;
+        self.events.push(PlatformEvent::WorkspaceEntryChanged {
+            operation: "created".into(),
+            path: relative,
+            previous_path: None,
+        });
+        Ok(entry)
+    }
+
+    /// Creates one new directory without replacing an existing entry.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or symlinked parents, an existing destination,
+    /// or an operating system failure.
+    pub fn create_directory(
+        &mut self,
+        relative: impl AsRef<Path>,
+    ) -> Result<WorkspaceEntry, WorkspaceError> {
+        let relative = normalize_new_path(relative.as_ref())?;
+        let path = self.resolve_new_path(&relative)?;
+        fs::create_dir(&path).map_err(|source| {
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                WorkspaceError::AlreadyExists(relative.clone())
+            } else {
+                WorkspaceError::Io {
+                    operation: "create directory",
+                    path: path.clone(),
+                    source,
+                }
+            }
+        })?;
+        let entry = entry_for_path(&path, relative.clone())?;
+        self.events.push(PlatformEvent::WorkspaceEntryChanged {
+            operation: "created".into(),
+            path: relative,
+            previous_path: None,
+        });
+        Ok(entry)
+    }
+
+    /// Renames or moves an entry within the workspace without overwriting a destination.
+    ///
+    /// Directory moves into their own descendants are rejected. Open-document state is
+    /// managed by `koren-documents`; hosts must update buffers after a successful move.
+    ///
+    /// # Errors
+    /// Returns an error for invalid paths, symlinks, missing sources, existing destinations,
+    /// or filesystem failures. This operation is not transactional across concurrent changes.
+    pub fn rename(
+        &mut self,
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<WorkspaceEntry, WorkspaceError> {
+        let source = normalize_new_path(source.as_ref())?;
+        let destination = normalize_new_path(destination.as_ref())?;
+        let source_path = self.resolve_relative(&source, false)?;
+        let source_metadata = fs::symlink_metadata(&source_path)
+            .map_err(|error| map_path_error(error, &source_path))?;
+        if source_metadata.file_type().is_symlink() {
+            return Err(WorkspaceError::SymlinkNotAllowed(source.clone()));
+        }
+        let destination_path = self.resolve_new_path(&destination)?;
+        if source_metadata.is_dir() && destination_path.starts_with(&source_path) {
+            return Err(WorkspaceError::InvalidRelativePath(destination));
+        }
+        match fs::symlink_metadata(&destination_path) {
+            Ok(_) => return Err(WorkspaceError::AlreadyExists(destination)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source_error) => {
+                return Err(WorkspaceError::Io {
+                    operation: "inspect destination",
+                    path: destination_path,
+                    source: source_error,
+                });
+            }
+        }
+        fs::rename(&source_path, &destination_path).map_err(|source_error| WorkspaceError::Io {
+            operation: "rename entry",
+            path: source_path,
+            source: source_error,
+        })?;
+        let entry = entry_for_path(&destination_path, destination.clone())?;
+        self.events.push(PlatformEvent::WorkspaceEntryChanged {
+            operation: "renamed".into(),
+            path: destination,
+            previous_path: Some(source),
+        });
+        Ok(entry)
+    }
+
+    /// Deletes an entry after explicit caller confirmation.
+    ///
+    /// Directories are removed recursively only when `recursive` is true. Hosts should
+    /// check dirty document buffers before invoking this operation. Deletion is not
+    /// transactional and cannot be rolled back after partial recursive failure.
+    ///
+    /// # Errors
+    /// Returns an error for missing/unsafe paths, absent confirmation, or filesystem failure.
+    pub fn delete(
+        &mut self,
+        relative: impl AsRef<Path>,
+        recursive: bool,
+        confirmed: bool,
+    ) -> Result<(), WorkspaceError> {
+        if !confirmed {
+            return Err(WorkspaceError::ConfirmationRequired);
+        }
+        let relative = normalize_new_path(relative.as_ref())?;
+        let path = self.resolve_relative(&relative, false)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| map_path_error(error, &path))?;
+        if metadata.file_type().is_symlink() {
+            return Err(WorkspaceError::SymlinkNotAllowed(relative));
+        }
+        let result = if metadata.is_dir() {
+            if recursive {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_dir(&path)
+            }
+        } else {
+            fs::remove_file(&path)
+        };
+        result.map_err(|source| WorkspaceError::Io {
+            operation: "delete entry",
+            path,
+            source,
+        })?;
+        self.events.push(PlatformEvent::WorkspaceEntryChanged {
+            operation: "deleted".into(),
+            path: relative,
+            previous_path: None,
+        });
+        Ok(())
+    }
+
     /// Drains workspace lifecycle events in FIFO order.
     pub fn drain_events(&mut self) -> Vec<PlatformEvent> {
         self.events.drain()
@@ -413,6 +598,55 @@ impl WorkspaceManager {
         }
         Ok(candidate)
     }
+
+    fn resolve_new_path(&self, relative: &Path) -> Result<PathBuf, WorkspaceError> {
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let parent = if parent.as_os_str().is_empty() {
+            self.root()?.to_path_buf()
+        } else {
+            self.resolve_relative(parent, true)?
+        };
+        Ok(parent.join(
+            relative
+                .file_name()
+                .ok_or_else(|| WorkspaceError::InvalidRelativePath(relative.into()))?,
+        ))
+    }
+}
+
+fn normalize_new_path(path: &Path) -> Result<PathBuf, WorkspaceError> {
+    let path = normalize_relative(path)?;
+    if path.as_os_str().is_empty() || path.file_name().is_none() {
+        return Err(WorkspaceError::InvalidRelativePath(path));
+    }
+    Ok(path)
+}
+
+fn entry_for_path(path: &Path, relative: PathBuf) -> Result<WorkspaceEntry, WorkspaceError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| WorkspaceError::Io {
+        operation: "inspect entry",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let kind = if metadata.file_type().is_symlink() {
+        EntryKind::Symlink
+    } else if metadata.is_dir() {
+        EntryKind::Directory
+    } else if metadata.is_file() {
+        EntryKind::File
+    } else {
+        EntryKind::Other
+    };
+    Ok(WorkspaceEntry {
+        name: relative
+            .file_name()
+            .unwrap_or(relative.as_os_str())
+            .to_os_string(),
+        path: relative,
+        kind,
+        size_bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 fn normalize_relative(path: &Path) -> Result<PathBuf, WorkspaceError> {
@@ -596,5 +830,63 @@ mod tests {
             }),
             Err(WorkspaceError::InvalidLimit)
         ));
+    }
+
+    #[test]
+    fn filesystem_mutations_are_bounded_to_root_and_never_overwrite() {
+        let temp = TempDir::new();
+        let outside = TempDir::new();
+        let mut manager = WorkspaceManager::new();
+        manager.open(&temp.0).unwrap();
+        manager.create_directory("src").unwrap();
+        manager.create_file("src/main.rs").unwrap();
+        fs::write(outside.0.join("keep.txt"), "safe").unwrap();
+
+        assert!(matches!(
+            manager.create_file("src/main.rs"),
+            Err(WorkspaceError::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            manager.rename("src/main.rs", "../outside.rs"),
+            Err(WorkspaceError::InvalidRelativePath(_))
+        ));
+        assert!(matches!(
+            manager.rename("src/main.rs", "src/missing/file.rs"),
+            Err(WorkspaceError::NotFound(_))
+        ));
+        assert_eq!(
+            manager.entry_metadata("src/main.rs").unwrap().kind,
+            EntryKind::File
+        );
+        manager.rename("src/main.rs", "src/lib.rs").unwrap();
+        assert!(!temp.0.join("src/main.rs").exists());
+        assert!(temp.0.join("src/lib.rs").exists());
+        assert!(matches!(
+            manager.delete("src", true, false),
+            Err(WorkspaceError::ConfirmationRequired)
+        ));
+        manager.delete("src", true, true).unwrap();
+        assert!(!temp.0.join("src").exists());
+        assert_eq!(
+            fs::read_to_string(outside.0.join("keep.txt")).unwrap(),
+            "safe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_mutations_reject_symlink_parents() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new();
+        let outside = TempDir::new();
+        fs::create_dir(temp.0.join("linked")).unwrap();
+        symlink(&outside.0, temp.0.join("escape")).unwrap();
+        let mut manager = WorkspaceManager::new();
+        manager.open(&temp.0).unwrap();
+        assert!(matches!(
+            manager.create_file("escape/pwned"),
+            Err(WorkspaceError::SymlinkNotAllowed(_))
+        ));
+        assert!(!outside.0.join("pwned").exists());
     }
 }

@@ -1,0 +1,20 @@
+[package]
+name = "koren-search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded, cancellable workspace text search for Koren IDE Platform"
+
+[dependencies]
+crossbeam-channel.workspace = true
+glob.workspace = true
+ignore.workspace = true
+regex.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "phase9a"
+harness = false

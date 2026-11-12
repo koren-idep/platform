@@ -16,6 +16,15 @@ pub enum PlatformEvent {
         /// Canonical root path that was closed.
         root: PathBuf,
     },
+    /// A filesystem entry changed through the workspace service.
+    WorkspaceEntryChanged {
+        /// Operation label: created, renamed, deleted, or refreshed.
+        operation: String,
+        /// Workspace-relative resulting path.
+        path: PathBuf,
+        /// Previous path for a rename.
+        previous_path: Option<PathBuf>,
+    },
     /// A document buffer was created.
     DocumentOpened {
         /// Stable identifier within its document manager.
@@ -45,6 +54,27 @@ pub enum PlatformEvent {
     DocumentClosed {
         /// Stable identifier within its document manager.
         document_id: u64,
+    },
+    /// An open document's backing path changed because its workspace entry moved.
+    DocumentPathChanged {
+        /// Stable identifier within its document manager.
+        document_id: u64,
+        /// New workspace-relative backing path.
+        path: PathBuf,
+    },
+    /// A local Git repository's index or working tree status changed.
+    GitStatusChanged {
+        /// Canonical repository root.
+        root: PathBuf,
+    },
+    /// A local Git operation completed successfully.
+    GitOperationCompleted {
+        /// Canonical repository root.
+        root: PathBuf,
+        /// Operation label such as `staged`, `unstaged`, or `committed`.
+        operation: String,
+        /// New commit object ID when a commit was created.
+        commit: Option<String>,
     },
     /// A save detected that its backing file changed externally.
     SaveConflictDetected {

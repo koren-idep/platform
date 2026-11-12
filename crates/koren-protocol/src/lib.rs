@@ -247,6 +247,95 @@ pub enum RequestMethod {
         /// Relative directory path; empty or `.` means the workspace root.
         path: String,
     },
+    /// Create an empty file without replacing an existing workspace entry.
+    CreateWorkspaceFile {
+        /// Relative destination path.
+        path: String,
+    },
+    /// Create one directory without replacing an existing workspace entry.
+    CreateWorkspaceDirectory {
+        /// Relative destination path.
+        path: String,
+    },
+    /// Move or rename a workspace entry without overwriting an existing destination.
+    RenameWorkspaceEntry {
+        /// Existing relative source path.
+        source: String,
+        /// New relative destination path.
+        destination: String,
+    },
+    /// Delete an entry after explicit user confirmation.
+    DeleteWorkspaceEntry {
+        /// Existing relative source path.
+        path: String,
+        /// Recursively delete a directory's contents.
+        recursive: bool,
+        /// Confirmation from the UI; false always rejects the operation.
+        confirmed: bool,
+    },
+    /// Query no-follow metadata for one existing entry.
+    WorkspaceEntryMetadata {
+        /// Existing relative path.
+        path: String,
+    },
+    /// Find local Git repositories in the active workspace without starting Git processes.
+    DiscoverGitRepositories,
+    /// Read status for the repository at or above a workspace-relative path.
+    GitStatus {
+        /// Workspace-relative path inside the desired repository.
+        path: String,
+    },
+    /// Read a bounded text diff for one repository-relative path.
+    GitDiff {
+        /// Workspace-relative repository root or descendant path.
+        repository: String,
+        /// Repository-relative file path.
+        path: String,
+        /// Compare the index to HEAD instead of the working tree.
+        staged: bool,
+    },
+    /// Stage exactly one path in a local repository.
+    GitStage {
+        /// Workspace-relative repository root or descendant path.
+        repository: String,
+        /// Repository-relative file path.
+        path: String,
+    },
+    /// Unstage exactly one path in a local repository.
+    GitUnstage {
+        /// Workspace-relative repository root or descendant path.
+        repository: String,
+        /// Repository-relative file path.
+        path: String,
+    },
+    /// Create a local commit from explicitly staged changes.
+    GitCommit {
+        /// Workspace-relative repository root or descendant path.
+        repository: String,
+        /// Commit message entered by the user.
+        message: String,
+    },
+    /// Start an explicit bounded workspace text search.
+    StartWorkspaceSearch {
+        /// Literal text or regular expression.
+        query: String,
+        /// Match case distinctly.
+        case_sensitive: bool,
+        /// Treat the query as a regular expression.
+        regular_expression: bool,
+        /// Optional glob for workspace-relative paths or file names.
+        file_filter: Option<String>,
+    },
+    /// Request cancellation of a running search.
+    CancelWorkspaceSearch {
+        /// Search job identity.
+        job_id: u64,
+    },
+    /// Drain available incremental results from a search job.
+    PollWorkspaceSearch {
+        /// Search job identity.
+        job_id: u64,
+    },
     /// Open a workspace-relative UTF-8 text file as a document.
     OpenDocument {
         /// Workspace-relative file path.
@@ -492,6 +581,90 @@ pub struct DirectoryEntry {
     pub size_bytes: u64,
 }
 
+/// A local Git repository summary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitRepositorySummary {
+    /// Canonical worktree root.
+    pub root: String,
+    /// Current branch, or `None` when HEAD is detached/unborn.
+    pub branch: Option<String>,
+    /// Whether the repository has a commit at HEAD.
+    pub has_head: bool,
+}
+
+/// One changed path returned by the local Git service.
+// Git's index and worktree states overlap; independent flags preserve staged plus unstaged edits.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitChangedFile {
+    /// Repository-relative path.
+    pub path: String,
+    /// Whether the index contains a staged change.
+    pub staged: bool,
+    /// Whether the working tree contains an unstaged change.
+    pub unstaged: bool,
+    /// Whether the path is untracked.
+    pub untracked: bool,
+    /// Whether the path is deleted.
+    pub deleted: bool,
+    /// Whether the path has an unresolved conflict.
+    pub conflicted: bool,
+}
+
+/// Branch and path status for one repository.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitStatusSummary {
+    /// Canonical worktree root.
+    pub root: String,
+    /// Current branch name when attached.
+    pub branch: Option<String>,
+    /// Whether HEAD has a commit.
+    pub has_head: bool,
+    /// Changed files.
+    pub files: Vec<GitChangedFile>,
+}
+
+/// One workspace text-search match.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchMatch {
+    /// Workspace-relative source path.
+    pub path: String,
+    /// One-based line number.
+    pub line: usize,
+    /// Zero-based UTF-16 column.
+    pub column_utf16: usize,
+    /// Match width in UTF-16 code units.
+    pub match_length_utf16: usize,
+    /// Bounded source line preview.
+    pub preview: String,
+}
+
+/// Terminal statistics for one workspace search.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchSummary {
+    /// Files scanned.
+    pub files_scanned: usize,
+    /// Matches returned.
+    pub matches_found: usize,
+    /// Binary or invalid UTF-8 files skipped.
+    pub skipped_binary_files: usize,
+    /// Whether the result cap stopped traversal.
+    pub truncated: bool,
+    /// Whether the search was cancelled.
+    pub cancelled: bool,
+}
+
+/// Coalesced progress from a running workspace search.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchProgress {
+    /// Files scanned so far.
+    pub files_scanned: usize,
+    /// Matches produced so far.
+    pub matches_found: usize,
+    /// Most recently scanned path.
+    pub current_path: Option<String>,
+}
+
 /// Typed successful response values.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -643,6 +816,62 @@ pub enum ResponseValue {
     },
     /// Entries from one workspace directory.
     DirectoryEntries(Vec<DirectoryEntry>),
+    /// Metadata for one filesystem entry.
+    WorkspaceEntry(DirectoryEntry),
+    /// Result of a workspace filesystem mutation.
+    WorkspaceEntryChanged {
+        /// Operation: created, renamed, or deleted.
+        operation: String,
+        /// Resulting or removed relative path.
+        path: String,
+        /// Previous relative path for a rename.
+        previous_path: Option<String>,
+    },
+    /// Discovered repositories under the active workspace.
+    GitRepositories(Vec<GitRepositorySummary>),
+    /// Current branch and path-specific status for one repository.
+    GitStatus(GitStatusSummary),
+    /// Bounded textual diff for one repository-relative path.
+    GitDiff {
+        /// Repository-relative file path.
+        path: String,
+        /// Whether this compares the index to HEAD.
+        staged: bool,
+        /// Text diff content.
+        text: String,
+    },
+    /// A local Git mutation completed.
+    GitOperation {
+        /// Completed operation.
+        operation: String,
+        /// New commit object ID when a commit was created.
+        commit: Option<String>,
+    },
+    /// A bounded search was started.
+    SearchStarted {
+        /// Search job identity.
+        job_id: u64,
+    },
+    /// Incremental search results and terminal status.
+    SearchBatch {
+        /// Search job identity.
+        job_id: u64,
+        /// Results drained in this batch.
+        matches: Vec<SearchMatch>,
+        /// Latest progress snapshot, if available.
+        progress: Option<SearchProgress>,
+        /// Whether a terminal event was received.
+        complete: bool,
+        /// Terminal summary when complete.
+        summary: Option<SearchSummary>,
+        /// Terminal error, if traversal failed.
+        error: Option<String>,
+    },
+    /// A search cancellation request was recorded.
+    SearchCancelled {
+        /// Search job identity.
+        job_id: u64,
+    },
     /// Metadata for a newly opened or already open document.
     DocumentOpened {
         /// Manager-local document identifier.

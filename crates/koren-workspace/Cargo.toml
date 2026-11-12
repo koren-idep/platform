@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Local workspace directory access for Koren IDE Platform"
 
+[[bench]]
+name = "phase9a"
+harness = false
+
 [dependencies]
 koren-core.workspace = true
 

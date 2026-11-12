@@ -1,0 +1,13 @@
+[package]
+name = "koren-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+git2.workspace = true
+ignore.workspace = true
+
+[[bench]]
+name = "phase9a"
+harness = false

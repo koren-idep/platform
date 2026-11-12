@@ -9,6 +9,8 @@ members = [
     "crates/koren-inspections",
     "crates/koren-lua",
     "crates/koren-workspace",
+    "crates/koren-search",
+    "crates/koren-git",
     "crates/koren-documents",
     "crates/koren-projects",
     "crates/koren-tasks",
@@ -30,6 +32,12 @@ serde_json = "1"
 semver = "1"
 mlua = { version = "=0.11.6", features = ["lua54", "vendored", "send"] }
 glob = "0.3"
+crossbeam-channel = "0.5"
+# 0.4.33 requires Rust 1.88; 0.4.22 keeps the workspace's Rust 1.85 MSRV.
+ignore = "=0.4.22"
+regex = "1"
+# Keep libgit2 bindings on the release that builds with the supported Rust 1.85 toolchain.
+git2 = { version = "=0.20.2", default-features = false }
 toml = "0.8"
 ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
 koren-core = { path = "crates/koren-core" }
@@ -40,6 +48,8 @@ koren-lsp = { path = "crates/koren-lsp" }
 koren-inspections = { path = "crates/koren-inspections" }
 koren-lua = { path = "crates/koren-lua" }
 koren-workspace = { path = "crates/koren-workspace" }
+koren-search = { path = "crates/koren-search" }
+koren-git = { path = "crates/koren-git" }
 koren-documents = { path = "crates/koren-documents" }
 koren-projects = { path = "crates/koren-projects" }
 koren-tasks = { path = "crates/koren-tasks" }
