@@ -1094,6 +1094,7 @@ dependencies = [
  "koren-core",
  "koren-documents",
  "koren-extensions",
+ "koren-inspections",
  "koren-lsp",
  "koren-lua",
  "koren-projects",
@@ -1173,6 +1174,7 @@ name = "koren-lua"
 version = "0.1.0"
 dependencies = [
  "koren-extensions",
+ "koren-inspections",
  "koren-protocol",
  "mlua",
 ]

@@ -11,14 +11,14 @@ ALLOWED_INTERNAL_DEPS = {
     "koren-extensions": set(),
     "koren-lsp": {"koren-documents", "koren-protocol"},
     "koren-inspections": {"koren-protocol"},
-    "koren-lua": {"koren-extensions", "koren-protocol"},
+    "koren-lua": {"koren-extensions", "koren-inspections", "koren-protocol"},
     "koren-workspace": {"koren-core"},
     "koren-documents": {"koren-core", "koren-protocol", "koren-workspace"},
     "koren-projects": {"koren-core", "koren-workspace", "koren-tasks"},
     "koren-tasks": {"koren-core"},
     "koren-cargo": {"koren-projects", "koren-tasks", "koren-workspace"},
     "koren-headless": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo"},
-    "koren-code": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo", "koren-extensions", "koren-lua", "koren-lsp"},
+    "koren-code": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo", "koren-extensions", "koren-inspections", "koren-lua", "koren-lsp"},
 }
 BACKEND_PACKAGES = set(ALLOWED_INTERNAL_DEPS) - {"koren-headless", "koren-code"}
 FORBIDDEN_BACKEND_DEPS = {

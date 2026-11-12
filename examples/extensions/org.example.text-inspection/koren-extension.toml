@@ -1,0 +1,9 @@
+schema_version = 1
+id = "org.example.text-inspection"
+name = "Text Inspection Example"
+publisher = "Koren examples"
+version = "0.1.0"
+description = "Finds TODO markers in plain text and proposes a revision-bound replacement."
+entry_point = "main.lua"
+api_version = "1.0.0"
+capabilities = ["diagnostics", "document_read"]

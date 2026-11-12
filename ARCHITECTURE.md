@@ -9,7 +9,7 @@ koren-headless ──> koren-core, koren-protocol, koren-commands,
                    koren-workspace, koren-documents, koren-projects,
                    koren-tasks, koren-cargo
 koren-code ──────> platform crates plus koren-extensions, koren-lua,
-                   koren-lsp
+                   koren-inspections, koren-lsp
 koren-documents ─> koren-core, koren-protocol, koren-workspace, ropey
 koren-projects ──> koren-core, koren-workspace, koren-tasks
 koren-tasks ─────> koren-core
@@ -18,7 +18,8 @@ koren-cargo ─────> koren-projects, koren-tasks, koren-workspace,
 koren-extensions (no internal dependencies)
 koren-lsp ───────> koren-documents, koren-protocol
 koren-inspections -> koren-protocol
-koren-lua ───────> koren-extensions, koren-protocol, mlua (Lua 5.4)
+koren-lua ───────> koren-extensions, koren-inspections, koren-protocol,
+                   mlua (Lua 5.4)
 koren-workspace ─> koren-core
 koren-protocol  ─> serde
 

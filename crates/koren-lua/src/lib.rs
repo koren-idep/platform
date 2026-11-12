@@ -10,6 +10,10 @@ use koren_extensions::{
     ContributionBuilder, DesignToken, DiagnosticDetailDefinition, ExtensionError,
     ExtensionManifest, MenuLocation, SettingKind, SettingValue, ThemeBase, UiDocument, UiElement,
 };
+use koren_inspections::{
+    CancellationToken, CodeAction, Finding, FindingOrigin, InspectionDocument, InspectionProfile,
+    InspectionProvider, OptionValue, ProposedTextEdit, RelatedLocation, RuleMetadata, Severity,
+};
 use koren_protocol::{TextPosition, TextRange};
 use mlua::{Function, HookTriggers, Lua, LuaOptions, RegistryKey, StdLib, Table, Value, VmState};
 use std::{
@@ -122,10 +126,15 @@ struct StagedDiagnosticDetail {
     title: String,
     explanation: String,
 }
+#[derive(Clone)]
+struct StagedInspectionRule {
+    metadata: RuleMetadata,
+}
 struct VmStateData {
     lua: Lua,
     command_keys: Arc<Mutex<BTreeMap<String, RegistryKey>>>,
     event_keys: Arc<Mutex<BTreeMap<String, Vec<RegistryKey>>>>,
+    inspection_callbacks: Arc<Mutex<BTreeMap<String, RegistryKey>>>,
     deactivate_key: Option<RegistryKey>,
     module_key: Option<RegistryKey>,
     context: Arc<Mutex<LuaHostContext>>,
@@ -139,12 +148,16 @@ struct VmStateData {
 #[derive(Clone)]
 pub struct LuaExtensionRuntime {
     inner: Arc<Mutex<VmStateData>>,
+    provider_id: Arc<str>,
+    inspection_rules: Arc<Vec<RuleMetadata>>,
 }
 
 impl std::fmt::Debug for LuaExtensionRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.lock().map_err(|_| std::fmt::Error)?;
         f.debug_struct("LuaExtensionRuntime")
+            .field("provider_id", &self.provider_id)
+            .field("inspection_rule_count", &self.inspection_rules.len())
             .field("memory_bytes", &inner.lua.used_memory())
             .field("memory_limit", &inner.limits.memory_bytes)
             .field("instruction_limit", &inner.limits.instructions)
@@ -247,6 +260,8 @@ impl LuaExtensionRuntime {
         let staged_settings = Arc::new(Mutex::new(Vec::<StagedSetting>::new()));
         let staged_themes = Arc::new(Mutex::new(Vec::<StagedTheme>::new()));
         let staged_diagnostic_details = Arc::new(Mutex::new(Vec::<StagedDiagnosticDetail>::new()));
+        let staged_inspection_rules = Arc::new(Mutex::new(Vec::<StagedInspectionRule>::new()));
+        let inspection_callbacks = Arc::new(Mutex::new(BTreeMap::<String, RegistryKey>::new()));
         let api = create_api(
             &lua,
             manifest,
@@ -260,6 +275,8 @@ impl LuaExtensionRuntime {
             staged_settings.clone(),
             staged_themes.clone(),
             staged_diagnostic_details.clone(),
+            &staged_inspection_rules,
+            &inspection_callbacks,
             ui_updates.clone(),
         )
         .map_err(|error| lua_error(&error))?;
@@ -294,6 +311,7 @@ impl LuaExtensionRuntime {
                 lua,
                 command_keys,
                 event_keys,
+                inspection_callbacks,
                 deactivate_key,
                 module_key: Some(module_key),
                 context,
@@ -302,6 +320,17 @@ impl LuaExtensionRuntime {
                 instructions,
                 limits,
             })),
+            provider_id: manifest.id.clone().into(),
+            inspection_rules: Arc::new(
+                staged_inspection_rules
+                    .lock()
+                    .map_err(|_| {
+                        LuaRuntimeError::Host("inspection registration lock poisoned".into())
+                    })?
+                    .iter()
+                    .map(|rule| rule.metadata.clone())
+                    .collect(),
+            ),
         };
 
         let staged = staged_commands
@@ -614,6 +643,11 @@ impl LuaExtensionRuntime {
             .map_err(|_| LuaRuntimeError::Host("Lua event map is poisoned".into()))?
             .clear();
         state
+            .inspection_callbacks
+            .lock()
+            .map_err(|_| LuaRuntimeError::Host("inspection callback registry poisoned".into()))?
+            .clear();
+        state
             .ui_updates
             .lock()
             .map_err(|_| LuaRuntimeError::Host("UI update queue lock is poisoned".into()))?
@@ -622,6 +656,282 @@ impl LuaExtensionRuntime {
         state.module_key = None;
         Ok(())
     }
+}
+
+impl InspectionProvider for LuaExtensionRuntime {
+    fn id(&self) -> &str {
+        &self.provider_id
+    }
+
+    fn rules(&self) -> Vec<RuleMetadata> {
+        self.inspection_rules.as_ref().clone()
+    }
+
+    // Keep the callback conversion in one pass so validation, cancellation checks, and revision
+    // binding cannot drift between findings emitted by one extension rule.
+    #[allow(clippy::too_many_lines)]
+    fn inspect(
+        &self,
+        document: &InspectionDocument,
+        profile: &InspectionProfile,
+        workspace: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Finding>, String> {
+        let state = self.inner.lock().map_err(|_| "Lua VM lock is poisoned")?;
+        let mut findings = Vec::new();
+        for rule in self.inspection_rules.iter() {
+            cancellation
+                .checkpoint()
+                .map_err(|error| error.to_string())?;
+            if !rule.languages.is_empty() && !rule.languages.contains(&document.language) {
+                continue;
+            }
+            let effective = profile.effective_rule(workspace, rule);
+            if !effective.enabled {
+                continue;
+            }
+            let callbacks = state
+                .inspection_callbacks
+                .lock()
+                .map_err(|_| "inspection callback registry is poisoned")?;
+            let key = callbacks
+                .get(&rule.id)
+                .ok_or_else(|| format!("inspection callback '{}' was deactivated", rule.id))?;
+            let callback: Function = state
+                .lua
+                .registry_value(key)
+                .map_err(|error| error.to_string())?;
+            drop(callbacks);
+
+            let lua_document = state
+                .lua
+                .create_table()
+                .map_err(|error| error.to_string())?;
+            lua_document
+                .set("path", document.path.as_str())
+                .map_err(|error| error.to_string())?;
+            lua_document
+                .set("language", document.language.as_str())
+                .map_err(|error| error.to_string())?;
+            lua_document
+                .set("text", document.text.as_ref())
+                .map_err(|error| error.to_string())?;
+            lua_document
+                .set("document_id", document.document_id)
+                .map_err(|error| error.to_string())?;
+            lua_document
+                .set("revision", document.revision)
+                .map_err(|error| error.to_string())?;
+
+            let settings = state
+                .lua
+                .create_table()
+                .map_err(|error| error.to_string())?;
+            settings
+                .set("enabled", effective.enabled)
+                .map_err(|error| error.to_string())?;
+            if let Some(severity) = effective.severity {
+                settings
+                    .set("severity", severity_name(severity))
+                    .map_err(|error| error.to_string())?;
+            }
+            let options = state
+                .lua
+                .create_table()
+                .map_err(|error| error.to_string())?;
+            for (name, value) in effective.options {
+                match value {
+                    OptionValue::Boolean(value) => options
+                        .set(name, value)
+                        .map_err(|error| error.to_string())?,
+                    OptionValue::Integer(value) => options
+                        .set(name, value)
+                        .map_err(|error| error.to_string())?,
+                    OptionValue::Text(value) => options
+                        .set(name, value)
+                        .map_err(|error| error.to_string())?,
+                }
+            }
+            settings
+                .set("options", options)
+                .map_err(|error| error.to_string())?;
+
+            state.instructions.store(0, Ordering::Relaxed);
+            let results: Table = callback
+                .call((lua_document, settings))
+                .map_err(|error| error.to_string())?;
+            let mut count = 0usize;
+            for item in results.sequence_values::<Table>() {
+                cancellation
+                    .checkpoint()
+                    .map_err(|error| error.to_string())?;
+                count = count.saturating_add(1);
+                if count > 1_000 {
+                    return Err(format!(
+                        "inspection rule '{}' exceeded 1,000 findings",
+                        rule.id
+                    ));
+                }
+                let item = item.map_err(|error| error.to_string())?;
+                let range = table_range(&item).map_err(|error| error.to_string())?;
+                validate_lua_range(&document.text, range)?;
+                let message: String = item.get("message").map_err(|error| error.to_string())?;
+                if message.trim().is_empty() || message.len() > 8 * 1024 {
+                    return Err("inspection message is empty or too large".into());
+                }
+                let explanation: Option<String> =
+                    item.get("explanation").map_err(|error| error.to_string())?;
+                if explanation
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 16 * 1024)
+                {
+                    return Err("inspection explanation is too large".into());
+                }
+                let category: Option<String> =
+                    item.get("category").map_err(|error| error.to_string())?;
+                let id = format!(
+                    "{}:{}:{}:{count}",
+                    rule.id, range.start.line, range.start.character
+                );
+                let mut actions = Vec::new();
+                if let Some(replacement) = item
+                    .get::<Option<String>>("replacement")
+                    .map_err(|error| error.to_string())?
+                {
+                    if replacement.len() > 64 * 1024 {
+                        return Err("inspection replacement is too large".into());
+                    }
+                    actions.push(CodeAction {
+                        id: format!("{id}:replace"),
+                        title: "Apply suggested replacement".into(),
+                        provider_id: self.provider_id.to_string(),
+                        kind: "quickfix".into(),
+                        diagnostic_ids: vec![id.clone()],
+                        edits: vec![ProposedTextEdit {
+                            path: document.path.clone(),
+                            expected_revision: document.revision,
+                            range,
+                            new_text: replacement,
+                        }],
+                        command: None,
+                        disabled_reason: None,
+                    });
+                }
+                let related =
+                    related_locations(&item, &document.path).map_err(|error| error.to_string())?;
+                findings.push(Finding {
+                    id,
+                    provider_id: self.provider_id.to_string(),
+                    rule_id: rule.id.clone(),
+                    path: document.path.clone(),
+                    document_id: document.document_id,
+                    document_revision: document.revision,
+                    source_revision: None,
+                    range,
+                    severity: effective.severity.unwrap_or(rule.default_severity),
+                    message,
+                    explanation,
+                    category: category.or_else(|| Some(rule.category.clone())),
+                    related,
+                    actions,
+                    documentation: None,
+                    origin: FindingOrigin::Document,
+                });
+            }
+        }
+        Ok(findings)
+    }
+}
+
+fn parse_severity(value: &str) -> Option<Severity> {
+    match value {
+        "error" => Some(Severity::Error),
+        "warning" => Some(Severity::Warning),
+        "information" => Some(Severity::Information),
+        "hint" => Some(Severity::Hint),
+        _ => None,
+    }
+}
+
+fn severity_name(value: Severity) -> &'static str {
+    match value {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Information => "information",
+        Severity::Hint => "hint",
+    }
+}
+
+fn table_range(item: &Table) -> mlua::Result<TextRange> {
+    Ok(TextRange {
+        start: TextPosition {
+            line: item.get("start_line")?,
+            character: item.get("start_column")?,
+        },
+        end: TextPosition {
+            line: item.get("end_line")?,
+            character: item.get("end_column")?,
+        },
+    })
+}
+
+fn validate_lua_range(text: &str, range: TextRange) -> Result<(), String> {
+    let lines = text.split('\n').collect::<Vec<_>>();
+    for position in [range.start, range.end] {
+        let line = lines
+            .get(position.line)
+            .ok_or_else(|| "inspection range line is outside the document".to_owned())?;
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let units = line.encode_utf16().count();
+        if position.character > units {
+            return Err("inspection range column is outside the document".into());
+        }
+        let mut offset = 0usize;
+        for scalar in line.chars() {
+            let next = offset + scalar.len_utf16();
+            if offset < position.character && position.character < next {
+                return Err("inspection range splits a UTF-16 surrogate pair".into());
+            }
+            offset = next;
+        }
+    }
+    if (range.end.line, range.end.character) < (range.start.line, range.start.character) {
+        return Err("inspection range end precedes its start".into());
+    }
+    Ok(())
+}
+
+fn related_locations(item: &Table, path: &str) -> mlua::Result<Vec<RelatedLocation>> {
+    let Some(related) = item.get::<Option<Table>>("related")? else {
+        return Ok(Vec::new());
+    };
+    let mut locations = Vec::new();
+    for entry in related.sequence_values::<Table>() {
+        if locations.len() >= 16 {
+            return Err(mlua::Error::RuntimeError(
+                "too many related locations".into(),
+            ));
+        }
+        let entry = entry?;
+        let line: usize = entry.get("line")?;
+        let character: usize = entry.get("column")?;
+        let message: String = entry.get("message")?;
+        if message.len() > 4096 {
+            return Err(mlua::Error::RuntimeError(
+                "related message is too large".into(),
+            ));
+        }
+        let position = TextPosition { line, character };
+        locations.push(RelatedLocation {
+            path: path.to_owned(),
+            range: TextRange {
+                start: position,
+                end: position,
+            },
+            message,
+        });
+    }
+    Ok(locations)
 }
 
 // API assembly remains in one function so each exposed table is gated beside its capability
@@ -641,6 +951,8 @@ fn create_api(
     staged_settings: Arc<Mutex<Vec<StagedSetting>>>,
     staged_themes: Arc<Mutex<Vec<StagedTheme>>>,
     staged_diagnostic_details: Arc<Mutex<Vec<StagedDiagnosticDetail>>>,
+    staged_inspection_rules: &Arc<Mutex<Vec<StagedInspectionRule>>>,
+    inspection_callbacks: &Arc<Mutex<BTreeMap<String, RegistryKey>>>,
     ui_updates: Arc<Mutex<VecDeque<(String, String)>>>,
 ) -> mlua::Result<Table> {
     let api = lua.create_table()?;
@@ -1131,6 +1443,112 @@ fn create_api(
         api.set("diagnostics", diagnostics)?;
     }
 
+    if manifest.capabilities.contains(&Capability::Diagnostics)
+        && manifest.capabilities.contains(&Capability::DocumentRead)
+    {
+        let inspections = lua.create_table()?;
+        let pending = staged_inspection_rules.clone();
+        let callbacks = inspection_callbacks.clone();
+        let provider_id = manifest.id.clone();
+        inspections.set(
+            "register_rule",
+            lua.create_function(move |lua, (definition, callback): (Table, Function)| {
+                let id: String = definition.get("id")?;
+                let title: String = definition.get("title")?;
+                let description: String = definition.get("description")?;
+                let category: String = definition.get("category")?;
+                let severity_name: String = definition
+                    .get::<Option<String>>("severity")?
+                    .unwrap_or_else(|| "warning".into());
+                let languages = definition
+                    .get::<Option<Vec<String>>>("languages")?
+                    .unwrap_or_default();
+                if id.trim().is_empty()
+                    || id.contains('.')
+                    || title.trim().is_empty()
+                    || title.len() > 256
+                    || description.len() > 4096
+                    || category.trim().is_empty()
+                    || category.len() > 128
+                    || languages.len() > 32
+                {
+                    return Err(mlua::Error::RuntimeError(
+                        "inspection rule has invalid or oversized metadata".into(),
+                    ));
+                }
+                let severity = parse_severity(&severity_name).ok_or_else(|| {
+                    mlua::Error::RuntimeError("unsupported inspection severity".into())
+                })?;
+                let mut options = BTreeMap::new();
+                if let Some(option_table) = definition.get::<Option<Table>>("options")? {
+                    for pair in option_table.pairs::<String, Value>() {
+                        let (name, value) = pair?;
+                        if name.trim().is_empty() || name.len() > 128 {
+                            return Err(mlua::Error::RuntimeError(
+                                "inspection option name is invalid".into(),
+                            ));
+                        }
+                        let value = match value {
+                            Value::Boolean(value) => OptionValue::Boolean(value),
+                            Value::Integer(value) => OptionValue::Integer(value),
+                            Value::String(value) => {
+                                let value = value.to_str()?.to_string();
+                                if value.len() > 1024 {
+                                    return Err(mlua::Error::RuntimeError(
+                                        "inspection text option is too long".into(),
+                                    ));
+                                }
+                                OptionValue::Text(value)
+                            }
+                            _ => {
+                                return Err(mlua::Error::RuntimeError(
+                                    "inspection options must be boolean, integer, or text".into(),
+                                ));
+                            }
+                        };
+                        if options.insert(name, value).is_some() {
+                            return Err(mlua::Error::RuntimeError(
+                                "duplicate inspection option".into(),
+                            ));
+                        }
+                    }
+                }
+                let rule_id = format!("{provider_id}.{id}");
+                let mut rules = pending.lock().map_err(|_| {
+                    mlua::Error::RuntimeError("inspection registration lock poisoned".into())
+                })?;
+                if rules.iter().any(|rule| rule.metadata.id == rule_id) {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "duplicate inspection rule '{rule_id}'"
+                    )));
+                }
+                let callback_id = rule_id.clone();
+                let key = lua.create_registry_value(callback)?;
+                callbacks
+                    .lock()
+                    .map_err(|_| {
+                        mlua::Error::RuntimeError("inspection callback registry poisoned".into())
+                    })?
+                    .insert(callback_id.clone(), key);
+                rules.push(StagedInspectionRule {
+                    metadata: RuleMetadata {
+                        id: rule_id,
+                        provider_id: provider_id.clone(),
+                        title,
+                        description,
+                        category,
+                        languages: languages.into_iter().collect(),
+                        default_severity: severity,
+                        supports_fixes: true,
+                        options,
+                    },
+                });
+                Ok(())
+            })?,
+        )?;
+        api.set("inspections", inspections)?;
+    }
+
     Ok(api)
 }
 
@@ -1294,6 +1712,86 @@ mod tests {
         .unwrap();
         assert_eq!(result, "Hello /workspace/demo");
         runtime.deactivate().unwrap();
+    }
+
+    #[test]
+    fn inspection_provider_honors_profiles_and_publishes_revision_bound_fixes() {
+        let manifest = manifest(&[Capability::Diagnostics, Capability::DocumentRead]);
+        let source = r#"
+            local m = {}
+            function m.activate()
+              koren.inspections.register_rule({
+                id = "todo",
+                title = "TODO marker",
+                description = "Replace TODO markers",
+                category = "maintainability",
+                languages = {"plaintext"},
+                severity = "warning"
+              }, function(document, settings)
+                if not settings.enabled or not document.text:find("TODO", 1, true) then
+                  return {}
+                end
+                return {{
+                  start_line = 0, start_column = 0,
+                  end_line = 0, end_column = 4,
+                  message = "TODO marker remains",
+                  explanation = "Replace this marker before shipping.",
+                  replacement = "DONE",
+                  related = {{line = 0, column = 4, message = "Suggested replacement starts here"}}
+                }}
+              end)
+            end
+            return m
+        "#;
+        let mut contributions = builder(&manifest);
+        let runtime = LuaExtensionRuntime::activate_source(
+            &manifest,
+            source,
+            LuaHostContext::default(),
+            LuaLimits::default(),
+            &mut contributions,
+        )
+        .unwrap();
+        let rules = runtime.rules();
+        assert_eq!(rules[0].id, "org.example.sample.todo");
+        assert_eq!(rules[0].provider_id, "org.example.sample");
+        assert_eq!(rules[0].default_severity, Severity::Warning);
+        let mut profile = InspectionProfile::new("Strict");
+        profile.rules.insert(
+            rules[0].id.clone(),
+            koren_inspections::RuleProfile {
+                enabled: true,
+                severity: Some(Severity::Error),
+                options: BTreeMap::new(),
+            },
+        );
+        let document = InspectionDocument {
+            path: "/workspace/readme.txt".into(),
+            document_id: Some(7),
+            revision: Some(12),
+            language: "plaintext".into(),
+            text: Arc::from("TODO"),
+        };
+        let findings = runtime
+            .inspect(&document, &profile, None, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error);
+        assert_eq!(
+            findings[0].explanation.as_deref(),
+            Some("Replace this marker before shipping.")
+        );
+        assert_eq!(findings[0].document_revision, Some(12));
+        assert_eq!(findings[0].actions[0].edits[0].expected_revision, Some(12));
+        assert_eq!(findings[0].actions[0].edits[0].new_text, "DONE");
+        assert_eq!(findings[0].related.len(), 1);
+
+        runtime.deactivate().unwrap();
+        assert!(
+            runtime
+                .inspect(&document, &profile, None, &CancellationToken::new())
+                .is_err()
+        );
     }
 
     #[test]

@@ -381,6 +381,10 @@ impl CancellationToken {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+    /// Requests cooperative cancellation of the running provider job.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
     /// Stops a provider cooperatively.
     ///
     /// # Errors
@@ -779,6 +783,11 @@ pub struct InspectionProgress {
 }
 
 impl InspectionJob {
+    /// Returns a handle that can cancel this job while it runs.
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        CancellationToken(self.cancelled.clone())
+    }
     /// Requests cooperative cancellation.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);

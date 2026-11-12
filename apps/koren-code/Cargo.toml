@@ -26,6 +26,7 @@ koren-projects = { workspace = true }
 koren-tasks = { workspace = true }
 koren-cargo = { workspace = true }
 koren-extensions = { workspace = true }
+koren-inspections = { workspace = true }
 koren-lua = { workspace = true }
 koren-lsp = { workspace = true }
 

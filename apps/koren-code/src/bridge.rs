@@ -6,6 +6,10 @@ use koren_extensions::{
     CommandContext, CommandEnablement, ExtensionManager, ExtensionState, MenuLocation, SettingKind,
     SettingValue, ThemeBase, UiDocument, UiElement,
 };
+use koren_inspections::{
+    CancellationToken, FindingOrigin, InspectionProfile, InspectionProfiles, InspectionProvider,
+    InspectionService,
+};
 use koren_lsp::{
     DiagnosticSet, FormattingOptions, LspActorEvent, LspDocumentSync, LspRequest, LspResponse,
     LspServerActors, LspServerHandle, ServerAuthorizer, ServerConfig, ServerEvent, ServerId,
@@ -19,7 +23,8 @@ use koren_protocol::{
     ExtensionCommandSummary, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary,
     ExtensionProjectWizardSummary, ExtensionSettingKind, ExtensionSettingSummary,
     ExtensionSettingValue, ExtensionSummary as ProtocolExtensionSummary, ExtensionThemeSummary,
-    ExtensionToolWindowSummary, ExtensionUiDocument, ExtensionUiElement,
+    ExtensionToolWindowSummary, ExtensionUiDocument, ExtensionUiElement, InspectionCodeAction,
+    InspectionFinding, InspectionProposedTextEdit, InspectionRelatedLocation,
     LanguageServerApprovalSummary, LanguageServerSummary, ProjectLifecycle, ProjectSummary,
     ProtocolError, Request, RequestMethod, Response, ResponseValue, TaskLifecycle, TaskSummary,
     TextEdit, validate_version,
@@ -171,7 +176,9 @@ fn backend_loop_with_state(receiver: Receiver<BackendCommand>, mut state: Deskto
     loop {
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(BackendCommand::Request(request, reply)) => {
-                if !state.defer_language_feature(&request, reply.clone(), &language_features) {
+                if !state.defer_document_inspection(&request, reply.clone())
+                    && !state.defer_language_feature(&request, reply.clone(), &language_features)
+                {
                     let _ = reply.send(state.dispatch(*request));
                 }
             }
@@ -219,6 +226,8 @@ struct DesktopBackend {
     tasks: TaskManager,
     approvals: TaskApprovalManager,
     extensions: ExtensionManager,
+    inspections: InspectionService,
+    inspection_profiles: InspectionProfiles,
     extension_root: Option<PathBuf>,
     extensions_discovered: bool,
     extension_setting_values: BTreeMap<String, ExtensionSettingValue>,
@@ -232,6 +241,7 @@ struct DesktopBackend {
     language_document_sync: BTreeMap<u64, LspDocumentSync>,
     open_documents: BTreeSet<DocumentId>,
     document_cancellations: BTreeMap<DocumentId, Arc<AtomicBool>>,
+    inspection_cancellations: Arc<Mutex<BTreeMap<(u64, u64), CancellationToken>>>,
     pending_language_servers: BTreeMap<u64, PendingLanguageServer>,
     next_language_server_approval: u64,
 }
@@ -273,6 +283,11 @@ impl DesktopBackend {
         cargo
             .register(&mut projects)
             .map_err(|error| error.to_string())?;
+        let mut inspection_profiles = InspectionProfiles::default();
+        inspection_profiles.insert(InspectionProfile::new("Default"));
+        inspection_profiles
+            .select(None, "Default")
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             platform,
             commands,
@@ -283,6 +298,8 @@ impl DesktopBackend {
             tasks: TaskManager::new(TaskOptions::default()).map_err(|error| error.to_string())?,
             approvals: TaskApprovalManager::new(),
             extensions: ExtensionManager::new(),
+            inspections: InspectionService::default(),
+            inspection_profiles,
             extension_root: extension_install_root(),
             extensions_discovered: false,
             extension_setting_values: load_extension_settings(),
@@ -296,6 +313,7 @@ impl DesktopBackend {
             language_document_sync: BTreeMap::new(),
             open_documents: BTreeSet::new(),
             document_cancellations: BTreeMap::new(),
+            inspection_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
             pending_language_servers: BTreeMap::new(),
             next_language_server_approval: 0,
         })
@@ -476,6 +494,150 @@ impl DesktopBackend {
         true
     }
 
+    fn defer_document_inspection(&self, request: &Request, reply: Sender<Response>) -> bool {
+        let RequestMethod::InspectDocument {
+            document_id,
+            expected_revision,
+            language,
+        } = &request.method
+        else {
+            return false;
+        };
+        let request_id = request.request_id;
+        let result = validate_version(request.version).and_then(|()| {
+            if language.trim().is_empty() || language.len() > 128 {
+                return Err(invalid("inspection language identifier is invalid"));
+            }
+            let snapshot = self
+                .documents
+                .snapshot(DocumentId(*document_id))
+                .map_err(document_error)?;
+            if snapshot.info.revision != *expected_revision {
+                return Err(ProtocolError {
+                    code: ErrorCode::Conflict,
+                    message: "inspection request refers to an obsolete document revision".into(),
+                });
+            }
+            let workspace = self
+                .workspace
+                .root()
+                .ok()
+                .map(|root| root.to_string_lossy().into_owned());
+            let profile = self
+                .inspection_profiles
+                .selected_for(workspace.as_deref())
+                .cloned()
+                .unwrap_or_else(|| InspectionProfile::new("Default"));
+            let path = snapshot.info.path.clone();
+            self.inspections
+                .inspect_document(
+                    koren_inspections::InspectionDocument {
+                        path: path
+                            .as_ref()
+                            .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+                        document_id: Some(*document_id),
+                        revision: Some(*expected_revision),
+                        language: language.clone(),
+                        text: Arc::from(snapshot.text),
+                    },
+                    profile,
+                    workspace,
+                )
+                .map(|job| (path, job))
+                .map_err(inspection_error)
+        });
+        let (path, job) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = reply.send(Response::new(request_id, Err(error)));
+                return true;
+            }
+        };
+        let document_id = *document_id;
+        let revision = *expected_revision;
+        let cancellation_map = self.inspection_cancellations.clone();
+        let token = job.cancellation_token();
+        let mut active = match cancellation_map.lock() {
+            Ok(active) => active,
+            Err(_) => {
+                let _ = reply.send(Response::new(
+                    request_id,
+                    Err(ProtocolError {
+                        code: ErrorCode::Internal,
+                        message: "inspection cancellation registry is unavailable".into(),
+                    }),
+                ));
+                return true;
+            }
+        };
+        let stale_keys = active
+            .keys()
+            .filter(|(active_document, _)| *active_document == document_id)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in stale_keys {
+            if let Some(previous) = active.remove(&key) {
+                previous.cancel();
+            }
+        }
+        active.insert((document_id, request_id), token.clone());
+        drop(active);
+        let worker_reply = reply.clone();
+        let spawn = thread::Builder::new()
+            .name("koren-inspection-response".into())
+            .spawn(move || {
+                let results = job
+                    .recv_timeout(Duration::from_secs(30))
+                    .map_err(inspection_error)
+                    .and_then(|findings| {
+                        if token.is_cancelled() {
+                            return Err(ProtocolError {
+                                code: ErrorCode::Conflict,
+                                message: "inspection results became stale before publication"
+                                    .into(),
+                            });
+                        }
+                        Ok(ResponseValue::InspectionFindings {
+                            document_revision: revision,
+                            findings: findings
+                                .into_iter()
+                                .map(|finding| inspection_finding(finding, &path, revision))
+                                .collect(),
+                        })
+                    });
+                if let Ok(mut active) = cancellation_map.lock() {
+                    active.remove(&(document_id, request_id));
+                }
+                let _ = worker_reply.send(Response::new(request_id, results));
+            });
+        if let Err(error) = spawn {
+            self.cancel_document_inspections(document_id);
+            let _ = reply.send(Response::new(
+                request_id,
+                Err(ProtocolError {
+                    code: ErrorCode::Internal,
+                    message: format!("could not start inspection response worker: {error}"),
+                }),
+            ));
+        }
+        true
+    }
+
+    fn cancel_document_inspections(&self, document_id: u64) {
+        if let Ok(mut active) = self.inspection_cancellations.lock() {
+            let keys = active
+                .keys()
+                .filter(|(active_document, _)| *active_document == document_id)
+                .copied()
+                .collect::<Vec<_>>();
+            for key in keys {
+                if let Some(token) = active.remove(&key) {
+                    token.cancel();
+                }
+            }
+        }
+    }
+
     fn method(&mut self, method: RequestMethod) -> Result<ResponseValue, ProtocolError> {
         match method {
             RequestMethod::Ping => Ok(ResponseValue::Pong),
@@ -535,7 +697,8 @@ impl DesktopBackend {
             RequestMethod::LanguageReferences { .. }
             | RequestMethod::LanguageFormat { .. }
             | RequestMethod::LanguageCodeActions { .. }
-            | RequestMethod::LanguageRename { .. } => Err(ProtocolError {
+            | RequestMethod::LanguageRename { .. }
+            | RequestMethod::InspectDocument { .. } => Err(ProtocolError {
                 code: ErrorCode::Internal,
                 message: "language feature request was not dispatched to its worker".into(),
             }),
@@ -645,6 +808,7 @@ impl DesktopBackend {
                 expected_revision,
                 edits,
             } => {
+                self.cancel_document_inspections(document_id);
                 let info = self
                     .documents
                     .apply_edits(DocumentId(document_id), expected_revision, &edits)
@@ -689,6 +853,7 @@ impl DesktopBackend {
                 document_id,
                 discard_unsaved_changes,
             } => {
+                self.cancel_document_inspections(document_id);
                 self.documents
                     .close(DocumentId(document_id), discard_unsaved_changes)
                     .map_err(document_error)?;
@@ -1154,6 +1319,7 @@ impl DesktopBackend {
         if enabled {
             self.extensions.enable(id).map_err(extension_error)?;
         } else {
+            self.inspections.unregister(id);
             if let Some(runtime) = self.lua_runtimes.remove(id) {
                 let _ = runtime.deactivate();
             }
@@ -1202,6 +1368,16 @@ impl DesktopBackend {
             })
             .map_err(extension_error)?;
         if let Some(runtime) = runtime {
+            if !runtime.rules().is_empty()
+                && let Err(error) = self.inspections.register(Arc::new(runtime.clone()))
+            {
+                let _ = runtime.deactivate();
+                let _ = self.extensions.disable(id);
+                return Err(ProtocolError {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("could not register extension inspections: {error}"),
+                });
+            }
             self.lua_runtimes.insert(id.to_owned(), runtime);
         }
         let summary = self
@@ -2740,6 +2916,101 @@ fn lsp_error(error: koren_lsp::LspError) -> ProtocolError {
     ProtocolError {
         code,
         message: error.to_string(),
+    }
+}
+
+fn inspection_error(error: koren_inspections::InspectionError) -> ProtocolError {
+    ProtocolError {
+        code: match error {
+            koren_inspections::InspectionError::ConcurrencyLimit
+            | koren_inspections::InspectionError::Cancelled
+            | koren_inspections::InspectionError::RequestTimeout => ErrorCode::Conflict,
+            _ => ErrorCode::InvalidRequest,
+        },
+        message: error.to_string(),
+    }
+}
+
+fn inspection_finding(
+    finding: koren_inspections::Finding,
+    active_path: &Option<PathBuf>,
+    expected_revision: u64,
+) -> InspectionFinding {
+    let active_path = active_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let actions = finding
+        .actions
+        .into_iter()
+        .map(|action| {
+            let supported = action.command.is_none()
+                && action.edits.len() == 1
+                && action.edits.first().is_some_and(|edit| {
+                    edit.path == active_path && edit.expected_revision == Some(expected_revision)
+                });
+            let edits = if supported {
+                action
+                    .edits
+                    .into_iter()
+                    .map(|edit| InspectionProposedTextEdit {
+                        path: edit.path,
+                        expected_revision: edit.expected_revision,
+                        range: edit.range,
+                        new_text: edit.new_text,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            InspectionCodeAction {
+                id: action.id,
+                title: action.title,
+                provider_id: action.provider_id,
+                kind: action.kind,
+                diagnostic_ids: action.diagnostic_ids,
+                edits,
+                disabled_reason: action.disabled_reason.or_else(|| {
+                    (!supported).then(|| {
+                        "This action is stale, affects another file, or uses an unsupported operation.".into()
+                    })
+                }),
+            }
+        })
+        .collect();
+    let origin = match finding.origin {
+        FindingOrigin::Document => "document".into(),
+        FindingOrigin::ProjectSnapshot { .. } => "project_snapshot".into(),
+        FindingOrigin::Imported { .. } => "imported".into(),
+    };
+    InspectionFinding {
+        id: finding.id,
+        provider_id: finding.provider_id,
+        rule_id: finding.rule_id,
+        path: finding.path,
+        document_revision: finding.document_revision,
+        range: finding.range,
+        severity: match finding.severity {
+            koren_inspections::Severity::Error => "error",
+            koren_inspections::Severity::Warning => "warning",
+            koren_inspections::Severity::Information => "information",
+            koren_inspections::Severity::Hint => "hint",
+        }
+        .into(),
+        message: finding.message,
+        explanation: finding.explanation,
+        category: finding.category,
+        related: finding
+            .related
+            .into_iter()
+            .map(|location| InspectionRelatedLocation {
+                path: location.path,
+                range: location.range,
+                message: location.message,
+            })
+            .collect(),
+        actions,
+        origin,
     }
 }
 

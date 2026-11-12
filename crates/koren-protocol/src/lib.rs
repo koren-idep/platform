@@ -164,6 +164,15 @@ pub enum RequestMethod {
         /// New symbol name.
         new_name: String,
     },
+    /// Explicitly inspect one revisioned document with registered local providers.
+    InspectDocument {
+        /// Open document identifier.
+        document_id: u64,
+        /// Revision shown by the editor.
+        expected_revision: u64,
+        /// Language identifier selected by the editor integration.
+        language: String,
+    },
     /// Read information about a local directory.
     WorkspaceInfo {
         /// Local filesystem path to inspect.
@@ -518,6 +527,13 @@ pub enum ResponseValue {
         document_revision: u64,
         /// Proposed text edits for the active document.
         edits: Vec<TextEdit>,
+    },
+    /// Inspection results tied to the analyzed document revision.
+    InspectionFindings {
+        /// Document revision used for analysis.
+        document_revision: u64,
+        /// Provider-attributed findings.
+        findings: Vec<InspectionFinding>,
     },
     /// Root path and top-level entry count.
     Workspace {
@@ -1047,6 +1063,80 @@ pub struct LanguageCodeAction {
     pub unsupported_reason: Option<String>,
     /// Provider supplied disabled reason.
     pub disabled_reason: Option<String>,
+}
+
+/// A provider-attributed inspection result returned to a host UI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InspectionFinding {
+    /// Stable finding instance identity.
+    pub id: String,
+    /// Stable provider identity.
+    pub provider_id: String,
+    /// Stable rule identity.
+    pub rule_id: String,
+    /// Workspace-relative source path.
+    pub path: String,
+    /// Document revision used by analysis.
+    pub document_revision: Option<u64>,
+    /// UTF-16 source range.
+    pub range: TextRange,
+    /// Severity name: error, warning, information, or hint.
+    pub severity: String,
+    /// User-facing diagnostic message.
+    pub message: String,
+    /// Optional contextual explanation.
+    pub explanation: Option<String>,
+    /// Optional grouping category.
+    pub category: Option<String>,
+    /// Related source locations.
+    pub related: Vec<InspectionRelatedLocation>,
+    /// Proposed user-confirmed text actions.
+    pub actions: Vec<InspectionCodeAction>,
+    /// Distinguishes imported/project/document results.
+    pub origin: String,
+}
+
+/// Related source location for an inspection finding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InspectionRelatedLocation {
+    /// Workspace-relative source path.
+    pub path: String,
+    /// UTF-16 source range.
+    pub range: TextRange,
+    /// Related context message.
+    pub message: String,
+}
+
+/// Supported text-only inspection action.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InspectionCodeAction {
+    /// Stable request-scoped identity.
+    pub id: String,
+    /// User-facing action title.
+    pub title: String,
+    /// Provider identity.
+    pub provider_id: String,
+    /// Action category.
+    pub kind: String,
+    /// Diagnostic identifiers this action addresses.
+    pub diagnostic_ids: Vec<String>,
+    /// Proposed edits; the host must preview and confirm before application.
+    pub edits: Vec<InspectionProposedTextEdit>,
+    /// Reason the host currently cannot apply this action.
+    pub disabled_reason: Option<String>,
+}
+
+/// Revision-bound proposed text replacement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InspectionProposedTextEdit {
+    /// Workspace-relative source path.
+    pub path: String,
+    /// Document revision used to calculate this edit.
+    pub expected_revision: Option<u64>,
+    /// UTF-16 replacement range.
+    pub range: TextRange,
+    /// Replacement contents.
+    pub new_text: String,
 }
 
 /// Serializable project summary with manager-local identity.
