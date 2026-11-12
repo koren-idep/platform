@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Deterministic stdio DAP adapter used by koren-debug integration tests."""
 import json
+import os
 import sys
 
+MODE = os.environ.get("KOREN_FAKE_DAP_MODE", "normal")
 
 def read_message():
     length = None
@@ -36,9 +38,26 @@ while True:
         break
     command = request["command"]
     if command == "initialize":
+        if MODE == "crash":
+            raise SystemExit(23)
+        if MODE == "failed-initialize":
+            send({"seq": 100, "type": "response", "request_seq": request["seq"],
+                  "command": command, "success": False, "message": "fixture init failure"})
+            break
+        if MODE == "reverse-request":
+            send({"seq": 99, "type": "request", "command": "runInTerminal",
+                  "arguments": {"kind": "integrated", "args": ["must-not-run"]}})
+            reverse_response = read_message()
+            if (reverse_response.get("type") != "response"
+                    or reverse_response.get("success") is not False
+                    or reverse_response.get("command") != "runInTerminal"):
+                raise RuntimeError("unsupported reverse request was not rejected")
+            send({"seq": 98, "type": "event", "event": "output",
+                  "body": {"category": "console", "output": "reverse request rejected"}})
         response(request, {"supportsConfigurationDoneRequest": True,
                             "supportsStepInTargetsRequest": False,
-                            "supportsVariablePaging": True})
+                            "supportsVariablePaging": True,
+                            "supportsTerminateRequest": True})
         send({"seq": 101, "type": "event", "event": "initialized", "body": {}})
     elif command == "launch" or command == "attach":
         response(request)

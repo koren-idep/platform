@@ -279,7 +279,7 @@ pub struct DebugInspectionCapabilities {
 }
 
 /// Current immutable public view of a debug session.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DebugSessionInfo {
     /// Manager-local session identity.
     pub session_id: u64,
@@ -811,6 +811,38 @@ impl DebugManager {
         Ok(())
     }
 
+    /// Removes a registered configuration while leaving any running session untouched.
+    ///
+    /// # Errors
+    /// Returns [`DebugError::NotFound`] when the configuration is not registered.
+    pub fn unregister_configuration(&mut self, id: &str) -> Result<(), DebugError> {
+        self.configurations
+            .remove(id)
+            .map(|_| ())
+            .ok_or(DebugError::NotFound)
+    }
+
+    /// Removes a registered adapter that no configuration references.
+    ///
+    /// # Errors
+    /// Returns [`DebugError::NotFound`] when the adapter is not registered, or
+    /// [`DebugError::InvalidConfiguration`] while a configuration still references it.
+    pub fn unregister_adapter(&mut self, id: &str) -> Result<(), DebugError> {
+        if self
+            .configurations
+            .values()
+            .any(|configuration| configuration.adapter_id == id)
+        {
+            return Err(DebugError::InvalidConfiguration(
+                "debug adapter is still referenced by a configuration".into(),
+            ));
+        }
+        self.adapters
+            .remove(id)
+            .map(|_| ())
+            .ok_or(DebugError::NotFound)
+    }
+
     /// Lists registered local adapters.
     #[must_use]
     pub fn adapters(&self) -> Vec<DebugAdapterDefinition> {
@@ -1226,6 +1258,7 @@ fn run_session(startup: SessionStartup) {
         pending: BTreeMap::new(),
         startup_progress: StartupProgress::default(),
         stopped: false,
+        disconnect_after_terminate: false,
         stop_deadline: None,
         last_activity: Instant::now(),
     };
@@ -1244,6 +1277,7 @@ struct SessionActor {
     pending: BTreeMap<u64, PendingRequest>,
     startup_progress: StartupProgress,
     stopped: bool,
+    disconnect_after_terminate: bool,
     stop_deadline: Option<Instant>,
     last_activity: Instant,
 }
@@ -1257,7 +1291,10 @@ struct StartupProgress {
 
 impl SessionActor {
     fn run(&mut self) {
-        if self.initialize().is_err() {
+        if let Err(error) = self.initialize() {
+            if self.info().state != DebugSessionState::Failed {
+                self.fail(error.to_string());
+            }
             self.cleanup(true);
             return;
         }
@@ -1533,6 +1570,10 @@ impl SessionActor {
             .get("message")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        if pending.command == "terminate" && self.disconnect_after_terminate {
+            self.disconnect_after_terminate = false;
+            self.send_disconnect(false);
+        }
         if pending.command == "launch" || pending.command == "attach" {
             self.startup_progress.launch_response = success;
         }
@@ -1824,23 +1865,21 @@ impl SessionActor {
         let launched = self.info().request == DebugRequestType::Launch;
         let capabilities = self.info().capabilities;
         if launched && capabilities.execution.terminate {
+            self.disconnect_after_terminate = true;
             let _ = self.send_operation(0, "terminate", json!({"restart":false}), None, Vec::new());
-            let _ = self.send_operation(
-                0,
-                "disconnect",
-                json!({"restart":false,"terminateDebuggee":false}),
-                None,
-                Vec::new(),
-            );
         } else {
-            let _ = self.send_operation(
-                0,
-                "disconnect",
-                json!({"restart":false,"terminateDebuggee":launched}),
-                None,
-                Vec::new(),
-            );
+            self.send_disconnect(launched);
         }
+    }
+
+    fn send_disconnect(&mut self, terminate_debuggee: bool) {
+        let _ = self.send_operation(
+            0,
+            "disconnect",
+            json!({"restart":false,"terminateDebuggee":terminate_debuggee}),
+            None,
+            Vec::new(),
+        );
     }
 
     fn cleanup(&mut self, kill: bool) {
@@ -1912,7 +1951,7 @@ impl SessionActor {
     }
 
     fn emit(&self, event: DebugEvent) {
-        let _ = self.startup.events.send(event);
+        let _ = self.startup.events.try_send(event);
     }
 
     fn alloc_sequence(&mut self) -> u64 {
@@ -2189,6 +2228,9 @@ mod tests {
         );
         assert_eq!(manager.sessions().len(), 0);
         assert!(!pid_file.exists());
+        assert!(manager.unregister_adapter("fake").is_err());
+        manager.unregister_configuration("fake.launch").unwrap();
+        manager.unregister_adapter("fake").unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -36,6 +36,10 @@ fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
 }
 
 fn manager_with_fake_adapter(root: &Path) -> DebugManager {
+    manager_with_fake_adapter_mode(root, "normal")
+}
+
+fn manager_with_fake_adapter_mode(root: &Path, mode: &str) -> DebugManager {
     let mut manager = DebugManager::new();
     manager
         .register_adapter(DebugAdapterDefinition {
@@ -48,7 +52,9 @@ fn manager_with_fake_adapter(root: &Path) -> DebugManager {
                     .into_owned(),
             ],
             working_directory: root.to_path_buf(),
-            environment: BTreeMap::new(),
+            environment: [("KOREN_FAKE_DAP_MODE".into(), mode.into())]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
         })
         .unwrap();
     manager
@@ -144,4 +150,73 @@ fn fake_adapter_initializes_stops_inspects_and_disconnects() {
             DebugSessionState::Terminated | DebugSessionState::Failed
         )
     });
+}
+
+#[test]
+fn manager_runs_multiple_independent_sessions_and_cleans_them_up() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut manager = manager_with_fake_adapter(&root);
+    let first = manager.start_session("fake.launch", &mut Allow).unwrap();
+    let second = manager.start_session("fake.launch", &mut Allow).unwrap();
+    assert_ne!(first.session_id, second.session_id);
+    let first_session = manager.session(first.session_id).unwrap();
+    let second_session = manager.session(second.session_id).unwrap();
+    wait_until("both sessions paused", || {
+        first_session.info().state == DebugSessionState::Paused
+            && second_session.info().state == DebugSessionState::Paused
+    });
+    first_session.stop().unwrap();
+    second_session.stop().unwrap();
+    wait_until("both sessions stopped", || {
+        matches!(
+            first_session.info().state,
+            DebugSessionState::Terminated | DebugSessionState::Failed
+        ) && matches!(
+            second_session.info().state,
+            DebugSessionState::Terminated | DebugSessionState::Failed
+        )
+    });
+    manager.shutdown();
+    assert!(manager.sessions().iter().all(|session| matches!(
+        session.state,
+        DebugSessionState::Terminated | DebugSessionState::Failed
+    )));
+}
+
+#[test]
+fn failed_initialization_adapter_crash_and_reverse_request_fail_safely() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for mode in ["failed-initialize", "crash"] {
+        let mut manager = manager_with_fake_adapter_mode(&root, mode);
+        let started = manager.start_session("fake.launch", &mut Allow).unwrap();
+        let session = manager.session(started.session_id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.info().state != DebugSessionState::Failed && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(
+            session.info().state,
+            DebugSessionState::Failed,
+            "mode={mode}: {:?}",
+            session.info()
+        );
+        assert!(session.info().error.is_some());
+        manager.shutdown();
+    }
+
+    let mut manager = manager_with_fake_adapter_mode(&root, "reverse-request");
+    let started = manager.start_session("fake.launch", &mut Allow).unwrap();
+    let session = manager.session(started.session_id).unwrap();
+    let mut observed = Vec::new();
+    wait_until("reverse request rejection", || {
+        observed.extend(manager.drain_events());
+        session.info().state == DebugSessionState::Paused
+            && observed.iter().any(|event| {
+                matches!(event,
+                koren_debug::DebugEvent::Output { output, .. }
+                    if output.contains("reverse request rejected"))
+            })
+    });
+    session.stop().unwrap();
+    manager.shutdown();
 }
