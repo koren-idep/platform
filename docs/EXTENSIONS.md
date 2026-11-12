@@ -102,6 +102,14 @@ Starting any declared language server requires explicit host approval, including
 
 Document open, revision changes, and close are synchronized with active compatible servers using the document manager's snapshots and UTF-16 positions. Diagnostics are replaced per provider and stale versions are discarded. Hover, completion, and definition requests use advertised capabilities and have a 150 ms desktop request budget. Each authorized language server has an actor thread and bounded FIFO mailbox; initialization, transport I/O, feature waits, and shutdown run outside the shared platform worker.
 
+## Phase 8 inspection and language actions
+
+Rust providers can use the `koren-inspections` crate to declare stable rule metadata and produce findings against immutable document snapshots. Findings retain provider and rule identities, UTF-16 ranges, revisions or project snapshot IDs, explanations, related locations, and proposed text actions. Providers are registered and removed explicitly. Document and project jobs are opt-in, bounded, cancellable, and never walk the filesystem or launch tools. Project hosts must supply their own snapshot. Profiles preserve unavailable rule settings and support typed options, global choices, and workspace overrides. Generic suppressions are host state and do not rewrite source files.
+
+The SARIF adapter accepts and exports a bounded subset of SARIF 2.1.0. Import limits input to 5 MiB and 20,000 findings, rejects unsafe paths, and does not fetch external resources. Unsupported fields are returned as warnings. Imported findings are marked as imported; they are not live diagnostics unless a source revision is known. The current desktop does not yet provide file-picker import/export commands.
+
+LSP requests for code actions and intentions, references, rename, and formatting are capability-gated and remain on per-server actors. `Ctrl+.` requests code actions, `F2` requests rename, `Shift+F12` requests references, and `Ctrl+Shift+F` requests formatting. Each proposed edit requires an explicit preview confirmation and uses the revision-aware document pipeline. Desktop refactoring currently accepts only a single open document; multi-file edits, resource operations, and provider commands are not executed. Rename proposals affecting multiple files fail before any edit. The Lua SDK does not yet expose custom inspection providers; the Rust inspection contracts remain available to Rust host extensions and providers.
+
 The public Rust crates are currently experimental. Protocol and extension API compatibility checks are implemented, but this release does not promise a stable compiled-plugin ABI. Extensions should use the manifest and typed host APIs; arbitrary HTML/JavaScript injection, dynamic Rust libraries, and WebAssembly are not supported.
 
 ## Local development

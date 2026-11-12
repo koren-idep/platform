@@ -152,3 +152,20 @@ One local run on 2026-11-11, Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, In
 | Process RSS before/after one active extension | 1 | 4,256 KiB / 4,256 KiB (0 KiB sampled delta) | Immediate `/proc/self/status` samples in the benchmark process; 4 KiB granularity and allocator reuse make this too coarse to infer zero extension overhead |
 
 Panel construction and multiple-command registration are measured as part of the activation transaction rather than as separate isolated timings. These are local microbenchmarks, not desktop interaction distributions. Windows and macOS performance were not measured.
+
+## Phase 8 inspection measurements
+
+Run the reproducible local inspection microbenchmark with:
+
+```sh
+cargo bench --locked -p koren-inspections --bench phase8
+```
+
+One local run on 2026-11-11, Linux x86_64, kernel `7.2.9-310.t2.fc44.x86_64`, Intel Core i7-1068NG7 at 2.30 GHz (8 CPUs), Rust `1.99.1`, optimized Cargo bench profile:
+
+| Workload | Iterations | Mean | Minimum |
+|---|---:|---:|---:|
+| Inspection profile lookup | 100,000 | 29.6 ns | 26 ns |
+| Document inspection and finding ingestion | 500 | 247.3 µs | 193.1 µs |
+
+The document fixture is 200 lines with one text marker per line and one provider executed in the bounded job thread. The measurement includes job dispatch, scanning, result construction, and collection. It is not a desktop responsiveness or project-analysis measurement. Multi-provider merge, project cancellation latency, large-workspace memory, and Problems filtering have not yet been measured.
