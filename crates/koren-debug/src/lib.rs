@@ -39,7 +39,10 @@ const COMMAND_QUEUE_CAPACITY: usize = 128;
 const ADAPTER_QUEUE_CAPACITY: usize = 128;
 const EVENT_QUEUE_CAPACITY: usize = 2_048;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(not(test))]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
@@ -2153,9 +2156,16 @@ mod tests {
             id: "fake".into(),
             name: "Fake DAP".into(),
             command: python.into(),
-            arguments: vec![],
+            arguments: vec![
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fake_adapter.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
             working_directory: root.into(),
-            environment: BTreeMap::new(),
+            environment: [("KOREN_FAKE_DAP_MODE".into(), "normal".into())]
+                .into_iter()
+                .collect(),
         }
     }
     fn configuration(root: &Path) -> DebugConfiguration {
@@ -2231,6 +2241,61 @@ mod tests {
         assert!(manager.unregister_adapter("fake").is_err());
         manager.unregister_configuration("fake.launch").unwrap();
         manager.unregister_adapter("fake").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    struct Allow;
+    impl DebugAuthorizer for Allow {
+        fn authorize_adapter(&mut self, _: &DebugAdapterDefinition) -> bool {
+            true
+        }
+        fn authorize_target(&mut self, _: &DebugConfiguration) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn unanswered_dap_request_times_out_and_fails_only_its_session() {
+        let root = temp_dir();
+        let mut adapter = adapter(&root);
+        adapter
+            .environment
+            .insert("KOREN_FAKE_DAP_MODE".into(), "drop-threads".into());
+        let mut manager = DebugManager::new();
+        manager.register_adapter(adapter).unwrap();
+        manager
+            .register_configuration(configuration(&root))
+            .unwrap();
+        let started = manager.start_session("fake.launch", &mut Allow).unwrap();
+        let session = manager.session(started.session_id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.info().state != DebugSessionState::Paused && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(
+            session.info().state,
+            DebugSessionState::Paused,
+            "{:?}",
+            session.info()
+        );
+        session.threads().unwrap();
+        while session.info().state != DebugSessionState::Failed && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(
+            session.info().state,
+            DebugSessionState::Failed,
+            "{:?}",
+            session.info()
+        );
+        assert!(
+            session
+                .info()
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out"))
+        );
+        manager.shutdown();
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -71,6 +71,8 @@ while True:
     elif command == "setBreakpoints":
         bps = request.get("arguments", {}).get("breakpoints", [])
         response(request, {"breakpoints": [{"verified": True, "line": bp["line"]} for bp in bps]})
+    elif command == "threads" and MODE == "drop-threads":
+        continue
     elif command == "threads":
         response(request, {"threads": [{"id": 1, "name": "fake-main"}]})
     elif command == "stackTrace":
