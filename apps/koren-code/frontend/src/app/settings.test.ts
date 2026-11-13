@@ -30,6 +30,15 @@ describe('typed application settings', () => {
     expect(storage.values.has('koren-code:settings:v1')).toBe(false);
   });
 
+  it('persists interface scale at user and workspace scope', () => {
+    const storage = memoryStorage();
+    let snapshot = writeSetting(storage, 'workbench.uiScale', 110, 'user', null);
+    snapshot = writeSetting(storage, 'workbench.uiScale', 90, 'workspace', '/work');
+    expect(effectiveSetting(snapshot, 'workbench.uiScale', '/work')).toEqual({ value: 90, origin: 'workspace' });
+    expect(effectiveSetting(snapshot, 'workbench.uiScale', '/elsewhere')).toEqual({ value: 110, origin: 'user' });
+    expect(() => writeSetting(storage, 'workbench.uiScale', 130, 'user', null)).toThrow('Invalid value');
+  });
+
   it('searches metadata and filters to values changed at either scope', () => {
     const storage = memoryStorage();
     const snapshot = writeSetting(storage, 'editor.wordWrap', true, 'workspace', '/work');

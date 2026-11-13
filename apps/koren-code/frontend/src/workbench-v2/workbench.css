@@ -165,6 +165,34 @@
 .settings-view .setting-control { flex: 0 0 260px; }
 .settings-view .settings-footer { min-height: 40px; padding: 5px 12px; }
 .settings-view .settings-footer button { min-height: 26px; border-radius: 4px; }
+.settings-view .settings-toolbar { gap: 10px; padding: 8px 18px; }
+.settings-view .settings-toolbar > input[type=search] { height: 32px; }
+.settings-view #settings-advanced { min-height: 29px; padding: 0 10px; border: 1px solid var(--border); border-radius: 5px; color: var(--muted); font-size: 11px; }
+.settings-view #settings-advanced.selected { color: var(--text); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
+.settings-view .settings-content { padding: 22px 28px 30px; }
+.settings-view .settings-content h2 { margin-bottom: 17px; }
+.settings-view .settings-content h3 { margin: 25px 0 11px; }
+.settings-view .setting-row { min-height: 72px; padding: 13px 0; row-gap: 8px; }
+.settings-view .setting-description { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+.settings-view .setting-description strong { font-size: 12px; line-height: 1.4; }
+.settings-view .setting-description p { grid-column: 1; line-height: 1.5; }
+.settings-view .setting-control { grid-template-columns: minmax(90px, 1fr) auto auto; gap: 12px; }
+.settings-view .setting-control input[type=checkbox] { appearance: none; width: 17px; height: 17px; margin: 0; border: 1px solid var(--border-strong); border-radius: 4px; background: var(--input); display: grid; place-content: center; }
+.settings-view .setting-control input[type=checkbox]::before { content: ''; width: 8px; height: 5px; border: solid var(--wb-header); border-width: 0 0 2px 2px; transform: rotate(-45deg) scale(0); transition: transform 90ms ease-out; }
+.settings-view .setting-control input[type=checkbox]:checked { background: var(--accent); border-color: var(--accent); }
+.settings-view .setting-control input[type=checkbox]:checked::before { transform: rotate(-45deg) scale(1); }
+.settings-view .setting-control input[type=checkbox]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.settings-view .setting-control input[type=checkbox]:disabled { opacity: .48; }
+.settings-view .setting-control input[type=range] { accent-color: var(--accent); height: 5px; }
+.settings-view .setting-origin { max-width: none; color: var(--muted); font-size: 10px; }
+.settings-view .setting-reset { min-height: 27px; padding: 0 9px; border-radius: 4px; }
+.settings-view .setting-reset[hidden] { display: none; }
+.settings-view .setting-advanced { grid-column: 1 / -1; margin: 0 0 2px; color: var(--muted); font-size: 10px; }
+.settings-view .setting-advanced summary { width: fit-content; cursor: pointer; }
+.settings-view .setting-metadata { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 8px 10px; margin-top: 7px; border: 1px solid var(--border-soft); border-radius: 5px; background: color-mix(in srgb, var(--panel) 70%, transparent); }
+.settings-view .setting-metadata code { color: var(--muted); }
+.settings-view .setting-metadata button { padding: 3px 7px; border: 1px solid var(--border); border-radius: 4px; font-size: 10px; }
+.settings-view .settings-footer { min-height: 44px; padding: 7px 16px; }
 .settings-preview { max-width: 760px; margin: 14px 0; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: linear-gradient(90deg, color-mix(in srgb, var(--preview-color) 22%, var(--wb-panel)), var(--wb-panel) 60%); }
 .settings-preview-title { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 12px; }
 .project-color-controls { display: flex; align-items: center; gap: 7px; }

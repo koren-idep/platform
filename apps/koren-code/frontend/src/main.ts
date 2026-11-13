@@ -22,7 +22,7 @@ import { automaticProjectColor, hasReadableProjectAccent, PROJECT_COLORS } from 
 import { fileIconMarkup, type WorkspaceEntryKind } from './app/fileIcons';
 import { headerMenusInOverflow } from './app/headerLayout';
 import { UI_COMMANDS } from './app/uiCommands';
-import { effectiveSetting, loadSettings, resetSetting, resetSettings, searchSettings, writeSetting, type SettingDescriptor, type SettingsScope, type SettingsSnapshot } from './app/settings';
+import { effectiveSetting, loadSettings, resetSetting, resetSettings, searchSettings, writeSetting, SETTING_DESCRIPTORS, type SettingDescriptor, type SettingsScope, type SettingsSnapshot } from './app/settings';
 import { taskStatus, visibleOutput } from './app/taskPresentation';
 import { extensionCanActivate, extensionToggleLabel, languageServerEnabled } from './app/extensions';
 import { diagnosticsForRevision, withDiagnosticPublication } from './app/diagnostics';
@@ -97,6 +97,7 @@ let settingsScope: SettingsScope = 'user';
 let settingsCategory = 'Appearance';
 let settingsModifiedOnly = false;
 let settingsQuery = '';
+let settingsAdvanced = localStorage.getItem('koren-code:settings-advanced') === 'true';
 let settingsTabOpen = false;
 let settingsTabActive = false;
 const settingsHistory = ['Appearance'];
@@ -1171,6 +1172,9 @@ function applySettingsPreferences(): void {
   const theme = effectiveSetting(settingsSnapshot, 'appearance.theme', workspaceRoot || null).value;
   setTheme(theme === 'light' ? 'light' : 'dark', false);
   document.documentElement.dataset.density = String(effectiveSetting(settingsSnapshot, 'workbench.density', workspaceRoot || null).value);
+  const uiScale = Number(effectiveSetting(settingsSnapshot, 'workbench.uiScale', workspaceRoot || null).value) / 100;
+  document.documentElement.style.setProperty('--koren-ui-scale', String(uiScale));
+  document.documentElement.style.zoom = `${uiScale * 100}%`;
   document.documentElement.dataset.toolbarVisible = String(effectiveSetting(settingsSnapshot, 'workbench.toolbarVisible', workspaceRoot || null).value);
   const showMenuBar = Boolean(effectiveSetting(settingsSnapshot, 'appearance.classicMenu', null).value);
   document.querySelector('.workbench-v2')!.classList.toggle('menu-labels-hidden', !showMenuBar);
@@ -1252,6 +1256,14 @@ function renderProjectIdentityPreview(color: string, icon: string, style: string
   title.append(mark, name);
 }
 
+function adjustEditorFontSize(action: 'increase' | 'decrease' | 'reset'): void {
+  const descriptor = SETTING_DESCRIPTORS.find((setting) => setting.id === 'editor.fontSize');
+  if (!descriptor || descriptor.type !== 'integer' || !descriptor.scopes.includes(settingsScope) || (settingsScope === 'workspace' && !workspaceRoot)) return;
+  const current = Number(effectiveSetting(settingsSnapshot, 'editor.fontSize', workspaceRoot || null).value);
+  const next = action === 'reset' ? descriptor.defaultValue : Math.max(descriptor.minimum, Math.min(descriptor.maximum, current + (action === 'increase' ? 1 : -1)));
+  writeDescriptorValue(descriptor, next);
+}
+
 function renderSettings(): void {
   const categories = document.querySelector<HTMLElement>('#settings-categories');
   const builtins = document.querySelector<HTMLElement>('#settings-builtins');
@@ -1259,6 +1271,8 @@ function renderSettings(): void {
   settingsQuery = document.querySelector<HTMLInputElement>('#settings-search')?.value ?? settingsQuery;
   settingsModifiedOnly = document.querySelector<HTMLInputElement>('#settings-modified')?.checked ?? settingsModifiedOnly;
   settingsScope = (document.querySelector<HTMLSelectElement>('#settings-scope')?.value ?? settingsScope) as SettingsScope;
+  const advanced = document.querySelector<HTMLButtonElement>('#settings-advanced');
+  if (advanced) { advanced.setAttribute('aria-pressed', String(settingsAdvanced)); advanced.classList.toggle('selected', settingsAdvanced); }
   categories.replaceChildren();
   for (const category of settingsCategories) {
     const button = document.createElement('button');
@@ -1353,7 +1367,7 @@ function renderSettingRow(descriptor: SettingDescriptor): HTMLElement {
   const title = document.createElement('strong'); title.textContent = descriptor.title;
   const id = document.createElement('code'); id.textContent = descriptor.id;
   const help = document.createElement('p'); help.textContent = descriptor.description;
-  description.append(title, id, help);
+  description.append(title, help);
   const effective = effectiveSetting(settingsSnapshot, descriptor.id, workspaceRoot || null);
   const stored = settingsScope === 'user' ? settingsSnapshot.user[descriptor.id] : (workspaceRoot ? settingsSnapshot.workspaces[workspaceRoot]?.[descriptor.id] : undefined);
   const value = descriptor.id === 'appearance.projectIdentity.color' && stored === undefined && workspaceRoot
@@ -1421,14 +1435,29 @@ function renderSettingRow(descriptor: SettingDescriptor): HTMLElement {
   const origin = document.createElement('span'); origin.className = 'setting-origin';
   const originLabel = descriptor.id === 'appearance.projectIdentity.color' && stored === undefined && workspaceRoot && Boolean(effectiveSetting(settingsSnapshot, 'appearance.projectColors.autoAssign', null).value)
     ? 'automatic workspace color' : effective.origin;
-  origin.textContent = `Effective: ${originLabel}${settingsScope === 'workspace' && !workspaceRoot ? ' · open a workspace to edit' : ''}`;
-  const reset = document.createElement('button'); reset.type = 'button'; reset.textContent = 'Reset'; reset.disabled = stored === undefined || !descriptor.scopes.includes(settingsScope) || (settingsScope === 'workspace' && !workspaceRoot) || settingsData.invalid;
+  const modified = stored !== undefined;
+  row.classList.toggle('modified', modified);
+  origin.textContent = modified ? (settingsScope === 'workspace' ? 'Workspace override' : 'Customized') : 'Using default';
+  const reset = document.createElement('button'); reset.type = 'button'; reset.textContent = 'Reset'; reset.className = 'setting-reset'; reset.hidden = !modified; reset.disabled = !modified || !descriptor.scopes.includes(settingsScope) || (settingsScope === 'workspace' && !workspaceRoot) || settingsData.invalid;
   reset.addEventListener('click', () => {
     try { settingsSnapshot = resetSetting(localStorage, descriptor.id, settingsScope, workspaceRoot || null); settingsData = { snapshot: settingsSnapshot, invalid: false }; applySettingsPreferences(); renderSettings(); }
     catch (error) { showError(error); }
   });
   if (descriptor.type !== 'color') controls.append(control);
-  controls.append(origin, reset); row.append(description, controls); return row;
+  controls.append(origin, reset);
+  let advancedDetails: HTMLDetailsElement | null = null;
+  if (settingsAdvanced) {
+    const details = document.createElement('details'); details.className = 'setting-advanced'; advancedDetails = details;
+    const summary = document.createElement('summary'); summary.textContent = 'Details';
+    const metadata = document.createElement('div'); metadata.className = 'setting-metadata';
+    const settingId = document.createElement('code'); settingId.textContent = descriptor.id;
+    const copyId = document.createElement('button'); copyId.type = 'button'; copyId.textContent = 'Copy ID'; copyId.addEventListener('click', () => void navigator.clipboard.writeText(descriptor.id).catch(() => setStatus('Clipboard access is unavailable.')));
+    const info = document.createElement('span'); info.textContent = `Default: ${descriptor.defaultValue} · Source: ${originLabel} · Owner: ${descriptor.owner}${descriptor.requiresRestart ? ' · Restart required' : ''}`;
+    metadata.append(settingId, copyId, info); details.append(summary, metadata);
+  }
+  row.append(description, controls);
+  if (advancedDetails) row.append(advancedDetails);
+  return row;
 }
 
 function choiceLabel(choice: string): string {
@@ -2574,6 +2603,12 @@ document.addEventListener('keydown', (event) => {
     const shortcut = [...commandMetadata.entries()].find(([_, metadata]) => metadata.enabled && metadata.shortcut && commandShortcutMatches(event, metadata.shortcut));
     if (shortcut) { event.preventDefault(); void executeCommand(shortcut[0]); return; }
   }
+  const target = event.target as HTMLElement;
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && target.closest('.cm-editor')) {
+    if (event.key === '=' || event.key === '+') { event.preventDefault(); adjustEditorFontSize('increase'); return; }
+    if (event.key === '-') { event.preventDefault(); adjustEditorFontSize('decrease'); return; }
+    if (event.key === '0') { event.preventDefault(); adjustEditorFontSize('reset'); return; }
+  }
   if ((event.ctrlKey || event.metaKey) && event.key === '`') { event.preventDefault(); if (layout.bottomCollapsed || !document.querySelector<HTMLButtonElement>('[data-panel="terminal"]')!.classList.contains('selected')) showPanel('terminal'); else setBottomCollapsed(true); }
   else if (event.key === 'Escape' && settingsTabActive) { event.preventDefault(); closeSettingsTab(); }
   else if (event.key === 'Escape') for (const menu of document.querySelectorAll<HTMLDetailsElement>('.menu-group[open]')) { menu.open = false; menu.querySelector('summary')?.focus(); }
@@ -2623,6 +2658,12 @@ document.querySelector<HTMLSelectElement>('#settings-scope')!.addEventListener('
 });
 document.querySelector<HTMLInputElement>('#settings-modified')!.addEventListener('change', (event) => {
   settingsModifiedOnly = (event.currentTarget as HTMLInputElement).checked;
+  renderSettings();
+});
+document.querySelector<HTMLButtonElement>('#settings-advanced')!.addEventListener('click', (event) => {
+  settingsAdvanced = !settingsAdvanced;
+  localStorage.setItem('koren-code:settings-advanced', String(settingsAdvanced));
+  (event.currentTarget as HTMLButtonElement).setAttribute('aria-pressed', String(settingsAdvanced));
   renderSettings();
 });
 document.querySelector<HTMLButtonElement>('#settings-reset-category')!.addEventListener('click', () => {

@@ -102,7 +102,7 @@ kbd {
   border-radius: 4px; background: var(--raised); color: var(--muted); text-align: center;
   font: 10px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space: nowrap;
 }
-#app { height: 100vh; min-height: 360px; display: flex; flex-direction: column; }
+#app { width: calc(100vw / var(--koren-ui-scale, 1)); height: calc(100vh / var(--koren-ui-scale, 1)); min-height: 360px; display: flex; flex-direction: column; }
 
 /* Native window contents: menu and toolbar */
 .menu-bar { height: 30px; min-height: 30px; display: flex; align-items: center; gap: 11px; padding: 0 14px; background: var(--bg); }
