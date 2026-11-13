@@ -414,6 +414,15 @@ pub enum RequestMethod {
     },
     /// List projects in the current workspace.
     ListProjects,
+    /// Discover projects through every registered provider using bounded filesystem inspection.
+    DiscoverRegisteredProjects {
+        /// Maximum directories inspected by each provider.
+        max_directories: usize,
+        /// Maximum candidates returned by each provider.
+        max_projects: usize,
+        /// Maximum directory nesting, with workspace root at depth zero.
+        max_depth: usize,
+    },
     /// Explicitly discover projects using a bounded marker-file provider.
     DiscoverProjects {
         /// Registered provider identifier.

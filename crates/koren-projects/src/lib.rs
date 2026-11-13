@@ -217,6 +217,21 @@ impl Default for DiscoveryLimits {
         }
     }
 }
+impl DiscoveryLimits {
+    fn validate_bounded(self) -> Result<(), ProjectError> {
+        if self.max_directories == 0
+            || self.max_directories > 10_000
+            || self.max_projects == 0
+            || self.max_projects > 1_000
+            || self.max_depth > 32
+        {
+            return Err(ProjectError::Invalid(
+                "project discovery limits must be within 1–10,000 directories, 1–1,000 projects, and depth 0–32".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Owns project records and FIFO project lifecycle events.
 pub struct ProjectManager {
@@ -286,6 +301,38 @@ impl ProjectManager {
             ProjectError::Invalid(format!("provider '{}' is not registered", id.as_str()))
         })?;
         let specs = provider.discover_candidates(workspace, limits)?;
+        specs
+            .into_iter()
+            .map(|spec| self.register_discovered(workspace, spec))
+            .collect()
+    }
+    /// Discovers projects using every registered provider with the same bounded traversal.
+    ///
+    /// Candidate inspection completes before registrations are changed, so a provider scan
+    /// failure does not leave a partially discovered set. Existing project roots are reused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid limits, workspace failures, or invalid provider candidates.
+    pub fn discover_all_registered(
+        &mut self,
+        workspace: &WorkspaceManager,
+        limits: DiscoveryLimits,
+    ) -> Result<Vec<ProjectId>, ProjectError> {
+        limits.validate_bounded()?;
+        let specs = self
+            .providers
+            .values()
+            .map(|provider| provider.discover_candidates(workspace, limits))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if specs.len() > limits.max_projects {
+            return Err(ProjectError::Invalid(
+                "project discovery result limit exceeded across registered providers".into(),
+            ));
+        }
         specs
             .into_iter()
             .map(|spec| self.register_discovered(workspace, spec))
@@ -639,6 +686,99 @@ mod tests {
                         max_projects: 4,
                         max_depth: 9
                     }
+                )
+                .is_err()
+        );
+        assert_eq!(bounded.list().len(), 0);
+    }
+    #[test]
+    fn provider_wide_discovery_rejects_limits_above_host_bounds() {
+        let (_temporary, workspace) = setup();
+        let mut manager = ProjectManager::new();
+        manager
+            .register_provider(Box::new(MarkerFileProvider::new(
+                ProviderId::new("fixture").unwrap(),
+                "marker",
+            )))
+            .unwrap();
+        assert!(
+            manager
+                .discover_all_registered(
+                    &workspace,
+                    DiscoveryLimits {
+                        max_directories: usize::MAX,
+                        max_projects: 1,
+                        max_depth: 32,
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(manager.list().len(), 0);
+    }
+    #[test]
+    fn all_registered_providers_are_scanned_and_refresh_reuses_project_roots() {
+        let (temporary, workspace) = setup();
+        fs::create_dir(temporary.0.join("alpha")).unwrap();
+        fs::create_dir(temporary.0.join("beta")).unwrap();
+        fs::write(
+            temporary.0.join("alpha/alpha.project"),
+            "opaque configuration",
+        )
+        .unwrap();
+        fs::write(
+            temporary.0.join("beta/beta.project"),
+            "opaque configuration",
+        )
+        .unwrap();
+        let alpha = ProviderId::new("alpha").unwrap();
+        let beta = ProviderId::new("beta").unwrap();
+        let mut manager = ProjectManager::new();
+        manager
+            .register_provider(Box::new(MarkerFileProvider::new(alpha, "alpha.project")))
+            .unwrap();
+        manager
+            .register_provider(Box::new(MarkerFileProvider::new(beta, "beta.project")))
+            .unwrap();
+
+        let first = manager
+            .discover_all_registered(&workspace, DiscoveryLimits::default())
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        let providers = manager
+            .list()
+            .into_iter()
+            .map(|project| project.provider_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(providers, ["alpha", "beta"].into_iter().collect());
+        assert_eq!(
+            manager
+                .discover_all_registered(&workspace, DiscoveryLimits::default())
+                .unwrap(),
+            first
+        );
+        assert_eq!(manager.list().len(), 2);
+
+        let mut bounded = ProjectManager::new();
+        bounded
+            .register_provider(Box::new(MarkerFileProvider::new(
+                ProviderId::new("alpha").unwrap(),
+                "alpha.project",
+            )))
+            .unwrap();
+        bounded
+            .register_provider(Box::new(MarkerFileProvider::new(
+                ProviderId::new("beta").unwrap(),
+                "beta.project",
+            )))
+            .unwrap();
+        assert!(
+            bounded
+                .discover_all_registered(
+                    &workspace,
+                    DiscoveryLimits {
+                        max_projects: 1,
+                        ..DiscoveryLimits::default()
+                    },
                 )
                 .is_err()
         );
