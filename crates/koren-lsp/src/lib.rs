@@ -323,6 +323,7 @@ pub enum ServerEvent {
 #[derive(Default, Debug)]
 pub struct LspDocumentSync {
     documents: BTreeMap<DocumentId, SyncedDocument>,
+    next_version: i32,
 }
 
 #[derive(Debug)]
@@ -357,7 +358,11 @@ impl LspDocumentSync {
             return Err(LspError::DocumentAlreadyOpen(id.0));
         }
         let uri = uri.into();
-        let version = 1;
+        let version = self
+            .next_version
+            .checked_add(1)
+            .ok_or(LspError::VersionExhausted)?;
+        self.next_version = version;
         self.documents.insert(
             id,
             SyncedDocument {
@@ -389,7 +394,7 @@ impl LspDocumentSync {
     ) -> Result<SyncNotification, LspError> {
         let document = self
             .documents
-            .get_mut(&id)
+            .get(&id)
             .ok_or(LspError::DocumentNotOpen(id.0))?;
         if snapshot.info.revision <= document.revision {
             return Err(LspError::StaleDocumentRevision {
@@ -398,10 +403,16 @@ impl LspDocumentSync {
                 received: snapshot.info.revision,
             });
         }
-        document.version = document
-            .version
+        let version = self
+            .next_version
             .checked_add(1)
             .ok_or(LspError::VersionExhausted)?;
+        self.next_version = version;
+        let document = self
+            .documents
+            .get_mut(&id)
+            .ok_or(LspError::DocumentNotOpen(id.0))?;
+        document.version = version;
         document.revision = snapshot.info.revision;
         Ok(SyncNotification {
             method: "textDocument/didChange",
@@ -2016,6 +2027,25 @@ mod tests {
         );
         assert_eq!(sync.close(id).unwrap().method, "textDocument/didClose");
         assert!(sync.version(id).is_none());
+        let reopened = sync
+            .open(
+                DocumentId(8),
+                "file:///demo",
+                "demo",
+                &snapshot(0, "new contents"),
+            )
+            .unwrap();
+        assert_eq!(reopened.params["textDocument"]["version"], 3);
+        assert_eq!(sync.version(DocumentId(8)), Some((3, 0)));
+        assert!(
+            !VersionedResult {
+                uri: "file:///demo".into(),
+                document_version: 1,
+                value: ()
+            }
+            .is_current(3),
+            "a delayed diagnostic from the previous open must not match the reopened document"
+        );
     }
 
     #[test]
