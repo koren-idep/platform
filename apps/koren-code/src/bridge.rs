@@ -153,13 +153,16 @@ pub struct DesktopEvent {
 
 pub(crate) enum BackendCommand {
     Request(Box<Request>, Sender<Response>),
+    #[cfg(test)]
     Subscribe(SyncSender<Vec<DesktopEvent>>),
+    SubscribeOnce(SyncSender<Vec<DesktopEvent>>),
     Shutdown,
 }
 
 struct EventSubscriber {
     sender: SyncSender<Vec<DesktopEvent>>,
     pending: Option<Vec<DesktopEvent>>,
+    once: bool,
 }
 
 pub(crate) type BackendSender = Sender<BackendCommand>;
@@ -193,12 +196,22 @@ pub(crate) fn send_request(sender: &BackendSender, request: Request) -> Result<R
         .map_err(|error| format!("platform request did not complete: {error}"))
 }
 
+#[cfg(test)]
 pub(crate) fn subscribe(
     sender: &BackendSender,
     events: SyncSender<Vec<DesktopEvent>>,
 ) -> Result<(), String> {
     sender
         .send(BackendCommand::Subscribe(events))
+        .map_err(|_| "platform worker stopped".to_owned())
+}
+
+pub(crate) fn subscribe_once(
+    sender: &BackendSender,
+    events: SyncSender<Vec<DesktopEvent>>,
+) -> Result<(), String> {
+    sender
+        .send(BackendCommand::SubscribeOnce(events))
         .map_err(|_| "platform worker stopped".to_owned())
 }
 
@@ -230,11 +243,24 @@ fn backend_loop_with_state(receiver: Receiver<BackendCommand>, mut state: Deskto
                     let _ = reply.send(state.dispatch(*request));
                 }
             }
+            #[cfg(test)]
             Ok(BackendCommand::Subscribe(sender)) => {
                 if subscribers.len() < 8 {
                     subscribers.push(EventSubscriber {
                         sender,
                         pending: None,
+                        once: false,
+                    });
+                } else {
+                    let _ = sender.try_send(Vec::new());
+                }
+            }
+            Ok(BackendCommand::SubscribeOnce(sender)) => {
+                if subscribers.len() < 8 {
+                    subscribers.push(EventSubscriber {
+                        sender,
+                        pending: None,
+                        once: true,
                     });
                 } else {
                     let _ = sender.try_send(Vec::new());
@@ -249,6 +275,7 @@ fn backend_loop_with_state(receiver: Receiver<BackendCommand>, mut state: Deskto
         subscribers.retain_mut(|subscriber| {
             if let Some(pending) = subscriber.pending.as_ref() {
                 match subscriber.sender.try_send(pending.clone()) {
+                    Ok(()) if subscriber.once => return false,
                     Ok(()) => subscriber.pending = None,
                     Err(TrySendError::Full(_)) => return true,
                     Err(TrySendError::Disconnected(_)) => return false,
@@ -272,7 +299,7 @@ fn backend_loop_with_state(receiver: Receiver<BackendCommand>, mut state: Deskto
         if !subscribers.is_empty() {
             subscribers.retain_mut(
                 |subscriber| match subscriber.sender.try_send(events.clone()) {
-                    Ok(()) => true,
+                    Ok(()) => !subscriber.once,
                     Err(TrySendError::Full(events)) => {
                         subscriber.pending = Some(events);
                         true
@@ -6374,6 +6401,35 @@ mod tests {
                 .any(|event| event.kind == "git_operation_completed" && event.commit.is_some())
         );
         backend.shutdown();
+    }
+
+    #[test]
+    fn one_shot_event_subscriptions_release_their_sender_after_delivery() {
+        let temp = Temp::new();
+        let backend = spawn_backend();
+        let mut request_id = 0;
+        let (events, receiver) = mpsc::sync_channel(2);
+        subscribe_once(&backend, events).unwrap();
+        call_backend(
+            &backend,
+            &mut request_id,
+            RequestMethod::OpenWorkspace {
+                path: temp.0.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+        let first = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(first.iter().any(|event| event.kind == "workspace_opened"));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(5)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        let (events, receiver) = mpsc::sync_channel(2);
+        subscribe_once(&backend, events).unwrap();
+        call_backend(&backend, &mut request_id, RequestMethod::CloseWorkspace).unwrap();
+        let second = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(second.iter().any(|event| event.kind == "workspace_closed"));
+        shutdown(&backend);
     }
 
     #[test]

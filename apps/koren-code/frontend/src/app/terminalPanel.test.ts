@@ -64,6 +64,29 @@ describe('integrated terminal panel', () => {
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn(async () => {}), readText: vi.fn(async () => 'paste') } });
   });
 
+  it('retains output received before the approved session response', async () => {
+    let finish!: (value: unknown) => void;
+    const pending = new Promise((resolve) => { finish = resolve; });
+    const client = { call: vi.fn(async (request: { method: string }) => {
+      if (request.method === 'request_terminal_start') return { kind: 'terminal_approval_required', value: approval };
+      if (request.method === 'approve_terminal_start') return pending;
+      return { kind: 'terminal_action', value: { session_id: 1 } };
+    }) } as unknown as KorenClient;
+    const { TerminalPanel } = await import('./terminal');
+    const panel = new TerminalPanel(document.querySelector<HTMLElement>('#terminal')!, client);
+    await panel.open();
+    const form = document.querySelector<HTMLFormElement>('#terminal-approval-dialog form')!;
+    form.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: form.querySelector<HTMLButtonElement>('[value="approve"]') }));
+    const bytes = new TextEncoder().encode('early prompt');
+    panel.handleEvents([{ kind: 'terminal_output', terminal_id: 1, sequence: 1, data_base64: encodeTerminalBytes(bytes) }]);
+    finish({ kind: 'terminal_approved', value: { request_id: 11, session: session(1) } });
+    await vi.waitFor(() => expect(document.querySelectorAll('.terminal-session-tab')).toHaveLength(1));
+    const terminal = terminalMocks.instances[0] as { output: Uint8Array[] };
+    expect(terminal.output.map((chunk) => Array.from(chunk))).toEqual([Array.from(bytes)]);
+    panel.handleEvents([{ kind: 'terminal_output', terminal_id: 1, sequence: 2, data_base64: encodeTerminalBytes(bytes) }]);
+    expect(document.querySelector('[data-terminal-status]')?.textContent).not.toContain('sequence gap');
+  });
+
   it('approves sessions, batches input, renders ordered bytes, switches, renames, and closes live tabs', async () => {
     const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
     let nextSessionId = 1;

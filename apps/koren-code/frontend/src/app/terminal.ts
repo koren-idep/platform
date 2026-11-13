@@ -24,11 +24,16 @@ interface TerminalTab {
 
 const MAX_TERMINAL_INPUT_BYTES = 64 * 1024;
 const MAX_PENDING_INPUT_BYTES = 1024 * 1024;
+const MAX_STARTUP_EVENTS = 512;
+const MAX_STARTUP_EVENT_BYTES = 2 * 1024 * 1024;
 
 export class TerminalPanel {
   private readonly tabs = new Map<number, TerminalTab>();
   private activeId: number | null = null;
   private pendingApproval: TerminalApprovalSummary | null = null;
+  private startingSessions = 0;
+  private startupEvents: PlatformEvent[] = [];
+  private startupEventBytes = 0;
   private readonly tabsHost: HTMLElement;
   private readonly viewsHost: HTMLElement;
   private readonly status: HTMLElement;
@@ -54,7 +59,12 @@ export class TerminalPanel {
     for (const event of events) {
       if (!event.terminal_id) continue;
       const tab = this.tabs.get(event.terminal_id);
-      if (!tab) continue;
+      if (!tab) {
+        if (this.startingSessions > 0 && this.startupEvents.length < MAX_STARTUP_EVENTS && this.startupEventBytes + (event.data_base64?.length ?? 0) <= MAX_STARTUP_EVENT_BYTES) {
+          this.startupEvents.push(event); this.startupEventBytes += event.data_base64?.length ?? 0;
+        } else if (this.startingSessions > 0) this.setStatus('Terminal startup output exceeded the buffer limit.');
+        continue;
+      }
       if (event.kind === 'terminal_output' && event.data_base64) {
         if (event.sequence === undefined) continue;
         const order = terminalSequenceOrder(tab.lastSequence, event.sequence);
@@ -119,11 +129,20 @@ export class TerminalPanel {
   }
 
   private async approve(approval: TerminalApprovalSummary): Promise<void> {
+    this.startingSessions += 1;
     try {
       const response = await this.client.call({ method: 'approve_terminal_start', params: { request_id: approval.request_id } });
       if (response.kind !== 'terminal_approved') throw new Error('The shell did not start.');
       this.addSession(response.value.session);
+      const events = this.startupEvents.filter((event) => event.terminal_id === response.value.session.session_id);
+      this.startupEvents = this.startupEvents.filter((event) => event.terminal_id !== response.value.session.session_id);
+      this.startupEventBytes = this.startupEvents.reduce((total, event) => total + (event.data_base64?.length ?? 0), 0);
+      this.handleEvents(events);
     } catch (error) { this.setStatus(error instanceof Error ? error.message : String(error)); }
+    finally {
+      this.startingSessions -= 1;
+      if (this.startingSessions === 0) { this.startupEvents = []; this.startupEventBytes = 0; }
+    }
   }
 
   private async deny(approval: TerminalApprovalSummary): Promise<void> {
