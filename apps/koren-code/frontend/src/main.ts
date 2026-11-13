@@ -24,6 +24,7 @@ import { languageForPath, languageIdForPath, languageNameForPath } from './edito
 import { flushAndSave } from './editor/save';
 import { languageServiceExtensions } from './editor/languageServices';
 import { debugGutter } from './editor/debugGutter';
+import { absoluteDebugSourcePath } from './editor/debugSource';
 import './styles/main.css';
 
 const client = new KorenClient(createDesktopTransport());
@@ -510,7 +511,7 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
   const lineSeparator = lineEnding === 'CRLF' ? '\r\n' : '\n';
   const languageExtensions = await languageForPath(tab.path);
   const languageConfig = new Compartment();
-  const gutter = debugGutter(tab.path,
+  const gutter = debugGutter(absoluteDebugSourcePath(workspaceRoot, tab.path),
     (source, line) => debugPanel?.breakpointState(source, line) ?? null,
     (source) => debugPanel?.executionLine(source) ?? null,
     (source, line) => { void loadDebugPanel().then(() => debugPanel?.toggleBreakpoint(source, line)).catch(showError); });
