@@ -31,6 +31,7 @@ export class TerminalPanel {
   private readonly tabs = new Map<number, TerminalTab>();
   private activeId: number | null = null;
   private pendingApproval: TerminalApprovalSummary | null = null;
+  private restartTargetId: number | null = null;
   private startingSessions = 0;
   private startupEvents: PlatformEvent[] = [];
   private startupEventBytes = 0;
@@ -52,7 +53,7 @@ export class TerminalPanel {
       const response = await this.client.call({ method: 'request_terminal_start' });
       if (response.kind !== 'terminal_approval_required') throw new Error('The terminal approval request was not returned.');
       this.showApproval(response.value);
-    } catch (error) { this.setStatus(error instanceof Error ? error.message : String(error)); }
+    } catch (error) { this.restartTargetId = null; this.setStatus(error instanceof Error ? error.message : String(error)); }
   }
 
   handleEvents(events: PlatformEvent[]): void {
@@ -91,7 +92,10 @@ export class TerminalPanel {
     this.root.querySelector<HTMLButtonElement>('[data-terminal-new]')!.addEventListener('click', () => void this.open());
     this.root.querySelector<HTMLButtonElement>('[data-terminal-rename]')!.addEventListener('click', () => this.renameActive());
     this.root.querySelector<HTMLButtonElement>('[data-terminal-close]')!.addEventListener('click', () => void this.closeActive());
-    this.root.querySelector<HTMLButtonElement>('[data-terminal-restart]')!.addEventListener('click', () => void this.open());
+    this.root.querySelector<HTMLButtonElement>('[data-terminal-restart]')!.addEventListener('click', () => {
+      this.restartTargetId = this.activeId;
+      void this.open();
+    });
     this.approvalDialog.querySelector<HTMLFormElement>('form')!.addEventListener('submit', (event) => {
       event.preventDefault();
       const choice = (event.submitter as HTMLButtonElement | null)?.value;
@@ -134,11 +138,20 @@ export class TerminalPanel {
       const response = await this.client.call({ method: 'approve_terminal_start', params: { request_id: approval.request_id } });
       if (response.kind !== 'terminal_approved') throw new Error('The shell did not start.');
       this.addSession(response.value.session);
+      if (this.restartTargetId !== null) {
+        const previousId = this.restartTargetId;
+        this.restartTargetId = null;
+        const previous = this.tabs.get(previousId);
+        if (previous) {
+          await this.client.call({ method: 'close_terminal', params: { session_id: previousId, terminate_active: previous.summary.process_group_active } });
+          this.removeTab(previousId);
+        }
+      }
       const events = this.startupEvents.filter((event) => event.terminal_id === response.value.session.session_id);
       this.startupEvents = this.startupEvents.filter((event) => event.terminal_id !== response.value.session.session_id);
       this.startupEventBytes = this.startupEvents.reduce((total, event) => total + (event.data_base64?.length ?? 0), 0);
       this.handleEvents(events);
-    } catch (error) { this.setStatus(error instanceof Error ? error.message : String(error)); }
+    } catch (error) { this.restartTargetId = null; this.setStatus(error instanceof Error ? error.message : String(error)); }
     finally {
       this.startingSessions -= 1;
       if (this.startingSessions === 0) { this.startupEvents = []; this.startupEventBytes = 0; }
@@ -146,6 +159,7 @@ export class TerminalPanel {
   }
 
   private async deny(approval: TerminalApprovalSummary): Promise<void> {
+    this.restartTargetId = null;
     try { await this.client.call({ method: 'deny_terminal_start', params: { request_id: approval.request_id } }); }
     catch (error) { this.setStatus(error instanceof Error ? error.message : String(error)); }
   }

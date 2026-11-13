@@ -167,4 +167,30 @@ describe('integrated terminal panel', () => {
     document.querySelector<HTMLButtonElement>('[data-terminal-close]')!.click();
     await vi.waitFor(() => expect(calls.some((item) => item.method === 'close_terminal' && item.params?.terminate_active === true)).toBe(true));
   });
+
+  it('restarts an exited terminal by replacing the old session after approval', async () => {
+    const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+    let nextSessionId = 1;
+    const client = { call: vi.fn(async (request: { method: string; params?: Record<string, unknown> }) => {
+      calls.push(request);
+      if (request.method === 'request_terminal_start') return { kind: 'terminal_approval_required', value: { ...approval, request_id: nextSessionId } };
+      if (request.method === 'approve_terminal_start') return { kind: 'terminal_approved', value: { request_id: request.params?.request_id, session: session(nextSessionId++) } };
+      return { kind: 'terminal_action', value: { session_id: request.params?.session_id ?? 1 } };
+    }) } as unknown as KorenClient;
+    const { TerminalPanel } = await import('./terminal');
+    const panel = new TerminalPanel(document.querySelector<HTMLElement>('#terminal')!, client);
+    document.querySelector<HTMLButtonElement>('[data-terminal-new]')!.click();
+    await vi.waitFor(() => expect(document.querySelector<HTMLDialogElement>('#terminal-approval-dialog')!.open).toBe(true));
+    const form = document.querySelector<HTMLFormElement>('#terminal-approval-dialog form')!;
+    const submit = () => form.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: form.querySelector<HTMLButtonElement>('[value="approve"]') }));
+    submit();
+    await vi.waitFor(() => expect(document.querySelectorAll('.terminal-session-tab')).toHaveLength(1));
+    panel.handleEvents([{ kind: 'terminal_state_changed', terminal_id: 1, terminal_state: 'exited', terminal_process_group_active: false }]);
+    document.querySelector<HTMLButtonElement>('[data-terminal-restart]')!.click();
+    await vi.waitFor(() => expect(document.querySelector<HTMLDialogElement>('#terminal-approval-dialog')!.open).toBe(true));
+    submit();
+    await vi.waitFor(() => expect(calls.some((call) => call.method === 'close_terminal' && call.params?.session_id === 1)).toBe(true));
+    await vi.waitFor(() => expect(document.querySelectorAll('.terminal-session-tab')).toHaveLength(1));
+    expect(document.querySelector('.terminal-session-tab.selected')?.textContent).not.toContain('exited');
+  });
 });
