@@ -17,6 +17,7 @@ import { formatCursorPosition, lineEndingFor } from './app/status';
 import { runConfigurationTasks, selectedRunTask } from './app/toolbar';
 import { gitRepositoryChoices, groupSearchMatches, normalizedCommitMessage, partitionGitFiles, searchSummaryText } from './app/developerTools';
 import { nextTheme, persistTheme, readTheme } from './app/theme';
+import { windowActionMessage, type WindowAction } from './app/windowControls';
 import { effectiveSetting, loadSettings, resetSetting, resetSettings, searchSettings, writeSetting, type SettingDescriptor, type SettingsScope, type SettingsSnapshot } from './app/settings';
 import { taskStatus, visibleOutput } from './app/taskPresentation';
 import { extensionCanActivate, extensionToggleLabel, languageServerEnabled } from './app/extensions';
@@ -40,6 +41,16 @@ interface RecoverySnapshot { schema_version: number; id: string; workspace: stri
 interface RecoverySummary { id: string; workspace: string; path: string; revision: number; updated_at_ms: number; byte_length: number }
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = workbenchMarkup;
+
+document.querySelectorAll<HTMLButtonElement>('[data-window-action]').forEach((button) => {
+  button.addEventListener('click', () => {
+    const action = button.dataset.windowAction as WindowAction | undefined;
+    if (action) window.ipc?.postMessage(windowActionMessage(action));
+  });
+});
+document.querySelector<HTMLElement>('.wb-drag-region')!.addEventListener('pointerdown', (event) => {
+  if (event.button === 0) window.ipc?.postMessage(windowActionMessage('drag'));
+});
 
 let terminalPanel: import('./app/terminal').TerminalPanel | null = null;
 let debugPanel: import('./app/debug').DebugPanel | null = null;

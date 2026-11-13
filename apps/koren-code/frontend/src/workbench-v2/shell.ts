@@ -64,7 +64,12 @@ export const workbenchMarkup = `
         <button role="menuitem" data-action="about">About Koren Code Editor</button>
       </div></details>
     </nav></details>
-    <span class="menu-spacer"></span>
+    <span class="wb-drag-region" aria-hidden="true"></span>
+    <div class="window-controls" role="toolbar" aria-label="Window controls">
+      <button type="button" data-window-action="minimize" title="Minimize" aria-label="Minimize"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h10"/></svg></button>
+      <button type="button" data-window-action="toggle_maximize" title="Maximize or restore" aria-label="Maximize or restore"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="3" width="10" height="10" rx=".6"/></svg></button>
+      <button type="button" class="window-close" data-window-action="close" title="Close" aria-label="Close"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8"/></svg></button>
+    </div>
   </div>
   <div class="toolbar" role="toolbar" aria-label="Editor actions">
     <div class="toolbar-group wb-legacy-actions">

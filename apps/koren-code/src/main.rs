@@ -42,7 +42,28 @@ enum UiEvent {
     BackendResponse(Box<koren_protocol::Response>),
     RecoveryResponse(serde_json::Value),
     CloseDecision(bool),
+    WindowAction(WindowAction),
     SmokeExit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowAction {
+    Minimize,
+    ToggleMaximize,
+    RequestClose,
+    BeginDrag,
+}
+
+impl WindowAction {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "minimize" => Some(Self::Minimize),
+            "toggle_maximize" => Some(Self::ToggleMaximize),
+            "close" => Some(Self::RequestClose),
+            "drag" => Some(Self::BeginDrag),
+            _ => None,
+        }
+    }
 }
 
 fn main() {
@@ -58,6 +79,7 @@ fn run(workspace: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = event_loop.create_proxy();
     let window = WindowBuilder::new()
         .with_title("Koren Code Editor")
+        .with_decorations(false)
         .with_inner_size(LogicalSize::new(1260.0, 820.0))
         .with_min_inner_size(LogicalSize::new(680.0, 440.0))
         .build(&event_loop)?;
@@ -124,6 +146,16 @@ fn run(workspace: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
             if message.get("type").and_then(serde_json::Value::as_str) == Some("close_decision") {
                 if let Some(allow) = message.get("allow").and_then(serde_json::Value::as_bool) {
                     let _ = proxy_for_ipc.send_event(UiEvent::CloseDecision(allow));
+                }
+                return;
+            }
+            if message.get("type").and_then(serde_json::Value::as_str) == Some("window_action") {
+                if let Some(action) = message
+                    .get("action")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(WindowAction::parse)
+                {
+                    let _ = proxy_for_ipc.send_event(UiEvent::WindowAction(action));
                 }
                 return;
             }
@@ -300,6 +332,21 @@ fn run(workspace: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
                     *control_flow = ControlFlow::Exit;
                 }
             }
+            Event::UserEvent(UiEvent::WindowAction(action)) => match action {
+                WindowAction::Minimize => window.set_minimized(true),
+                WindowAction::ToggleMaximize => window.set_maximized(!window.is_maximized()),
+                WindowAction::RequestClose => {
+                    if !close_prompt_open {
+                        close_prompt_open = true;
+                        let _ = webview.evaluate_script(
+                            "window.dispatchEvent(new Event('koren-close-request'))",
+                        );
+                    }
+                }
+                WindowAction::BeginDrag => {
+                    let _ = window.drag_window();
+                }
+            },
             Event::UserEvent(UiEvent::SmokeExit) => {
                 bridge::shutdown(&backend);
                 *control_flow = ControlFlow::Exit;
@@ -787,7 +834,7 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> Response<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_disallowed_method, startup_url, workspace_argument};
+    use super::{WindowAction, is_disallowed_method, startup_url, workspace_argument};
     use std::{ffi::OsString, fs};
     use wry::http::Method;
 
@@ -809,6 +856,24 @@ mod tests {
         assert!(is_disallowed_method("/events", &Method::POST));
         assert!(is_disallowed_method("/picker", &Method::POST));
         assert!(is_disallowed_method("/recovery", &Method::DELETE));
+    }
+
+    #[test]
+    fn window_actions_accept_only_supported_controls() {
+        assert_eq!(
+            WindowAction::parse("minimize"),
+            Some(WindowAction::Minimize)
+        );
+        assert_eq!(
+            WindowAction::parse("toggle_maximize"),
+            Some(WindowAction::ToggleMaximize)
+        );
+        assert_eq!(
+            WindowAction::parse("close"),
+            Some(WindowAction::RequestClose)
+        );
+        assert_eq!(WindowAction::parse("drag"), Some(WindowAction::BeginDrag));
+        assert_eq!(WindowAction::parse("quit"), None);
     }
 
     #[test]
