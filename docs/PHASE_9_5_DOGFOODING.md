@@ -1,56 +1,57 @@
-# Phase 9.5 dogfooding record
+# Phase 9.5 dogfooding and reliability record
 
-## Scope and verification
+## Scope and method
 
-The editor was opened on an isolated disposable worktree of the Koren source repository. Interactive checks used the Linux WebKitGTK desktop window; automated checks are listed separately below. The source worktree was not used for demonstration edits.
+Interactive checks used Koren Code Editor on Linux x86_64 with WebKitGTK under Xvfb/Openbox. Debugging and language-server workflows used disposable programs and an isolated home directory. No demonstration edits were made in the Koren repository. Interactive acceptance is reported separately from automated checks.
 
-Manual WebKitGTK checks completed:
+Earlier Phase 9.5 checks remain recorded below: project search, Unicode editing and saving, rename with an open tab, root-level Git selection, extension commands, graphical shell approval, and approved Cargo execution were exercised in the desktop window. The root repository selector fix and its frontend regression test are in the earlier Phase 9.5 commit history.
 
-- Opened the Koren repository and browsed its Rust workspace and source tree.
-- Opened a new document, pasted Unicode (`😀` and an em dash) through the system clipboard, saved it, renamed it while its tab was open, edited it again, and verified the final bytes on disk.
-- Ran project search for `gitRepositoryChoices` in the Koren tree; the panel returned 5 matches across 148 files and 9 skipped binary files.
-- Opened Source Control on the rebuilt app, confirmed the root repository appears as `./HEAD`, and saw a clean status in the disposable worktree.
-- Discovered the Cargo workspace and ran `Cargo workspace check` after approving its exact command in the graphical prompt. The first attempt stopped at the documented `tsc: command not found` prerequisite because the fresh worktree had no frontend dependencies. After `npm ci` in that worktree, the approved Cargo task succeeded with exit code 0 in 17.41 s.
-- Opened and approved an integrated shell through the graphical authorization prompt, entered a command, observed streamed output and a successful shell exit. The shell used an isolated temporary home directory.
-- Loaded the bundled Hello and Text Inspection examples, enabled and activated them, and invoked the Hello command through the command palette.
-- Inspected the Git panel and found that a repository at the workspace root could not be selected: its empty relative path collided with the placeholder option. The selector now gives the root repository the explicit relative path `.` and displays its branch. A frontend regression test covers root and nested repositories together.
+## Real GDB DAP
 
-The real-window session did not cover save conflicts, external edits, diagnostic quick fixes, panel resizing, or preference persistence across a desktop restart. Those remain unverified interactively. The root path conversion and rendering are covered by the frontend unit test and the selector was also checked in the rebuilt window.
+GDB 17.2 was verified locally with `gdb --interpreter=dap`; its DAP initialize request succeeded and the build reported Python support. A temporary Rust program was compiled with debug symbols. Koren was configured to start `/usr/bin/gdb --interpreter=dap` with the fixture executable and working directory. The desktop displayed the exact adapter and target details and required explicit approval before launch.
 
-Automated verification completed after the fix:
+The real session initialized, accepted a source breakpoint, launched, stopped at that breakpoint, displayed the source execution line, returned `main::main` in the stack, and showed the local `answer = 40`. Step Over advanced execution; Continue completed the fixture and showed `dap fixture: 80`; a separate Stop ended a session in the `terminated` state. The installed GDB emitted `No source file named ...` and reported a pending breakpoint before the executable was loaded, then resolved and hit it after launch. This is a pre-load diagnostic from GDB, not evidence of a failed breakpoint.
 
-- `python3 scripts/check.py` passed (format, workspace check, architecture, frontend type-check/lint/tests/build).
-- `cargo +1.85.0 check --workspace --locked` passed.
-- `python3 scripts/pr_check.py` passed (strict Clippy, workspace tests and docs, Python tests, frontend checks, clean workspace build, release build, desktop smoke).
-- The focused `developerTools.test.ts` suite passed (4 tests); the full frontend suite passed (50 tests).
+The real window exposed a Koren defect before the successful run: editor tabs carry workspace-relative paths, while the DAP breakpoint API requires an absolute source path. Koren rejected the click with `debug breakpoint source must be absolute`. The frontend now resolves workspace-relative source paths before requesting breakpoints; focused tests cover Unix paths, Windows paths, and rejection of a relative workspace root. Fix committed as `82f935b` (`fix(debug): resolve workspace paths for breakpoints`).
 
-## Environment limits
+This verifies GDB 17.2's native DAP launch path on this Linux host. Other DAP adapters and Windows/macOS desktop behavior were not tested.
 
-`rust-analyzer` is not installed as a component of the active Rust toolchain, so no real rust-analyzer session, live diagnostics, or code-action workflow was verified. Rust syntax highlighting and Cargo integration were available. The host has GDB 17.2, but this session did not complete a GUI-authorized real DAP launch; real debugger compatibility remains unverified. Existing fake-adapter tests continue to provide protocol coverage.
+## Real rust-analyzer
 
-Search, workspace navigation, safe document services, Git operations, terminal authorization, and DAP protocol behavior also have automated service and UI tests. Their presence is not evidence that every full GUI workflow listed above was exercised in this dogfooding session.
+The installed `rust-analyzer` was the rustup shim and initially had no component installed for the active stable toolchain. The official stable component was installed locally and reported `rust-analyzer 1.99.1 (58cf8f9 2026-10-13)`. A disposable Cargo project and a temporary Rust extension configuration pointed Koren at the direct analyzer executable, with explicit `HOME`, `CARGO_HOME`, `RUSTUP_HOME`, and `PATH` values because the language-server manager starts processes with a cleared environment. Koren displayed a graphical authorization request before starting it. The running analyzer and its proc-macro helper processes were observed; they exited when Koren was closed.
 
-## Startup and memory sample
+The session produced a real unresolved-name diagnostic in Problems. After editing the source to remove the error, the old diagnostic disappeared. Hover showed rust-analyzer's inferred `i32` type information, and completion offered the local `answer` value. The source was edited rapidly and the editor remained responsive; a second open document was used during the same session. These checks confirm basic initialization, workspace loading, synchronization, diagnostics, hover, completion, and shutdown.
 
-Three consecutive Linux debug-build desktop smoke runs used `scripts/run_desktop_smoke.py` on 2026-11-12. Each run waited for the visible window and sampled the application process tree one second later:
+Ctrl+. returned real rust-analyzer actions such as “Insert explicit type” and “Promote local to constant.” In the tested selections, the actions had no supported immediate text edit, so Koren correctly described them as unavailable for preview and applied none. This exposed that Koren was requesting code actions with an empty diagnostic context. Koren now sends current-revision diagnostics and asks for quick fixes when those diagnostics are present; older protocol-v2 clients may omit the new optional field. A bridge regression fixture only returns its quick fix when both the diagnostic and `quickfix` filter are forwarded. The live rust-analyzer run still did not yield a supported immediate edit or preview. No real quick-fix preview was completed. Go-to-definition, explicit server restart, and workspace-close shutdown were not conclusively verified interactively. This remains an acceptance gap.
 
-| Run | Time to visible window | Process-tree RSS at +1 s |
-|---:|---:|---:|
-| 1 | 174.2 ms | 395,056 KiB |
-| 2 | 170.4 ms | 395,460 KiB |
-| 3 | 174.9 ms | 394,660 KiB |
-| Median | 174.2 ms | 395,056 KiB |
+The analyzer configuration was specific to the disposable fixture and did not modify the repository's extension catalog or weaken execution approvals. Analyzer-triggered Cargo/build-script behavior was not separately measured.
 
-This is a repeatable smoke procedure on the local Fedora Linux x86_64 host with Xvfb/Openbox, not a representative production-hardware claim. It reports summed resident set size for the editor process and descendants only. It does not report per-process memory, virtual memory, proportional set size, or shared-page attribution; therefore the sum may double-count shared pages and cannot be described as private memory. The sample did not include an active language server, terminal, or debugger.
+## External save conflicts
 
-The built frontend continues to split the terminal and debugger into on-demand chunks. Their current built sizes are about 332.2 KiB and 12.4 KiB respectively; the editor entry is about 489.8 KiB (501.58 kB decimal), just over Vite's 500 kB warning threshold. The editor entry is central to the initial workflow, and this small threshold overage did not justify adding more loading complexity during stabilization. No bundle optimization was made.
+The editor opened a disposable `conflict.txt`; an external process independently replaced it with Unicode text (`external version – 雪`). Koren's save opened the “File changed outside Koren” dialog. Expanding the preview showed the external text. Choosing Reload put that exact text in the editor and left the document clean at a newer revision.
 
-Interactive responsiveness was observed qualitatively: tree navigation, opening files, clipboard paste, save, rename, terminal input/output, and command palette activation completed in the real window. No frame-time or latency instrumentation was collected for those actions. Large-workspace search latency, memory with language services, and terminal/debug adapter memory remain unmeasured.
+A second external revision was then written while Koren held a different unsaved buffer. The dialog preview showed `new external revision`. Choosing the explicit Overwrite action wrote `overwrite from Koren` to disk and returned the document to a clean state. The document service's tests additionally cover external deletion, changed-again detection, reload revision increments, and refusal to silently save over newer contents. Rapid changes during a conflict and conflict while inspections run were not separately exercised in the GUI.
 
-## Remaining stabilization work
+## Restart and unsaved-document behavior
 
-- Re-run the complete check suite after the final documentation and code changes.
-- Verify root-level Git selection, extension deactivation cleanup, diagnostics and quick fixes, document conflicts, and reopen persistence in a rebuilt interactive window.
-- Add per-process RSS/PSS and virtual-memory reporting to the desktop smoke tooling before making component-level memory claims.
-- Complete a real GDB DAP workflow only after it can be launched from the editor's graphical approval flow.
-- Add repeatable UI latency fixtures for workspace open, file open, tab switch, search, and terminal/debugger activation.
+Before restart, the theme was changed from OLED Black to Light. On reopening with the same isolated home directory, Light remained selected. The editor returned to its empty welcome state: the last workspace, open tabs, active tab, and running language server were not restored. No task, terminal, language server, or debugger was automatically started. The user must reopen a workspace and explicitly authorize language services again. Panel-dimension persistence was not verified in this interactive run.
+
+Extension enablement/activation was not restored automatically; the earlier restart exercise required enabling and activating the example again. Extension settings and inspection profiles are stored separately in `~/.config/koren/extension-settings.json`; round-trip and legacy-format behavior have automated bridge tests. Persisting enabled/active process state is not part of the current restore behavior. Corrupted settings are treated as defaults by the loader, but preserving a damaged file and recovery from renamed or missing workspaces were not manually verified.
+
+With a dirty Rust buffer, the native close request showed “Unsaved documents.” Cancel left the editor open and the modified marker intact. A later explicit Discard and close closed the application. No session recovery is implemented; dirty buffers are protected by this prompt rather than silently persisted.
+
+## Existing checks and remaining automated coverage
+
+The repository already has document-service tests for conflict preview/reload/overwrite, a second external change, deleted files, and dirty close; settings tests cover legacy migration and profile round trips; frontend tests cover bounded theme/layout state helpers. The breakpoint path conversion has three focused frontend regression cases. The language-service bridge fixture now verifies that diagnostic context and the quick-fix request filter reach the provider, and the protocol test verifies that old protocol-v2 requests without the optional context still deserialize.
+
+After the breakpoint fix and documentation updates, `python3 scripts/check.py` passed, `cargo +1.85.0 check --workspace --locked` passed, and `python3 scripts/pr_check.py` passed. The PR check included strict Clippy, all Rust unit and doc tests, Python tests (21 passed), all frontend tests (53 passed), typecheck, lint, production build, architecture checks, a clean workspace build, optimized editor build, and Linux desktop launch smoke. The focused breakpoint-path Vitest file also passed (3 tests).
+
+## Performance boundaries
+
+The three earlier no-tool desktop smoke samples remain the baseline: median visible window 174.2 ms and process-tree RSS 395,056 KiB at one second. The final PR smoke during this completion run reported 174.1 ms and 405,464 KiB. These are Linux/Xvfb smoke measurements, not interactive latency targets. A real rust-analyzer process was sampled at about 646 MiB RSS while indexing the small fixture, with two proc-macro helpers around 27 MiB each; Koren's process was about 204 MiB at that moment. These are single `ps` samples, not peak or steady-state measurements, and shared memory is not separated.
+
+LSP initialization-to-ready time, edit-to-diagnostic latency, real debugger startup-to-first-stop, conflict-preview latency, restored-session latency, idle CPU with real services, and per-process WebKit memory were not instrumented. They remain unmeasured rather than inferred from the fake-server or launch-smoke benchmarks. See [BENCHMARKS.md](../BENCHMARKS.md) for the prior workload boundaries.
+
+## Status
+
+Phase 9.5 remains **partially complete**. Real GDB DAP, core rust-analyzer features, explicit conflict handling, theme persistence, and dirty-close behavior were exercised. A real quick-fix preview and Go-to-definition have not been verified; panel-size persistence and several recovery edge cases also remain unverified. Do not begin another phase until these acceptance gaps are resolved and the final full checks pass.
