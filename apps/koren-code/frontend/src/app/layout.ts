@@ -34,6 +34,16 @@ export function persistLayout(storage: Pick<Storage, 'setItem'>, layout: LayoutP
   storage.setItem(KEY, JSON.stringify(layout));
 }
 
+export function fitLayoutToViewport(layout: LayoutPreferences, width: number, height: number): LayoutPreferences {
+  const usableWidth = Math.max(320, width);
+  const usableHeight = Math.max(240, height);
+  return {
+    ...layout,
+    explorerWidth: Math.round(Math.min(layout.explorerWidth, Math.max(148, usableWidth * 0.42))),
+    bottomHeight: Math.round(Math.min(layout.bottomHeight, Math.max(96, Math.min(480, usableHeight * 0.5)))),
+  };
+}
+
 function boundedNumber(value: unknown, minimum: number, maximum: number, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value)
     ? Math.min(maximum, Math.max(minimum, value))

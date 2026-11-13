@@ -8,7 +8,8 @@ import type { SearchMatch } from './services/protocol';
 import { approvalChoice, conflictChoice } from './app/dialogs';
 import { commandShortcutMatches, filterCommands, nextCommandSelection } from './app/commands';
 import { activePanelLayout, diagnosticDetailMatches, extensionMenusAt, safeThemeVariables, validExtensionSettingValue } from './app/extensions';
-import { readLayout, persistLayout, type LayoutPreferences } from './app/layout';
+import { readLayout, persistLayout, fitLayoutToViewport, type LayoutPreferences } from './app/layout';
+import { persistSession, readSession } from './app/session';
 import { formatCursorPosition, lineEndingFor } from './app/status';
 import { runConfigurationTasks, selectedRunTask } from './app/toolbar';
 import { gitRepositoryChoices, groupSearchMatches, normalizedCommitMessage, partitionGitFiles, searchSummaryText } from './app/developerTools';
@@ -224,6 +225,8 @@ let projectExplorerMenus: ExtensionMenuSummary[] = [];
 let extensionCatalogCache: ExtensionCatalog | null = null;
 let openExtensionPanels = loadOpenExtensionPanels();
 let activeDynamicPanel = localStorage.getItem('koren.activeExtensionPanel') ?? '';
+let activePanel = 'output';
+let restoringSession = false;
 let registeredCommands: string[] = [];
 const commandLabels = new Map<string, string>();
 const commandDescriptions = new Map<string, string>();
@@ -261,6 +264,7 @@ function setStatus(message: string): void {
 function showError(error: unknown): void { setStatus(error instanceof Error ? error.message : String(error)); }
 
 function applyLayout(): void {
+  Object.assign(layout, fitLayoutToViewport(layout, window.innerWidth, window.innerHeight));
   workbench.style.setProperty('--explorer-width', `${layout.explorerWidth}px`);
   workbench.style.setProperty('--bottom-height', `${layout.bottomHeight}px`);
   document.querySelector('#explorer')!.classList.toggle('collapsed', layout.explorerCollapsed);
@@ -268,6 +272,15 @@ function applyLayout(): void {
   document.querySelector('#bottom-panel')!.classList.toggle('collapsed', layout.bottomCollapsed);
 }
 function saveLayout(): void { persistLayout(localStorage, layout); }
+function saveSession(): void {
+  if (restoringSession || !workspaceRoot) return;
+  persistSession(localStorage, {
+    workspace: workspaceRoot,
+    openFiles: tabs.tabs.map((tab) => tab.path),
+    activeFile: tabs.active?.path ?? null,
+    activePanel: ['output', 'problems', 'tasks', 'projects', 'search', 'source-control', 'terminal', 'debug'].includes(activePanel) ? activePanel : 'output',
+  });
+}
 function setExplorerCollapsed(collapsed: boolean): void {
   layout.explorerCollapsed = collapsed;
   document.querySelector('#explorer')!.classList.toggle('collapsed', collapsed);
@@ -292,6 +305,7 @@ async function openWorkspace(path: string): Promise<void> {
   treeState.setEntries('', expect(await client.call({ method: 'list_directory', params: { path: '' } }), 'directory_entries').value);
   renderTree();
   await refreshProjects();
+  saveSession();
   setStatus('Workspace opened');
 }
 
@@ -361,7 +375,7 @@ async function renameWorkspaceEntry(path: string): Promise<void> {
     }
     if (selectedPath === path || selectedPath.startsWith(`${path}/`)) selectedPath = `${destination}${selectedPath.slice(path.length)}`;
     await refreshWorkspacePath(parentPath(path)); if (parentPath(destination) !== parentPath(path)) await refreshWorkspacePath(parentPath(destination));
-    renderTabs(); renderTree(); updateStatusDocument(); setStatus(`Renamed ${result.previous_path ?? path}`);
+    renderTabs(); renderTree(); updateStatusDocument(); saveSession(); setStatus(`Renamed ${result.previous_path ?? path}`);
   } catch (error) { showError(error); }
 }
 
@@ -466,11 +480,11 @@ function handleTreeKey(event: KeyboardEvent, path: string, kind: string): void {
   }
 }
 
-async function openDocument(path: string): Promise<void> {
+async function openDocument(path: string): Promise<boolean> {
   try {
     const opened = expect(await client.call({ method: 'open_document', params: { path } }), 'document_opened').value;
     const alreadyOpen = tabs.tabs.find((tab) => tab.id === opened.document_id);
-    if (alreadyOpen) { selectTab(alreadyOpen.id); return; }
+    if (alreadyOpen) { selectTab(alreadyOpen.id); return true; }
     const content = expect(await client.call({ method: 'read_document', params: { document_id: opened.document_id } }), 'document_contents').value;
     const tab: EditorTab = {
       id: opened.document_id, path, title: baseName(path), revision: content.revision,
@@ -484,7 +498,9 @@ async function openDocument(path: string): Promise<void> {
     welcome.classList.add('hidden'); editorHost.classList.remove('hidden');
     renderTree(); renderTabs(); updateStatusDocument(); editor.focus();
     scheduleInspection(tab.id);
-  } catch (error) { showError(error); }
+    saveSession();
+    return true;
+  } catch (error) { showError(error); return false; }
 }
 
 async function navigateDebugSource(path: string, zeroBasedLine: number): Promise<void> {
@@ -525,6 +541,7 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
       .filter((diagnostic) => diagnostic.document_revision === (documentViews.get(tab.id)?.pipeline.currentRevision ?? revision))
       .map(({ range, severity, code, source, message }) => ({ range, severity: severity === 'error' ? 1 : severity === 'warning' ? 2 : severity === 'information' ? 3 : severity === 'hint' ? 4 : null, code, source, message })),
     navigate: navigateToDefinition,
+    message: setStatus,
   });
   const theme = EditorView.theme({
     '&': { height: '100%', color: 'var(--text)', backgroundColor: 'var(--bg)' },
@@ -603,6 +620,7 @@ function selectTab(id: number): void {
   renderLanguageDiagnostics(id);
   scheduleInspection(id);
   renderTree(); renderTabs(); updateStatusDocument(); editor?.focus();
+  saveSession();
   void client.call({ method: 'read_document', params: { document_id: id } }).catch(showError);
 }
 
@@ -650,6 +668,7 @@ async function closeTab(tab: EditorTab): Promise<void> {
     inspectionTimers.delete(tab.id); inspectionGenerations.delete(tab.id); renderProblems();
     if (wasActive && tabs.activeId !== null) selectTab(tabs.activeId); else renderTabs();
     updateStatusDocument();
+    saveSession();
   } catch (error) { showError(error); }
 }
 
@@ -909,17 +928,18 @@ function handlePlatformEvent(event: PlatformEvent): void {
         tab.path = `${event.path}${tab.path.slice(event.previous_path.length)}`; tab.title = baseName(tab.path); tab.language = languageNameForPath(tab.path);
         void refreshDocumentLanguage(tab.id);
       }
-      renderTabs(); updateStatusDocument();
+      renderTabs(); updateStatusDocument(); saveSession();
     }
   }
   if (event.kind === 'document_path_changed' && event.document_id && event.path) {
     const tab = tabs.tabs.find((item) => item.id === event.document_id);
-    if (tab) { tab.path = event.path; tab.title = baseName(event.path); tab.language = languageNameForPath(event.path); void refreshDocumentLanguage(tab.id); renderTabs(); updateStatusDocument(); }
+    if (tab) { tab.path = event.path; tab.title = baseName(event.path); tab.language = languageNameForPath(event.path); void refreshDocumentLanguage(tab.id); renderTabs(); updateStatusDocument(); saveSession(); }
     if (event.document_id) { diagnosticsByDocument.delete(event.document_id); inspectionFindingsByDocument.delete(event.document_id); renderProblems(); scheduleInspection(event.document_id); }
   }
   if (event.kind === 'document_closed' && event.document_id && tabs.tabs.some((tab) => tab.id === event.document_id)) {
     documentViews.delete(event.document_id); debugGutterRefreshers.delete(event.document_id); tabs.close(event.document_id); renderTabs();
     if (tabs.active) selectTab(tabs.active.id); else { editorHost.classList.add('hidden'); welcome.classList.remove('hidden'); editor = null; updateStatusDocument(); }
+    saveSession();
   }
   if (event.kind === 'task_output_available' && event.run_id) queueOutputRefresh(event.run_id);
   if (event.kind === 'task_finished' && event.run_id) void updateTaskOutput(event.run_id);
@@ -976,7 +996,9 @@ function showPanel(panel: 'output' | 'problems' | 'tasks' | 'projects' | string)
   for (const id of ['output', 'problems', 'tasks', 'projects', 'search', 'source-control', 'terminal', 'debug']) document.querySelector(`#${id}`)!.classList.toggle('hidden', id !== panel);
   for (const host of document.querySelectorAll<HTMLElement>('[data-extension-panel]')) host.classList.toggle('hidden', host.dataset.extensionPanel !== panel);
   if (panel.startsWith('org.') || panel.includes('.')) { activeDynamicPanel = panel; localStorage.setItem('koren.activeExtensionPanel', panel); }
+  activePanel = panel;
   setBottomCollapsed(false);
+  saveSession();
 }
 
 function scheduleInspection(documentId: number): void {
@@ -1883,17 +1905,17 @@ async function navigateToSearchMatch(match: SearchMatch): Promise<void> {
 }
 
 async function navigateToDefinition(uri: string, range: TextRange): Promise<void> {
-  if (!workspaceRoot) return;
+  if (!workspaceRoot) { setStatus('Open a workspace before navigating to a definition.'); return; }
   try {
     const target = new URL(uri);
-    if (target.protocol !== 'file:') return;
+    if (target.protocol !== 'file:' || (target.hostname && target.hostname !== 'localhost')) { setStatus('Definition target uses an unsupported location.'); return; }
     let filePath = decodeURIComponent(target.pathname);
     if (/^\/[A-Za-z]:\//.test(filePath)) filePath = filePath.slice(1);
     const root = workspaceRoot.replaceAll('\\', '/').replace(/\/$/, '');
     const candidate = filePath.replaceAll('\\', '/');
     if (!candidate.startsWith(`${root}/`)) { setStatus('Definition is outside the open workspace'); return; }
     const relative = candidate.slice(root.length + 1);
-    await openDocument(relative);
+    if (!await openDocument(relative)) return;
     const active = tabs.active;
     if (!active || !editor) return;
     const line = editor.state.doc.line(Math.max(1, Math.min(editor.state.doc.lines, range.start.line + 1)));
@@ -2051,8 +2073,32 @@ window.addEventListener('koren-close-request', () => {
 document.documentElement.dataset.theme = readTheme(localStorage);
 document.querySelector<HTMLSelectElement>('#theme-setting')!.value = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
 applyLayout();
+window.addEventListener('resize', () => { applyLayout(); saveLayout(); });
 if (layout.bottomCollapsed) document.querySelector('#bottom-resizer')!.classList.add('hidden');
 renderTree(); renderTabs(); updateStatusDocument();
 void (async () => { for await (const events of client.subscribeEvents()) events.forEach(handlePlatformEvent); })();
+void (async () => {
+  const saved = readSession(localStorage);
+  if (!saved) return;
+  restoringSession = true;
+  try {
+    try { await openWorkspace(saved.workspace); }
+    catch { setStatus('The previous workspace is unavailable. Open a workspace to continue.'); return; }
+    const missing: string[] = [];
+    for (const path of saved.openFiles) if (!await openDocument(path)) missing.push(path);
+    if (saved.activeFile) {
+      const active = tabs.tabs.find((tab) => tab.path === saved.activeFile);
+      if (active) selectTab(active.id);
+    }
+    const restoreBottomCollapsed = layout.bottomCollapsed;
+    activePanel = saved.activePanel;
+    showPanel(saved.activePanel);
+    setBottomCollapsed(restoreBottomCollapsed);
+    if (missing.length) setStatus(`Session restored; ${missing.length} file${missing.length === 1 ? '' : 's'} could not be reopened.`);
+  } finally {
+    restoringSession = false;
+    saveSession();
+  }
+})();
 
 export { client, renderTree, renderTabs, showPanel };

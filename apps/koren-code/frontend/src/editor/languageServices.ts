@@ -11,6 +11,13 @@ export interface LanguageServiceHost {
   flush(): Promise<void>;
   diagnostics(): LanguageDiagnosticContext[];
   navigate(uri: string, range: TextRange): Promise<void>;
+  message?(message: string): void;
+}
+
+export function selectedLocation<T>(locations: T[], selection: string | null): T | undefined {
+  if (locations.length === 1) return locations[0];
+  if (!selection || !/^[1-9]\d*$/.test(selection)) return undefined;
+  return locations[Number(selection) - 1];
 }
 
 function editorChanges(view: EditorView, edits: Array<{ range: TextRange; new_text: string }>) {
@@ -77,9 +84,14 @@ export function languageServiceExtensions(client: KorenClient, host: LanguageSer
         position: positionAt(view.state.doc.toString(), view.state.selection.main.head),
       } });
       if (response.kind !== 'language_definitions' || response.value.document_revision !== host.revision()) return true;
-      const target = response.value.locations[0];
+      const locations = response.value.locations;
+      if (!locations.length) { host.message?.('No definition found at this location.'); return true; }
+      const choice = locations.length === 1 ? '1' : window.prompt(locations.map((location, index) =>
+        `${index + 1}. ${location.uri}:${location.range.start.line + 1}:${location.range.start.character + 1}`,
+      ).join('\n'), '1');
+      const target = selectedLocation(locations, choice);
       if (target) await host.navigate(target.uri, target.range);
-    } catch { /* no active server or no definition is a normal editor state */ }
+    } catch (error) { host.message?.(error instanceof Error ? error.message : String(error)); }
     return true;
   };
 
@@ -98,7 +110,7 @@ export function languageServiceExtensions(client: KorenClient, host: LanguageSer
           const choice = locations.length === 1 ? '1' : window.prompt(locations.map((location, index) =>
             `${index + 1}. ${location.uri}:${location.range.start.line + 1}:${location.range.start.character + 1}`,
           ).join('\n'), '1');
-          const selected = choice === null ? undefined : locations[Number(choice) - 1];
+          const selected = selectedLocation(locations, choice);
           if (selected) await host.navigate(selected.uri, selected.range);
         }
       }
