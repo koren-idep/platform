@@ -108,7 +108,7 @@
 .window-controls button:hover { background: color-mix(in srgb, var(--wb-text) 10%, var(--wb-header)); }
 .window-controls button svg { width: 14px; height: 14px; }
 .window-controls .window-close:hover { background: #c42b1c; color: #fff; }
-.workbench-v2 .workbench { padding: 0 7px 5px; }
+.workbench-v2 .workbench { padding: 8px 7px 5px; }
 .workbench-v2 .explorer, .secondary-sidebar { border: 0; border-radius: 7px; background: #151719; }
 .workbench-v2 .explorer .panel-heading, .workbench-v2 .explorer-footer { display: none; }
 .workbench-v2 .primary-sidebar-tabs { min-height: 37px; padding: 4px 7px; border-bottom: 0; gap: 2px; }
