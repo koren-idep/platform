@@ -65,7 +65,9 @@
 .wb-title-toolbar { flex-direction: row; align-items: center; gap: 4px; background: #08090a; border-bottom: 0; }
 .workbench-v2.menu-labels-hidden .menus { display: none; }
 .wb-title-toolbar { height: 44px; min-width: 0; display: flex; align-items: stretch; gap: 0; padding: 0; overflow: visible; background: var(--wb-header); border-bottom: 0; }
-.project-menu-region { min-width: 0; max-width: 100%; height: 44px; flex: 0 1 auto; display: flex; align-items: stretch; overflow: visible; background: var(--wb-header); }
+.project-menu-region { position: relative; z-index: 1; isolation: isolate; min-width: 0; max-width: 100%; height: 44px; flex: 0 1 auto; display: flex; align-items: stretch; overflow: visible; background: transparent; }
+.project-menu-region::before { content: ''; position: absolute; z-index: 0; inset: 0 0 -92px; display: none; pointer-events: none; background: radial-gradient(ellipse 100% 104px at 8% 8px, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .52), transparent) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .3), transparent) 38%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .1), transparent) 74%, transparent 96%); }
+.project-menu-region > * { position: relative; z-index: 1; }
 .workspace-selector { height: 44px; min-width: 0; max-width: none; flex: 0 1 clamp(200px, 18vw, 290px); display: flex; align-items: center; gap: 9px; margin: 0; padding: 0 13px; border: 0; border-radius: 0; color: var(--text); white-space: nowrap; background: transparent; transition: filter 140ms ease; }
 .workspace-selector:hover { filter: brightness(1.12); }
 .workspace-selector:focus-visible { position: relative; z-index: 1; outline: 2px solid #74b7ff; outline-offset: -3px; }
@@ -109,7 +111,7 @@
 .window-controls button:hover { background: color-mix(in srgb, var(--wb-text) 10%, var(--wb-header)); }
 .window-controls button svg { width: 14px; height: 14px; }
 .window-controls .window-close:hover { background: #c42b1c; color: #fff; }
-.workbench-v2 .workbench { padding: 8px 7px 5px; }
+.workbench-v2 .workbench { position: relative; z-index: 0; padding: 8px 7px 5px; }
 .workbench-v2 .explorer, .secondary-sidebar { border: 0; border-radius: 7px; background: #151719; }
 .workbench-v2 .explorer .panel-heading, .workbench-v2 .explorer-footer { display: none; }
 .workbench-v2 .primary-sidebar-tabs { min-height: 35px; padding: 3px 6px; border-bottom: 0; gap: 2px; }
@@ -210,8 +212,8 @@
 .settings-extension-row button { padding: 5px 9px; border: 1px solid var(--border); border-radius: 4px; }
 .workbench-v2 .status-bar { background: #08090a; border: 0; }
 :root[data-project-colors="false"] .project-menu-region { background: var(--wb-header); }
-:root[data-project-colors="true"][data-project-color-style="subtle-gradient"] .project-menu-region { background: linear-gradient(180deg, transparent 24%, color-mix(in srgb, var(--wb-header) 48%, transparent) 72%, var(--wb-header) 100%), linear-gradient(90deg, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .58), var(--wb-header)) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .38), var(--wb-header)) 25%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .18), var(--wb-header)) 58%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .05), var(--wb-header)) 82%, var(--wb-header) 100%); }
-:root[data-project-colors="true"][data-project-color-style="solid-tint"] .project-menu-region { background: linear-gradient(180deg, transparent 24%, color-mix(in srgb, var(--wb-header) 48%, transparent) 72%, var(--wb-header) 100%), linear-gradient(90deg, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .58), var(--wb-header)) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .34), var(--wb-header)) 40%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .1), var(--wb-header)) 78%, var(--wb-header) 100%); }
+:root[data-project-colors="true"][data-project-color-style="subtle-gradient"] .project-menu-region::before { display: block; }
+:root[data-project-colors="true"][data-project-color-style="solid-tint"] .project-menu-region::before { display: block; }
 :root[data-project-colors="true"][data-project-color-style="icon-only"] .project-menu-region { background: var(--wb-header); }
 :root[data-project-colors="true"][data-project-color-style="icon-only"] .project-icon-mark { color: var(--project-color); }
 :root[data-project-colors="true"][data-project-color-style="subtle-gradient"] .project-icon-mark,
