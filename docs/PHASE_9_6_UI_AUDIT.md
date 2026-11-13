@@ -1,39 +1,25 @@
-# Phase 9.6 UI audit and migration notes
+# Phase 9.6 Workbench and Settings Audit
 
-## Current frontend surfaces
+## Workbench shell
 
-The desktop client is a TypeScript entry point (`apps/koren-code/frontend/src/main.ts`) with focused helpers under `src/app/`, CodeMirror modules under `src/editor/`, a typed Rust bridge in `apps/koren-code/src/bridge.rs`, and one shared stylesheet. The UI is assembled as a single workbench with a menu row, a tall bordered toolbar, a permanent project explorer, document tabs, a bottom tool panel, and a status bar. Search, Git, Problems, Tasks, Projects, Terminal, and Debug currently share the bottom panel. Extension tools are published through the existing typed contributions and are user-opened.
+The frontend remains a TypeScript workbench over the existing typed Rust bridge, Tao/Wry host, and CodeMirror 6 editor. The shell has a compact direct menu bar, horizontal Files/Search/Git/Extensions sidebar tabs, editor tabs, a resizable bottom tool area, an optional outline panel, and a minimal status bar. The title area has custom minimize, maximize/restore, and close controls. The visible product wordmark and waffle menu are removed; the menu labels remain directly accessible. Run configuration selection is reserved for a later phase.
 
-The settings surface is currently a small modal containing a theme selector, extension settings, and inspection profiles. Theme, layout, session, and recovery preferences use separate versioned or named WebKit local-storage entries. The Rust host atomically persists extension setting values and inspection profiles in the per-user Koren settings file. There is no general application-preferences protocol or workspace preferences file yet. Preserve the inspection/extension persistence contract and add new typed preferences without rewriting those services.
+The dark workbench uses near-black chrome, restrained borders, compact controls, rounded panel surfaces, and original inline SVG icons. The project-color wash spans the project selector and menu labels, then fades to the normal header background at Help; the flexible gap and utility controls stay uniform. The header row and body now share the same 44 px alignment, and the status bar follows the panel corner radius and horizontal inset. The default project pane is 380 px wide at 1600×900. The supplied Fleet screenshot is the primary layout reference; the IntelliJ screenshot informs the secondary tooling and discoverability. The app keeps Koren's own icons and hierarchy. It does not copy Fleet assets or add its AI surface.
 
-## Phase 9.6 starting point
+## Workspace project discovery
 
-- Keep Tao, Wry, CodeMirror 6, the typed protocol, and all existing platform services.
-- Retain the current dark/light choice, but expose it through a centralized Koren token layer with dark near-black defaults.
-- Preserve session/layout and recovery stores as separate transient state.
-- Keep tool windows lazy; default a fresh profile to a collapsed bottom panel and a closed right panel.
-- Do not add a framework, AI surface, Rust-specific editor affordance, or run-configuration engine.
-- Build searchable settings from typed descriptors; mark unsupported settings explicitly instead of presenting inert controls.
-- Keep extension settings and contributed tools on their existing host-owned APIs.
+Opening a workspace triggers `discover_registered_projects` with fixed limits of 6,000 directories, 256 project candidates, and depth 32. The Rust project manager calls all registered providers; the frontend does not select or name Cargo. Provider discovery inspects workspace filesystem entries and manifests only. It does not execute Cargo, project commands, or project code, and it does not fetch dependencies. The Cargo provider remains registered and continues to provide its existing task definitions.
 
-## Known migration risks
+Detected projects are loaded into the Projects tool window and provider tasks into Tasks. The menu and Projects panel expose **Refresh Project** for a bounded rescan. Discovery failures are shown in the Projects and Tasks panels and in the status message; workspace opening remains available. Tasks still go through the existing task authorization flow. The legacy Cargo-specific protocol operation remains for compatibility, but the main UI no longer exposes it.
 
-1. `main.ts` owns shell markup and many event routes. Replace it incrementally; broad file moves would make behavioral review and recovery regression checks harder.
-2. Multiple preference records already exist in local storage. Migrate only values with explicit equivalence and preserve unknown extension settings.
-3. Existing layout dimensions and tab/session restore are already tested. New defaults must not overwrite values that users have saved.
-4. Terminal, debugger, inspections, and extension views are lazy or asynchronous. Layout changes must not start those services just by rendering their containers.
-5. The current lower panel is part of the session schema. New sidebar selection and panel visibility need additive migration and must tolerate older schema-1 sessions.
+## Settings and preferences
 
-## Revised plan after the course correction
+Settings are built from typed descriptors and support search, user/workspace scope, validation, reset, and live theme/editor changes. Opening Settings adds a selectable Settings tab beside document tabs in the main editor viewer; it no longer replaces or overlays the whole workbench. Current controls cover theme, menu visibility, project identity and accents, density, toolbar visibility, editor typography, indentation, line numbers, and wrapping. The settings and keybinding stores are browser-profile local storage; there is not yet a Rust settings-file editor. Extension settings and inspection profiles continue to use their existing host-owned persistence APIs.
 
-### Milestone 9.6-A workbench review
+## Visual review
 
-The Fleet and IntelliJ reference screenshots supplied in the conversation were inspected directly. The requested repository copies under `design-references/` were not present in the checked working tree. No network retrieval was used. The Fleet reference guided the horizontal Files/Search/Git navigation, near-black chrome, compact top controls, separated rounded work areas, editor tabs, and terminal placement. IntelliJ informed the optional secondary tool panel and menu discoverability. The toolbar actions use original inline SVGs; no proprietary icon assets were copied.
+Real WebKitGTK captures at 1600×900 are saved in [the Phase 9.6 screenshots](screenshots/phase-9-6/). Captures 13 and 14 show Settings as a main-view tab and verify switching between it and a real open document. Compared with the Fleet reference, the hierarchy matches its horizontal sidebar tabs, dark separated work areas, compact editor tabs, and bottom tools. Koren's title area keeps its visible menu labels and custom window buttons; its panel proportions and original icon set differ from Fleet. The IntelliJ reference supports opening Projects and Tasks from the View menu rather than adding a permanent activity rail.
 
-The workbench now has a compact menu row and a dedicated action row with consistent new/open/save, undo/redo, source control, run, search, layout, and settings controls. Its frameless title area includes custom minimize, maximize/restore, and close buttons, plus a drag region. The main canvas separates the horizontal project sidebar, editor tabs/editor, optional outline panel, bottom tool panel, and status bar into rounded dark surfaces. Existing editor, workspace, terminal panel, task, extension, and approval routes continue through the previous application services. The desktop capture is [phase-9-6-workbench.png](screenshots/phase-9-6-workbench.png) (1600×900, real WebKitGTK window, disposable workspace).
+## Scope
 
-Compared with the Fleet reference, the broad hierarchy and panel geometry now align: Fleet-style horizontal sidebar tabs, a compact two-row header, a large central editor, separate bottom terminal area, and a secondary panel are visible. Remaining differences are deliberate or limited: Koren uses its own thin monochrome SVG set and blue active states; the screenshot's terminal panel is open but has no live shell session; the secondary panel currently shows the existing outline empty state. The Fleet screenshot's brighter syntax, denser editor content, and active terminal prompt are not part of this capture. This is the 9.6-A visual checkpoint, not final visual approval.
-
-No new Settings work was undertaken as part of this milestone; the pre-existing in-progress Settings changes were preserved. A full Settings redesign, additional tool-window contributions, and later UI milestones remain outside 9.6-A. Preserve the new shell as the presentation layer over the existing typed bridge and application services.
-
-Split editors, generalized docking, keybinding recording, and settings-file editing require additional document ownership and host APIs. They remain explicit follow-up items unless the staged implementation can support them without weakening shared document state or execution boundaries.
+The Settings implementation is still evolving. Generalized docking, settings-file editing, and universal Run/Debug configurations are not included here. No Phase 9.7 work is part of this checkpoint.
