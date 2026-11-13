@@ -433,6 +433,13 @@ impl DesktopBackend {
             .map_err(|error| error.to_string())?;
         commands
             .register(
+                "editor.go_to_definition",
+                "Navigate to the definition at the cursor",
+                command_go_to_definition,
+            )
+            .map_err(|error| error.to_string())?;
+        commands
+            .register(
                 "editor.source_control",
                 "Open local Git source control",
                 command_source_control,
@@ -3512,6 +3519,13 @@ impl DesktopBackend {
         position: koren_protocol::TextPosition,
     ) -> Result<ResponseValue, ProtocolError> {
         let targets = self.language_targets(document_id, expected_revision)?;
+        if targets.is_empty() {
+            return Err(ProtocolError {
+                code: ErrorCode::InvalidState,
+                message: "No language server is active for this document.".into(),
+            });
+        }
+        let mut unsupported = false;
         for (_, server, uri, version) in targets {
             let request = LspRequest::Definition {
                 uri,
@@ -3535,14 +3549,20 @@ impl DesktopBackend {
                             .collect(),
                     });
                 }
-                Err(koren_lsp::LspError::UnsupportedFeature(_))
-                | Err(koren_lsp::LspError::RequestTimeout(_))
+                Err(koren_lsp::LspError::UnsupportedFeature(_)) => unsupported = true,
+                Err(koren_lsp::LspError::RequestTimeout(_))
                 | Err(koren_lsp::LspError::RequestCancelled)
                 | Err(koren_lsp::LspError::RequestQueueFull)
                 | Err(koren_lsp::LspError::ServerNotReady(_)) => continue,
                 Err(error) => return Err(lsp_error(error)),
                 _ => continue,
             }
+        }
+        if unsupported {
+            return Err(ProtocolError {
+                code: ErrorCode::InvalidState,
+                message: "The active language server does not support Go to Definition.".into(),
+            });
         }
         Ok(ResponseValue::LanguageDefinitions {
             document_revision: expected_revision,
@@ -4291,6 +4311,10 @@ fn command_new_file(arguments: &[String]) -> Result<String, CommandError> {
 }
 fn command_search(arguments: &[String]) -> Result<String, CommandError> {
     command_ui_action(arguments, "editor.search")
+}
+
+fn command_go_to_definition(arguments: &[String]) -> Result<String, CommandError> {
+    command_ui_action(arguments, "editor.go_to_definition")
 }
 fn command_source_control(arguments: &[String]) -> Result<String, CommandError> {
     command_ui_action(arguments, "editor.source_control")
@@ -6357,7 +6381,7 @@ mod tests {
         let mut backend = DesktopBackend::new().unwrap();
         assert!(matches!(
             backend.method(RequestMethod::ListCommands).unwrap(),
-            ResponseValue::Commands(commands) if commands == ["core.ping", "editor.new_file", "editor.search", "editor.source_control"]
+            ResponseValue::Commands(commands) if commands == ["core.ping", "editor.go_to_definition", "editor.new_file", "editor.search", "editor.source_control"]
         ));
         assert!(matches!(
             backend.method(RequestMethod::ExecuteCommand { command_id: "core.ping".into() }).unwrap(),
@@ -6493,7 +6517,7 @@ mod tests {
             matches!(backend.method(RequestMethod::LanguageCompletion { document_id, expected_revision: 0, position: koren_protocol::TextPosition { line: 0, character: 1 } }).unwrap(), ResponseValue::LanguageCompletions { items, .. } if items[0].label == "complete")
         );
         assert!(
-            matches!(backend.method(RequestMethod::LanguageDefinition { document_id, expected_revision: 0, position: koren_protocol::TextPosition { line: 0, character: 1 } }).unwrap(), ResponseValue::LanguageDefinitions { locations, .. } if locations.is_empty())
+            matches!(backend.method(RequestMethod::LanguageDefinition { document_id, expected_revision: 0, position: koren_protocol::TextPosition { line: 0, character: 1 } }).unwrap(), ResponseValue::LanguageDefinitions { locations, .. } if locations == [koren_protocol::LanguageLocation { uri: "file:///definition".into(), range: koren_protocol::TextRange { start: koren_protocol::TextPosition { line: 3, character: 2 }, end: koren_protocol::TextPosition { line: 3, character: 8 } } }])
         );
         let feature_pool = LanguageFeaturePool::new();
         let range = koren_protocol::TextRange {

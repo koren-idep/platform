@@ -24,7 +24,8 @@ import { DocumentEditPipeline } from './editor/sync';
 import { editsFromViewUpdate } from './editor/transactions';
 import { languageForPath, languageIdForPath, languageNameForPath } from './editor/languages';
 import { flushAndSave } from './editor/save';
-import { languageServiceExtensions } from './editor/languageServices';
+import { goToDefinition, languageServiceExtensions } from './editor/languageServices';
+import { installDefinitionShortcut, positionForRange, workspaceRelativePath } from './editor/definitionNavigation';
 import { debugGutter } from './editor/debugGutter';
 import { absoluteDebugSourcePath } from './editor/debugSource';
 import './styles/main.css';
@@ -70,6 +71,7 @@ app.innerHTML = `
       <details class="menu-group"><summary>Navigate</summary><div class="menu-popup" role="menu">
         <button role="menuitem" data-action="focus-explorer">Focus Project Explorer <kbd>Ctrl+B</kbd></button>
         <button role="menuitem" data-action="focus-editor">Focus Editor <kbd>F6</kbd></button>
+        <button role="menuitem" data-action="go-to-definition">Go to Definition <kbd>F12</kbd></button>
         <div class="menu-separator"></div><button role="menuitem" data-action="previous-tab">Previous Tab <kbd>Ctrl+Shift+Tab</kbd></button>
         <button role="menuitem" data-action="next-tab">Next Tab <kbd>Ctrl+Tab</kbd></button>
         <div id="extension-navigate-items"></div>
@@ -216,7 +218,7 @@ const rootLabel = document.querySelector<HTMLElement>('#status-workspace')!;
 let workspaceRoot = '';
 let selectedPath = '';
 let runId: number | null = null;
-const documentViews = new Map<number, { state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment }>();
+const documentViews = new Map<number, { state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment; goToDefinition: (view: EditorView) => Promise<void> }>();
 const recoveryBaseHashes = new Map<number, string>();
 const recoveryTimers = new Map<number, number>();
 const recoveryWrites = new Map<number, Promise<void>>();
@@ -637,9 +639,9 @@ async function openDocument(path: string): Promise<boolean> {
       dirty: content.dirty, language: languageNameForPath(path), lineEnding: lineEndingFor(content.contents),
     };
     tabs.open(tab); selectedPath = path;
-    const { state, pipeline, lineEnding, languageConfig, refreshDebugGutter } = await createDocumentState(tab, content.contents, content.revision);
+    const { state, pipeline, lineEnding, languageConfig, refreshDebugGutter, goToDefinition: navigateDefinition } = await createDocumentState(tab, content.contents, content.revision);
     debugGutterRefreshers.set(tab.id, refreshDebugGutter);
-    documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig });
+    documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig, goToDefinition: navigateDefinition });
     if (fingerprint) recoveryBaseHashes.set(tab.id, fingerprint);
     if (!editor) editor = new EditorView({ state, parent: editorHost }); else editor.setState(state);
     welcome.classList.add('hidden'); editorHost.classList.remove('hidden');
@@ -669,7 +671,7 @@ async function navigateDebugSource(path: string, zeroBasedLine: number): Promise
   editor.focus();
 }
 
-async function createDocumentState(tab: EditorTab, contents: string, revision: number): Promise<{ state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment; refreshDebugGutter: () => void }> {
+async function createDocumentState(tab: EditorTab, contents: string, revision: number): Promise<{ state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment; refreshDebugGutter: () => void; goToDefinition: (view: EditorView) => Promise<void> }> {
   const lineEnding = lineEndingFor(contents);
   const lineSeparator = lineEnding === 'CRLF' ? '\r\n' : '\n';
   const languageExtensions = await languageForPath(tab.path);
@@ -679,7 +681,7 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
     (source) => debugPanel?.executionLine(source) ?? null,
     (source, line) => { void loadDebugPanel().then(() => debugPanel?.toggleBreakpoint(source, line)).catch(showError); });
   const refreshDebugGutter = () => { if (tabs.activeId === tab.id && editor) gutter.refresh(editor); };
-  const serviceExtensions = languageServiceExtensions(client, {
+  const languageHost = {
     documentId: tab.id,
     revision: () => documentViews.get(tab.id)?.pipeline.currentRevision ?? revision,
     flush: () => documentViews.get(tab.id)?.pipeline.flush() ?? Promise.resolve(),
@@ -689,7 +691,8 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
       .map(({ range, severity, code, source, message }) => ({ range, severity: severity === 'error' ? 1 : severity === 'warning' ? 2 : severity === 'information' ? 3 : severity === 'hint' ? 4 : null, code, source, message })),
     navigate: navigateToDefinition,
     message: setStatus,
-  });
+  };
+  const serviceExtensions = languageServiceExtensions(client, languageHost);
   const theme = EditorView.theme({
     '&': { height: '100%', color: 'var(--text)', backgroundColor: 'var(--bg)' },
     '.cm-content': { caretColor: 'var(--accent)' },
@@ -725,7 +728,7 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
     },
   }, () => documentViews.get(tab.id)?.state.doc.toString() ?? contents,
   (newRevision, dirty) => { tabs.update(tab.id, { revision: newRevision, dirty }); renderTabs(); updateStatusDocument(); }, showError);
-  return { state, pipeline, lineEnding, languageConfig, refreshDebugGutter };
+  return { state, pipeline, lineEnding, languageConfig, refreshDebugGutter, goToDefinition: (view: EditorView) => goToDefinition(client, languageHost, view) };
 }
 
 async function refreshDocumentLanguage(documentId: number): Promise<void> {
@@ -873,9 +876,9 @@ async function showConflict(tab: EditorTab): Promise<void> {
     tabs.update(tab.id, { revision: decision.revision, dirty: decision.dirty });
     if (action === 'reload') {
       const content = expect(await client.call({ method: 'read_document', params: { document_id: tab.id } }), 'document_contents').value;
-      const { state, pipeline, lineEnding, languageConfig, refreshDebugGutter } = await createDocumentState(tab, content.contents, content.revision);
+      const { state, pipeline, lineEnding, languageConfig, refreshDebugGutter, goToDefinition: navigateDefinition } = await createDocumentState(tab, content.contents, content.revision);
       tabs.update(tab.id, { lineEnding });
-      documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig });
+      documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig, goToDefinition: navigateDefinition });
       debugGutterRefreshers.set(tab.id, refreshDebugGutter);
       if (tabs.activeId === tab.id && editor) editor.setState(state);
       await deleteRecoveryForDocument(tab.id);
@@ -1832,6 +1835,7 @@ async function executeCommand(command: string): Promise<void> {
     }
     const result = expect(await client.call({ method: 'execute_command', params: { command_id: command } }), 'command_output').value;
     if (result === 'editor.new_file') { void createWorkspaceEntry(parentPath(selectedPath), false); return; }
+    if (result === 'editor.go_to_definition') { await runGoToDefinition(); return; }
     if (result === 'editor.search') { showPanel('search'); document.querySelector<HTMLInputElement>('#search-query')!.focus(); return; }
     if (result === 'editor.source_control') { showPanel('source-control'); void refreshGitRepositories(); return; }
     renderExtensions(expect(await client.call({ method: 'list_extensions' }), 'extensions').value);
@@ -1868,6 +1872,7 @@ function handleAction(action: string, target: HTMLElement): void {
     case 'close-wizard': document.querySelector<HTMLDialogElement>('#project-wizard-dialog')!.close(); break;
     case 'focus-explorer': setExplorerCollapsed(false); treeRoot.querySelector<HTMLButtonElement>('.tree-row')?.focus(); break;
     case 'focus-editor': editor?.focus(); break;
+    case 'go-to-definition': void runGoToDefinition(); break;
     case 'next-tab': cycleTab(1); break;
     case 'previous-tab': cycleTab(-1); break;
     case 'discover': void discoverCargo(); break;
@@ -2067,21 +2072,20 @@ async function navigateToSearchMatch(match: SearchMatch): Promise<void> {
 async function navigateToDefinition(uri: string, range: TextRange): Promise<void> {
   if (!workspaceRoot) { setStatus('Open a workspace before navigating to a definition.'); return; }
   try {
-    const target = new URL(uri);
-    if (target.protocol !== 'file:' || (target.hostname && target.hostname !== 'localhost')) { setStatus('Definition target uses an unsupported location.'); return; }
-    let filePath = decodeURIComponent(target.pathname);
-    if (/^\/[A-Za-z]:\//.test(filePath)) filePath = filePath.slice(1);
-    const root = workspaceRoot.replaceAll('\\', '/').replace(/\/$/, '');
-    const candidate = filePath.replaceAll('\\', '/');
-    if (!candidate.startsWith(`${root}/`)) { setStatus('Definition is outside the open workspace'); return; }
-    const relative = candidate.slice(root.length + 1);
+    const relative = workspaceRelativePath(uri, workspaceRoot);
+    if (!relative) { setStatus('Definition target is outside the open workspace or uses an unsupported location.'); return; }
     if (!await openDocument(relative)) return;
-    const active = tabs.active;
-    if (!active || !editor) return;
-    const line = editor.state.doc.line(Math.max(1, Math.min(editor.state.doc.lines, range.start.line + 1)));
-    const position = Math.max(line.from, Math.min(line.to, line.from + range.start.character));
-    editor.dispatch({ selection: { anchor: position }, scrollIntoView: true }); editor.focus();
+    if (!tabs.active || !editor) return;
+    const position = positionForRange(editor.state.doc, range);
+    editor.dispatch({ selection: { anchor: position }, effects: EditorView.scrollIntoView(position, { y: 'center' }) }); editor.focus();
   } catch (error) { showError(error); }
+}
+
+async function runGoToDefinition(): Promise<void> {
+  const tab = tabs.active;
+  const view = tab ? documentViews.get(tab.id) : undefined;
+  if (!tab || !view || !editor) { setStatus('Open a document before navigating to a definition.'); return; }
+  await view.goToDefinition(editor);
 }
 
 document.addEventListener('contextmenu', (event) => {
@@ -2153,6 +2157,8 @@ document.addEventListener('keydown', (event) => {
   else if (event.key === 'F5' && runId !== null) { event.preventDefault(); void client.call({ method: 'cancel_task', params: { run_id: runId } }).then(() => setStatus('Cancellation requested')).catch(showError); }
   else if (event.key === 'Escape') for (const menu of document.querySelectorAll<HTMLDetailsElement>('.menu-group[open]')) { menu.open = false; menu.querySelector('summary')?.focus(); }
 });
+
+installDefinitionShortcut(document, () => document.querySelector<HTMLDialogElement>('#command-dialog')!.open, () => { void runGoToDefinition(); });
 
 document.querySelector<HTMLInputElement>('#command-search')!.addEventListener('input', (event) => {
   commandSelection = 0; renderCommandResults((event.target as HTMLInputElement).value);

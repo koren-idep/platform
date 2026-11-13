@@ -685,7 +685,7 @@ impl LspServer {
                 "general": { "positionEncodings": ["utf-16"] },
                 "textDocument": {
                     "hover": { "dynamicRegistration": false },
-                    "definition": { "dynamicRegistration": false },
+                    "definition": { "dynamicRegistration": false, "linkSupport": true },
                     "completion": { "completionItem": { "snippetSupport": false } },
                     "references": { "dynamicRegistration": false },
                     "rename": { "dynamicRegistration": false, "prepareSupport": true },
@@ -1510,15 +1510,27 @@ fn parse_locations(value: Value) -> Result<Vec<Location>, LspError> {
     values
         .into_iter()
         .map(|location| {
-            let uri = location
-                .get("uri")
-                .and_then(Value::as_str)
-                .ok_or_else(|| LspError::Protocol("definition omitted URI".into()))?
-                .to_owned();
-            let range = location
-                .get("range")
-                .cloned()
-                .ok_or_else(|| LspError::Protocol("definition omitted range".into()))?;
+            let (uri, range) = if let Some(uri) = location.get("uri").and_then(Value::as_str) {
+                let range = location
+                    .get("range")
+                    .cloned()
+                    .ok_or_else(|| LspError::Protocol("definition omitted range".into()))?;
+                (uri.to_owned(), range)
+            } else {
+                let uri = location
+                    .get("targetUri")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| LspError::Protocol("definition omitted URI".into()))?
+                    .to_owned();
+                let range = location
+                    .get("targetSelectionRange")
+                    .or_else(|| location.get("targetRange"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        LspError::Protocol("definition link omitted target range".into())
+                    })?;
+                (uri, range)
+            };
             let range = serde_json::from_value(range)
                 .map_err(|error| LspError::Protocol(error.to_string()))?;
             Ok(Location { uri, range })
@@ -2090,6 +2102,14 @@ mod tests {
             "alpha"
         );
         assert_eq!(parse_locations(json!({"uri":"file:///target","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}})).unwrap().len(), 1);
+        assert_eq!(parse_locations(json!([{"uri":"file:///target","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}},{"targetUri":"file:///other","targetRange":{"start":{"line":2,"character":3},"end":{"line":2,"character":8}},"targetSelectionRange":{"start":{"line":2,"character":4},"end":{"line":2,"character":8}}}])).unwrap(), vec![
+            Location { uri: "file:///target".into(), range: TextRange { start: TextPosition { line: 0, character: 0 }, end: TextPosition { line: 0, character: 1 } } },
+            Location { uri: "file:///other".into(), range: TextRange { start: TextPosition { line: 2, character: 4 }, end: TextPosition { line: 2, character: 8 } } },
+        ]);
+        assert_eq!(
+            parse_locations(Value::Null).unwrap(),
+            Vec::<Location>::new()
+        );
         let edit = parse_workspace_edit(&json!({"documentChanges":[
             {"textDocument":{"uri":"file:///demo","version":2},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"x"}]},
             {"kind":"rename","oldUri":"file:///a","newUri":"file:///b"}
@@ -2188,7 +2208,19 @@ mod tests {
                 )
                 .unwrap()
                 .value,
-            []
+            [Location {
+                uri: "file:///definition".into(),
+                range: TextRange {
+                    start: TextPosition {
+                        line: 3,
+                        character: 2,
+                    },
+                    end: TextPosition {
+                        line: 3,
+                        character: 8,
+                    },
+                },
+            }]
         );
         exercise_advanced_requests(server);
         server.did_open("file:///demo", "demo", 1, "hello").unwrap();

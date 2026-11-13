@@ -85,7 +85,11 @@ while True:
             wait_for_gate("FAKE_LSP_COMPLETION_GATE", "FAKE_LSP_COMPLETION_REACHED")
             result = {"isIncomplete": False, "items": [{"label": "complete"}]}
         elif method == "textDocument/definition":
-            result = []
+            result = [{
+                "targetUri": "file:///definition",
+                "targetRange": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 8}},
+                "targetSelectionRange": {"start": {"line": 3, "character": 2}, "end": {"line": 3, "character": 8}},
+            }]
         elif method == "textDocument/codeAction":
             trace(message)
             uri = message["params"]["textDocument"]["uri"]

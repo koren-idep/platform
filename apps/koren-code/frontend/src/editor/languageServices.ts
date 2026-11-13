@@ -20,6 +20,26 @@ export function selectedLocation<T>(locations: T[], selection: string | null): T
   return locations[Number(selection) - 1];
 }
 
+export async function goToDefinition(client: KorenClient, host: LanguageServiceHost, view: EditorView): Promise<void> {
+  try {
+    await host.flush();
+    const revision = host.revision();
+    const response = await client.call({ method: 'language_definition', params: {
+      document_id: host.documentId, expected_revision: revision,
+      position: positionAt(view.state.doc.toString(), view.state.selection.main.head),
+    } });
+    if (response.kind !== 'language_definitions' || response.value.document_revision !== host.revision()) return;
+    const locations = response.value.locations;
+    if (!locations.length) { host.message?.('No definition found at this location.'); return; }
+    const choice = locations.length === 1 ? '1' : window.prompt(locations.map((location, index) =>
+      `${index + 1}. ${location.uri}:${location.range.start.line + 1}:${location.range.start.character + 1}`,
+    ).join('\n'), '1');
+    const target = selectedLocation(locations, choice);
+    if (!target) return;
+    await host.navigate(target.uri, target.range);
+  } catch (error) { host.message?.(error instanceof Error ? error.message : String(error)); }
+}
+
 function editorChanges(view: EditorView, edits: Array<{ range: TextRange; new_text: string }>) {
   const doc = view.state.doc;
   const changes = edits.map((edit) => {
@@ -75,25 +95,7 @@ export function languageServiceExtensions(client: KorenClient, host: LanguageSer
     } catch { return null; }
   }, { hoverTime: 350, hideOnChange: true });
 
-  const definition = async (view: EditorView) => {
-    try {
-      await host.flush();
-      const revision = host.revision();
-      const response = await client.call({ method: 'language_definition', params: {
-        document_id: host.documentId, expected_revision: revision,
-        position: positionAt(view.state.doc.toString(), view.state.selection.main.head),
-      } });
-      if (response.kind !== 'language_definitions' || response.value.document_revision !== host.revision()) return true;
-      const locations = response.value.locations;
-      if (!locations.length) { host.message?.('No definition found at this location.'); return true; }
-      const choice = locations.length === 1 ? '1' : window.prompt(locations.map((location, index) =>
-        `${index + 1}. ${location.uri}:${location.range.start.line + 1}:${location.range.start.character + 1}`,
-      ).join('\n'), '1');
-      const target = selectedLocation(locations, choice);
-      if (target) await host.navigate(target.uri, target.range);
-    } catch (error) { host.message?.(error instanceof Error ? error.message : String(error)); }
-    return true;
-  };
+  const definition = async (view: EditorView) => { await goToDefinition(client, host, view); return true; };
 
   const references = async (view: EditorView) => {
     try {
