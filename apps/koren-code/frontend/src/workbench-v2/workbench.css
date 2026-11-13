@@ -112,8 +112,8 @@
 .workbench-v2 .workbench { padding: 8px 7px 5px; }
 .workbench-v2 .explorer, .secondary-sidebar { border: 0; border-radius: 7px; background: #151719; }
 .workbench-v2 .explorer .panel-heading, .workbench-v2 .explorer-footer { display: none; }
-.workbench-v2 .primary-sidebar-tabs { min-height: 37px; padding: 4px 7px; border-bottom: 0; gap: 2px; }
-.workbench-v2 .primary-sidebar-tabs button { flex: 0 1 auto; padding: 0 11px; border-radius: 4px; color: #abb1bb; font-size: 12px; }
+.workbench-v2 .primary-sidebar-tabs { min-height: 35px; padding: 3px 6px; border-bottom: 0; gap: 2px; }
+.workbench-v2 .primary-sidebar-tabs button { flex: 0 1 auto; padding: 0 8px; border-radius: 4px; color: #abb1bb; font-size: 12px; }
 .workbench-v2 .primary-sidebar-tabs button.selected { background: #303235; box-shadow: inset 0 0 0 1px #404348; }
 .workbench-v2 .primary-sidebar-tabs button:hover { color: var(--text); background-color: #25282c; }
 .workbench-v2 .tree-row { height: 25px; border-radius: 4px; }
@@ -124,10 +124,11 @@
 .workbench-v2 .explorer-resizer, .workbench-v2 .secondary-resizer { background: transparent; }
 .workbench-v2 .main-column { gap: 5px; background: transparent; }
 .workbench-v2 .editor-frame { border-radius: 7px; background: #151719; }
-.workbench-v2 .tabs { height: 34px; min-height: 34px; padding: 3px 5px; gap: 3px; border: 0; background: #151719; }
-.workbench-v2 .tab { min-width: 105px; height: 28px; border: 0; border-radius: 4px; }
+.workbench-v2 .tabs { height: 32px; min-height: 32px; padding: 3px 4px; gap: 2px; border: 0; background: #151719; }
+.workbench-v2 .tab { min-width: 98px; height: 26px; border: 0; border-radius: 4px; }
 .workbench-v2 .tab.active { background: #263746; box-shadow: inset 0 0 0 1px #3573a5; }
-.workbench-v2 .tab-select { padding-left: 8px; }
+.workbench-v2 .tab-select { padding-left: 6px; }
+.workbench-v2 .tab-close { width: 21px; height: 21px; flex-basis: 21px; margin-right: 3px; }
 .workbench-v2 .tree-chevron svg, .workbench-v2 .tree-icon svg, .workbench-v2 .tab-file-icon svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; vertical-align: middle; }
 .workbench-v2 .tree-chevron { color: var(--muted); }
 .workbench-v2 .tab-file-icon { display: inline-flex; flex: 0 0 16px; color: var(--muted); }
@@ -209,8 +210,8 @@
 .settings-extension-row button { padding: 5px 9px; border: 1px solid var(--border); border-radius: 4px; }
 .workbench-v2 .status-bar { background: #08090a; border: 0; }
 :root[data-project-colors="false"] .project-menu-region { background: var(--wb-header); }
-:root[data-project-colors="true"][data-project-color-style="subtle-gradient"] .project-menu-region { background: linear-gradient(180deg, transparent 55%, color-mix(in srgb, var(--wb-header) 65%, transparent) 82%, var(--wb-header) 100%), linear-gradient(90deg, color-mix(in srgb, var(--project-color) var(--project-intensity), var(--wb-header)) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .62), var(--wb-header)) 34%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .24), var(--wb-header)) 72%, var(--wb-header) 100%); }
-:root[data-project-colors="true"][data-project-color-style="solid-tint"] .project-menu-region { background: linear-gradient(180deg, transparent 55%, color-mix(in srgb, var(--wb-header) 65%, transparent) 82%, var(--wb-header) 100%), linear-gradient(90deg, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .72), var(--wb-header)) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .38), var(--wb-header)) 58%, var(--wb-header) 100%); }
+:root[data-project-colors="true"][data-project-color-style="subtle-gradient"] .project-menu-region { background: linear-gradient(180deg, transparent 24%, color-mix(in srgb, var(--wb-header) 48%, transparent) 72%, var(--wb-header) 100%), linear-gradient(90deg, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .58), var(--wb-header)) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .38), var(--wb-header)) 25%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .18), var(--wb-header)) 58%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .05), var(--wb-header)) 82%, var(--wb-header) 100%); }
+:root[data-project-colors="true"][data-project-color-style="solid-tint"] .project-menu-region { background: linear-gradient(180deg, transparent 24%, color-mix(in srgb, var(--wb-header) 48%, transparent) 72%, var(--wb-header) 100%), linear-gradient(90deg, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .58), var(--wb-header)) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .34), var(--wb-header)) 40%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .1), var(--wb-header)) 78%, var(--wb-header) 100%); }
 :root[data-project-colors="true"][data-project-color-style="icon-only"] .project-menu-region { background: var(--wb-header); }
 :root[data-project-colors="true"][data-project-color-style="icon-only"] .project-icon-mark { color: var(--project-color); }
 :root[data-project-colors="true"][data-project-color-style="subtle-gradient"] .project-icon-mark,
