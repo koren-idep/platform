@@ -520,6 +520,10 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
     documentId: tab.id,
     revision: () => documentViews.get(tab.id)?.pipeline.currentRevision ?? revision,
     flush: () => documentViews.get(tab.id)?.pipeline.flush() ?? Promise.resolve(),
+    diagnostics: () => [...(diagnosticsByDocument.get(tab.id)?.values() ?? [])]
+      .flatMap((set) => set.diagnostics)
+      .filter((diagnostic) => diagnostic.document_revision === (documentViews.get(tab.id)?.pipeline.currentRevision ?? revision))
+      .map(({ range, severity, code, source, message }) => ({ range, severity: severity === 'error' ? 1 : severity === 'warning' ? 2 : severity === 'information' ? 3 : severity === 'hint' ? 4 : null, code, source, message })),
     navigate: navigateToDefinition,
   });
   const theme = EditorView.theme({

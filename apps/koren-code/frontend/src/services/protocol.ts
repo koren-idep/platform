@@ -111,6 +111,9 @@ export interface LanguageDiagnostic {
   code: string | null; related_information: Array<{ uri: string; range: TextRange; message: string }>;
   document_revision: number | null; document_version: number | null;
 }
+export interface LanguageDiagnosticContext {
+  range: TextRange; severity: number | null; code: string | null; source: string | null; message: string;
+}
 export interface LanguageDiagnosticSet {
   provider_id: string; uri: string; document_version: number | null; document_id: number | null; diagnostics: LanguageDiagnostic[];
 }
@@ -202,7 +205,7 @@ export type ExistingRequestMethod =
   | { method: 'language_definition'; params: { document_id: number; expected_revision: number; position: TextPosition } }
   | { method: 'language_references'; params: { document_id: number; expected_revision: number; position: TextPosition; include_declaration: boolean } }
   | { method: 'language_format'; params: { document_id: number; expected_revision: number } }
-  | { method: 'language_code_actions'; params: { document_id: number; expected_revision: number; range: TextRange } }
+  | { method: 'language_code_actions'; params: { document_id: number; expected_revision: number; range: TextRange; diagnostics?: LanguageDiagnosticContext[] } }
   | { method: 'language_rename'; params: { document_id: number; expected_revision: number; position: TextPosition; new_name: string } }
   | { method: 'inspect_document'; params: { document_id: number; expected_revision: number; language: string } }
   | { method: 'open_workspace'; params: { path: string } }

@@ -540,6 +540,12 @@ impl DesktopBackend {
         reply: Sender<Response>,
         pool: &LanguageFeaturePool,
     ) -> bool {
+        let code_action_diagnostics = match &request.method {
+            RequestMethod::LanguageCodeActions { diagnostics, .. } => {
+                diagnostics.clone().unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
         let (kind, document_id, expected_revision, position, include_declaration, range, new_name) =
             match &request.method {
                 RequestMethod::LanguageHover {
@@ -617,6 +623,7 @@ impl DesktopBackend {
                     document_id,
                     expected_revision,
                     range,
+                    ..
                 } => (
                     FeatureKind::CodeActions,
                     *document_id,
@@ -668,6 +675,7 @@ impl DesktopBackend {
                     include_declaration,
                     range,
                     new_name,
+                    code_action_diagnostics,
                 },
                 targets,
                 cancelled,
@@ -3931,6 +3939,7 @@ struct LanguageFeatureParams {
     include_declaration: bool,
     range: koren_protocol::TextRange,
     new_name: Option<String>,
+    code_action_diagnostics: Vec<koren_protocol::LanguageDiagnosticContext>,
 }
 
 fn single_position_range(position: koren_protocol::TextPosition) -> koren_protocol::TextRange {
@@ -3953,6 +3962,7 @@ fn run_language_feature(
         include_declaration,
         range,
         new_name,
+        code_action_diagnostics,
     } = params;
     let deadline = Instant::now() + LANGUAGE_FEATURE_TIMEOUT;
     let mut tickets = Vec::new();
@@ -4002,8 +4012,23 @@ fn run_language_feature(
                 uri,
                 version,
                 range,
-                diagnostics: Vec::new(),
-                only: Vec::new(),
+                diagnostics: code_action_diagnostics
+                    .iter()
+                    .map(|diagnostic| {
+                        serde_json::json!({
+                            "range": diagnostic.range,
+                            "severity": diagnostic.severity.filter(|value| (1..=4).contains(value)),
+                            "code": diagnostic.code,
+                            "source": diagnostic.source,
+                            "message": diagnostic.message,
+                        })
+                    })
+                    .collect(),
+                only: if code_action_diagnostics.is_empty() {
+                    Vec::new()
+                } else {
+                    vec!["quickfix".into()]
+                },
                 timeout: LANGUAGE_FEATURE_TIMEOUT,
             },
             FeatureKind::Rename => LspRequest::Rename {
@@ -6403,7 +6428,7 @@ mod tests {
         let command = if cfg!(windows) { "python" } else { "python3" };
         let argument = serde_json::to_string(&fixture.to_string_lossy()).unwrap();
         let manifest = format!(
-            "schema_version=1\nid='org.example.demo-server'\nname='Demo server'\npublisher='Koren tests'\nversion='0.1.0'\ndescription='Fake language-server integration test'\nentry_point='main.lua'\napi_version='1.0.0'\ncapabilities=['language_definitions','language_server']\n[[languages]]\nid='demo'\nname='Demo'\nextensions=['demo']\n[[language_servers]]\nid='fake'\ncommand='{command}'\nlanguages=['demo']\nfile_extensions=['demo']\narguments=[{argument}]\nenvironment={{FAKE_SECRET='hidden-value'}}\n"
+            "schema_version=1\nid='org.example.demo-server'\nname='Demo server'\npublisher='Koren tests'\nversion='0.1.0'\ndescription='Fake language-server integration test'\nentry_point='main.lua'\napi_version='1.0.0'\ncapabilities=['language_definitions','language_server']\n[[languages]]\nid='demo'\nname='Demo'\nextensions=['demo']\n[[language_servers]]\nid='fake'\ncommand='{command}'\nlanguages=['demo']\nfile_extensions=['demo']\narguments=[{argument}]\nenvironment={{FAKE_SECRET='hidden-value',FAKE_LSP_REQUIRE_CODE_ACTION_CONTEXT='1'}}\n"
         );
         fs::write(extension_dir.join("koren-extension.toml"), manifest).unwrap();
 
@@ -6433,7 +6458,10 @@ mod tests {
         let ResponseValue::LanguageServerApprovalRequired(approval) = approval else {
             panic!("expected explicit server approval")
         };
-        assert_eq!(approval.environment_keys, ["FAKE_SECRET"]);
+        assert_eq!(
+            approval.environment_keys,
+            ["FAKE_LSP_REQUIRE_CODE_ACTION_CONTEXT", "FAKE_SECRET"]
+        );
         assert!(
             !serde_json::to_string(&approval)
                 .unwrap()
@@ -6481,6 +6509,13 @@ mod tests {
         assert!(matches!(
             run_deferred_language_request(&backend, &feature_pool, 21, RequestMethod::LanguageCodeActions {
                 document_id, expected_revision: 0, range,
+                diagnostics: Some(vec![koren_protocol::LanguageDiagnosticContext {
+                    range,
+                    severity: Some(1),
+                    code: Some("missing-name".into()),
+                    source: Some("rust-analyzer".into()),
+                    message: "cannot find value in this scope".into(),
+                }]),
             }).unwrap(),
             ResponseValue::LanguageCodeActions { actions, .. }
                 if actions.len() == 1 && actions[0].edits.as_ref().is_some_and(|edits| edits[0].new_text == "demo")

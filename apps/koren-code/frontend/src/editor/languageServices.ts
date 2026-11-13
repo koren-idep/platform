@@ -2,13 +2,14 @@ import { autocompletion, type Completion, type CompletionContext } from '@codemi
 import type { Extension } from '@codemirror/state';
 import { hoverTooltip, keymap, type EditorView } from '@codemirror/view';
 import type { KorenClient } from '../services/client';
-import type { TextRange } from '../services/protocol';
+import type { LanguageDiagnosticContext, TextRange } from '../services/protocol';
 import { positionAt } from './sync';
 
 export interface LanguageServiceHost {
   documentId: number;
   revision(): number;
   flush(): Promise<void>;
+  diagnostics(): LanguageDiagnosticContext[];
   navigate(uri: string, range: TextRange): Promise<void>;
 }
 
@@ -131,6 +132,7 @@ export function languageServiceExtensions(client: KorenClient, host: LanguageSer
       const response = await client.call({ method: 'language_code_actions', params: {
         document_id: host.documentId, expected_revision: revision,
         range: { start: positionAt(text, startOffset), end: positionAt(text, endOffset) },
+        diagnostics: host.diagnostics(),
       } });
       if (response.kind !== 'language_code_actions' || response.value.document_revision !== host.revision()) return true;
       const actions = response.value.actions;

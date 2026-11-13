@@ -32,6 +32,21 @@ pub struct TextEdit {
     pub new_text: String,
 }
 
+/// Current language-server diagnostic details supplied as code-action context.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LanguageDiagnosticContext {
+    /// Diagnostic range in UTF-16 document coordinates.
+    pub range: TextRange,
+    /// LSP diagnostic severity value (1 error, 2 warning, 3 information, 4 hint).
+    pub severity: Option<u8>,
+    /// Optional provider diagnostic code.
+    pub code: Option<String>,
+    /// Optional diagnostic source label.
+    pub source: Option<String>,
+    /// Diagnostic message.
+    pub message: String,
+}
+
 /// Explicit choice for resolving a detected external file conflict.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -209,6 +224,9 @@ pub enum RequestMethod {
         expected_revision: u64,
         /// Selected UTF-16 range; an empty range requests intentions.
         range: TextRange,
+        /// Diagnostics to help providers return quick fixes. Omitted by older protocol-v2 clients.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostics: Option<Vec<LanguageDiagnosticContext>>,
     },
     /// Request a symbol rename proposal from the active language server.
     LanguageRename {
@@ -2169,6 +2187,21 @@ mod tests {
                     character: 2,
                 },
             },
+            RequestMethod::LanguageCodeActions {
+                document_id: 4,
+                expected_revision: 9,
+                range: TextRange {
+                    start: TextPosition {
+                        line: 1,
+                        character: 2,
+                    },
+                    end: TextPosition {
+                        line: 1,
+                        character: 5,
+                    },
+                },
+                diagnostics: None,
+            },
         ];
         for method in requests {
             let request = Request::new(42, method);
@@ -2176,6 +2209,16 @@ mod tests {
             assert!(encoded.contains("\"version\":2"));
             assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), request);
         }
+        let legacy_code_action_request = r#"{"version":2,"request_id":42,"method":{"method":"language_code_actions","params":{"document_id":4,"expected_revision":9,"range":{"start":{"line":1,"character":2},"end":{"line":1,"character":5}}}}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Request>(legacy_code_action_request)
+                .unwrap()
+                .method,
+            RequestMethod::LanguageCodeActions {
+                diagnostics: None,
+                ..
+            }
+        ));
         let response = Response::new(
             42,
             Ok(ResponseValue::LanguageServerApprovalRequired(

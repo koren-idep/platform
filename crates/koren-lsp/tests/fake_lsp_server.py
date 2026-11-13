@@ -87,10 +87,15 @@ while True:
         elif method == "textDocument/definition":
             result = []
         elif method == "textDocument/codeAction":
+            trace(message)
             uri = message["params"]["textDocument"]["uri"]
-            result = [{"title": "Replace text", "kind": "quickfix", "data": {"token": "demo"}, "edit": {"changes": {uri: [{
-                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}, "newText": "demo"
-            }]}}}]
+            result = []
+            context = message["params"]["context"]
+            require_context = os.environ.get("FAKE_LSP_REQUIRE_CODE_ACTION_CONTEXT") == "1"
+            if not require_context or (context["diagnostics"] and "quickfix" in context["only"]):
+                result = [{"title": "Replace text", "kind": "quickfix", "data": {"token": "demo"}, "edit": {"changes": {uri: [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}, "newText": "demo"
+                }]}}}]
         elif method == "codeAction/resolve":
             result = message["params"]
         elif method == "textDocument/references":
