@@ -3,13 +3,19 @@ export interface LayoutPreferences {
   bottomHeight: number;
   explorerCollapsed: boolean;
   bottomCollapsed: boolean;
+  primaryView: 'files' | 'search' | 'git' | 'extensions';
+  secondaryWidth: number;
+  secondaryCollapsed: boolean;
 }
 
 export const DEFAULT_LAYOUT: Readonly<LayoutPreferences> = {
-  explorerWidth: 276,
-  bottomHeight: 188,
+  explorerWidth: 260,
+  bottomHeight: 220,
   explorerCollapsed: false,
-  bottomCollapsed: false,
+  bottomCollapsed: true,
+  primaryView: 'files',
+  secondaryWidth: 300,
+  secondaryCollapsed: true,
 };
 
 const KEY = 'koren-code:layout';
@@ -24,6 +30,9 @@ export function readLayout(storage: Pick<Storage, 'getItem'>): LayoutPreferences
       bottomHeight: boundedNumber(value.bottomHeight, 90, 480, DEFAULT_LAYOUT.bottomHeight),
       explorerCollapsed: value.explorerCollapsed === true,
       bottomCollapsed: value.bottomCollapsed === true,
+      primaryView: value.primaryView === 'search' || value.primaryView === 'git' || value.primaryView === 'extensions' ? value.primaryView : 'files',
+      secondaryWidth: boundedNumber(value.secondaryWidth, 180, 480, DEFAULT_LAYOUT.secondaryWidth),
+      secondaryCollapsed: value.secondaryCollapsed !== false,
     };
   } catch {
     return { ...DEFAULT_LAYOUT };
@@ -41,6 +50,7 @@ export function fitLayoutToViewport(layout: LayoutPreferences, width: number, he
     ...layout,
     explorerWidth: Math.round(Math.min(layout.explorerWidth, Math.max(148, usableWidth * 0.42))),
     bottomHeight: Math.round(Math.min(layout.bottomHeight, Math.max(96, Math.min(480, usableHeight * 0.5)))),
+    secondaryWidth: Math.round(Math.min(layout.secondaryWidth, Math.max(180, usableWidth * 0.32))),
   };
 }
 

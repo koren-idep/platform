@@ -5,6 +5,12 @@ import { persistSession, readSession } from './session';
 import { formatCursorPosition, lineEndingFor } from './status';
 
 describe('desktop presentation helpers', () => {
+  it('starts a fresh layout with the bottom tool window collapsed', () => {
+    expect(readLayout({ getItem: () => null }).bottomCollapsed).toBe(true);
+    expect(DEFAULT_LAYOUT.explorerWidth).toBe(260);
+    expect(DEFAULT_LAYOUT.bottomHeight).toBe(220);
+  });
+
   it('filters registered commands and wraps palette selection', () => {
     expect(filterCommands(['core.ping', 'editor.save'], 'SAVE')).toEqual(['editor.save']);
     expect(nextCommandSelection(0, 2, -1)).toBe(1);

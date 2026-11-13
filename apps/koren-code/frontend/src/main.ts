@@ -2,6 +2,8 @@ import { redo, redoDepth, selectAll, undo, undoDepth } from '@codemirror/command
 import { Compartment, EditorState } from '@codemirror/state';
 import { basicSetup, EditorView } from 'codemirror';
 import { linter, setDiagnostics, type Diagnostic as CodeMirrorDiagnostic } from '@codemirror/lint';
+import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
+import { tags } from '@lezer/highlight';
 import { KorenClient, KorenError, createDesktopTransport } from './services/client';
 import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary, ExtensionSettingSummary, ExtensionSettingValue, ExtensionSummary, ExtensionThemeSummary, ExtensionToolWindowSummary, ExtensionUiDocument, GitRepositorySummary, GitStatusSummary, InspectionConfigurationSummary, InspectionFinding, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ProjectInspectionSummary, ResponseValue, TaskSummary, TextRange } from './services/protocol';
 import type { SearchMatch } from './services/protocol';
@@ -15,6 +17,7 @@ import { formatCursorPosition, lineEndingFor } from './app/status';
 import { runConfigurationTasks, selectedRunTask } from './app/toolbar';
 import { gitRepositoryChoices, groupSearchMatches, normalizedCommitMessage, partitionGitFiles, searchSummaryText } from './app/developerTools';
 import { nextTheme, persistTheme, readTheme } from './app/theme';
+import { effectiveSetting, loadSettings, resetSetting, resetSettings, searchSettings, writeSetting, type SettingDescriptor, type SettingsScope, type SettingsSnapshot } from './app/settings';
 import { taskStatus, visibleOutput } from './app/taskPresentation';
 import { extensionCanActivate, extensionToggleLabel, languageServerEnabled } from './app/extensions';
 import { diagnosticsForRevision, withDiagnosticPublication } from './app/diagnostics';
@@ -29,160 +32,14 @@ import { installDefinitionShortcut, positionForRange, workspaceRelativePath } fr
 import { debugGutter } from './editor/debugGutter';
 import { absoluteDebugSourcePath } from './editor/debugSource';
 import './styles/main.css';
+import './workbench-v2/workbench.css';
+import { workbenchMarkup } from './workbench-v2/shell';
 
 const client = new KorenClient(createDesktopTransport());
 interface RecoverySnapshot { schema_version: number; id: string; workspace: string; path: string; contents: string; base_sha256: string; revision: number; updated_at_ms: number }
 interface RecoverySummary { id: string; workspace: string; path: string; revision: number; updated_at_ms: number; byte_length: number }
 const app = document.querySelector<HTMLDivElement>('#app')!;
-app.innerHTML = `
-  <header class="menu-bar">
-    <div class="brand" aria-label="Koren Code Editor"><span class="brand-mark">&lt;/&gt;</span><span class="brand-name">Koren Code Editor</span></div>
-    <span class="brand-divider" aria-hidden="true"></span>
-    <nav class="menus" aria-label="Main menu">
-      <details class="menu-group"><summary>File</summary><div class="menu-popup" role="menu">
-        <button role="menuitem" data-action="open">Open Folder… <kbd>Ctrl+O</kbd></button>
-        <button role="menuitem" data-action="open-file" id="menu-open-file" disabled>Open File… <kbd>Ctrl+Shift+O</kbd></button>
-        <button role="menuitem" data-action="new-file">New File <kbd>Ctrl+N</kbd></button>
-        <div class="menu-separator"></div>
-        <button role="menuitem" data-action="save">Save <kbd>Ctrl+S</kbd></button>
-        <button role="menuitem" data-action="save-all">Save All</button>
-        <button role="menuitem" data-action="close-active">Close Active Tab <kbd>Ctrl+W</kbd></button>
-      </div></details>
-      <details class="menu-group"><summary>Edit</summary><div class="menu-popup" role="menu">
-        <button role="menuitem" data-action="undo">Undo <kbd>Ctrl+Z</kbd></button>
-        <button role="menuitem" data-action="redo">Redo <kbd>Ctrl+Y</kbd></button>
-        <div class="menu-separator"></div><button role="menuitem" data-action="select-all">Select All <kbd>Ctrl+A</kbd></button>
-      </div></details>
-      <details class="menu-group"><summary>View</summary><div class="menu-popup" role="menu">
-        <button role="menuitem" data-action="toggle-explorer">Toggle Project Explorer <kbd>Ctrl+B</kbd></button>
-        <button role="menuitem" data-action="toggle-bottom">Toggle Bottom Panel <kbd>Ctrl+J</kbd></button>
-        <div class="menu-separator"></div><button role="menuitem" data-action="toggle-theme">Toggle Theme <kbd>Alt+T</kbd></button>
-        <div class="menu-separator"></div>
-        <button role="menuitem" data-action="show-panel" data-panel-target="output">Output</button>
-        <button role="menuitem" data-action="show-panel" data-panel-target="tasks">Tasks</button>
-        <button role="menuitem" data-action="show-panel" data-panel-target="problems">Problems</button>
-        <button role="menuitem" data-action="show-panel" data-panel-target="projects">Projects</button>
-        <button role="menuitem" data-action="show-panel" data-panel-target="search">Search <kbd>Ctrl+Shift+F</kbd></button>
-        <button role="menuitem" data-action="show-panel" data-panel-target="terminal">Terminal <kbd>Ctrl+grave</kbd></button>
-        <button role="menuitem" data-action="source-control">Source Control</button>
-        <div id="extension-panel-menu-items"></div>
-        <div id="extension-wizard-menu-items"></div>
-      </div></details>
-      <details class="menu-group"><summary>Navigate</summary><div class="menu-popup" role="menu">
-        <button role="menuitem" data-action="focus-explorer">Focus Project Explorer <kbd>Ctrl+B</kbd></button>
-        <button role="menuitem" data-action="focus-editor">Focus Editor <kbd>F6</kbd></button>
-        <button role="menuitem" data-action="go-to-definition">Go to Definition <kbd>F12</kbd></button>
-        <div class="menu-separator"></div><button role="menuitem" data-action="previous-tab">Previous Tab <kbd>Ctrl+Shift+Tab</kbd></button>
-        <button role="menuitem" data-action="next-tab">Next Tab <kbd>Ctrl+Tab</kbd></button>
-        <div id="extension-navigate-items"></div>
-      </div></details>
-      <details class="menu-group"><summary>Run</summary><div class="menu-popup" role="menu">
-        <button role="menuitem" data-action="discover">Discover Cargo Projects</button>
-        <div class="menu-separator"></div>
-        <button role="menuitem" data-action="run-cargo" data-command="build">Build Workspace</button>
-        <button role="menuitem" data-action="run-cargo" data-command="check">Check Workspace</button>
-        <button role="menuitem" data-action="run-cargo" data-command="test">Test Workspace</button>
-        <button role="menuitem" data-action="run-cargo" data-command="clean">Clean Workspace</button>
-        <div class="menu-separator"></div><button role="menuitem" data-action="cancel-task" disabled>Cancel Active Task <kbd>F5</kbd></button>
-      </div></details>
-      <details class="menu-group"><summary>Tools</summary><div class="menu-popup" role="menu">
-        <button role="menuitem" data-action="command-palette">Command Palette… <kbd>Ctrl+Shift+P</kbd></button>
-        <button role="menuitem" data-action="extensions">Extensions…</button>
-        <button role="menuitem" data-action="import-sarif">Import SARIF Report…</button>
-        <button role="menuitem" data-action="export-sarif">Export Current Inspections…</button>
-        <div id="extension-tools-items"></div>
-        <button role="menuitem" data-action="copy-path">Copy Current File Path</button>
-        <button role="menuitem" data-action="refresh">Refresh Project Explorer</button>
-      </div></details>
-      <details class="menu-group"><summary>Help</summary><div class="menu-popup" role="menu">
-        <button role="menuitem" data-action="shortcuts">Keyboard Shortcuts</button>
-        <button role="menuitem" data-action="about">About Koren Code Editor</button>
-      </div></details>
-    </nav>
-    <span class="menu-spacer"></span>
-  </header>
-  <div class="toolbar" role="toolbar" aria-label="Editor actions">
-    <div class="toolbar-group">
-      <button class="toolbar-button" data-action="new-file" title="New File (Ctrl+N)" aria-label="New File">＋</button>
-      <button class="toolbar-button" data-action="open" title="Open Folder (Ctrl+O)" aria-label="Open Folder">▱</button>
-      <button class="toolbar-button" data-action="save" id="toolbar-save" disabled title="Save (Ctrl+S)" aria-label="Save">▣</button>
-    </div>
-    <span class="toolbar-divider" aria-hidden="true"></span>
-    <div class="toolbar-group">
-      <button class="toolbar-button" data-action="undo" id="toolbar-undo" disabled title="Undo (Ctrl+Z)" aria-label="Undo">↶</button>
-      <button class="toolbar-button" data-action="redo" id="toolbar-redo" disabled title="Redo (Ctrl+Y)" aria-label="Redo">↷</button>
-    </div>
-    <span class="toolbar-divider" aria-hidden="true"></span>
-    <button class="toolbar-button" data-action="source-control" title="Source Control" aria-label="Source Control">⑂</button>
-    <div class="run-controls">
-      <button class="run-button" data-action="run-selected" id="toolbar-run" disabled title="Run selected configuration after approval"><span aria-hidden="true">▶</span><span>Run</span></button>
-      <select id="run-configuration" aria-label="Run configuration" disabled><option value="">No run configuration</option></select>
-    </div>
-    <span class="toolbar-spacer"></span>
-    <button class="toolbar-button toolbar-utility" data-action="command-palette" title="Command Palette (Ctrl+Shift+P)" aria-label="Command Palette">⌁</button>
-    <button class="toolbar-button toolbar-utility" data-action="settings" title="Settings" aria-label="Settings">⚙</button>
-  </div>
-  <main class="workbench" id="workbench">
-    <aside class="explorer" id="explorer">
-      <div class="panel-heading"><span>PROJECT</span><span class="panel-actions"><button data-action="refresh" title="Refresh explorer" aria-label="Refresh explorer">↻</button><details class="panel-options"><summary title="Project panel options" aria-label="Project panel options">⋮</summary><div class="panel-options-menu" role="menu"><button role="menuitem" data-action="toggle-explorer">Collapse Project Panel</button></div></details><button data-action="toggle-explorer" title="Collapse explorer" aria-label="Collapse explorer">‹</button></span></div>
-      <div id="tree" class="tree" role="tree" aria-label="Project files"></div>
-      <div class="explorer-footer"><button data-action="discover">Discover Cargo</button></div>
-    </aside>
-    <div id="explorer-resizer" class="explorer-resizer" role="separator" aria-label="Resize project explorer" aria-orientation="vertical" tabindex="0"></div>
-    <section class="main-column">
-      <section class="editor-frame" aria-label="Editor workspace">
-        <div id="tabs" class="tabs" role="tablist" aria-label="Open files"></div>
-        <div id="editor" class="editor hidden" aria-label="Code editor"></div>
-        <section id="welcome" class="welcome">
-          <div class="welcome-mark">&lt;/&gt;</div><div class="welcome-title">Koren Code Editor</div>
-          <p>A focused workspace for your code.</p>
-          <div class="welcome-actions"><button class="primary-button" data-action="open">Open Folder</button><button data-action="open-file" id="welcome-open-file">Open File</button></div>
-          <div class="welcome-hint">Open a folder <kbd>Ctrl+O</kbd> <span>·</span> Open a file <kbd>Ctrl+Shift+O</kbd> <span>·</span> Command Palette <kbd>Ctrl+Shift+P</kbd></div>
-        </section>
-      </section>
-      <div class="bottom-resizer" id="bottom-resizer" role="separator" aria-label="Resize bottom panel" aria-orientation="horizontal" tabindex="0"></div>
-      <section class="bottom-panel" id="bottom-panel">
-        <div class="bottom-heading"><div class="tool-tabs" role="tablist" aria-label="Tool panels">
-          <button class="selected" data-panel="output" role="tab" aria-selected="true">Output</button><button data-panel="problems" role="tab" aria-selected="false">Problems <span id="problem-count" class="count-badge">0</span></button><button data-panel="tasks" role="tab" aria-selected="false">Tasks</button><button data-panel="projects" role="tab" aria-selected="false">Projects</button><button data-panel="search" role="tab" aria-selected="false">Search</button><button data-panel="terminal" role="tab" aria-selected="false">Terminal</button><button data-panel="debug" role="tab" aria-selected="false">Debug</button>
-        </div><span id="bottom-task-state" class="task-state"></span><span class="panel-actions"><button data-action="cancel-task" title="Cancel active task" aria-label="Cancel active task" disabled>■</button><button data-action="toggle-bottom" title="Collapse bottom panel" aria-label="Collapse bottom panel">⌄</button></span></div>
-        <div id="output" class="panel-content output"><div class="panel-empty">Task output will appear here.</div></div>
-        <div id="problems" class="panel-content problem-list hidden"><div class="problem-filters"><label>Severity <select id="problem-severity-filter"><option value="all">All</option><option value="error">Errors</option><option value="warning">Warnings</option><option value="information">Information</option><option value="hint">Hints</option></select></label><label>Group by <select id="problem-grouping"><option value="file">File</option><option value="provider">Provider</option><option value="category">Category</option><option value="severity">Severity</option></select></label></div><div id="problem-entries"><div class="panel-empty">No problems reported by installed language integrations.</div></div></div>
-        <div id="tasks" class="panel-content task-list hidden"><div class="panel-empty">Discover Cargo projects to see available tasks.</div></div>
-        <div id="projects" class="panel-content project-list hidden"><div class="project-analysis-controls"><button data-action="start-project-analysis">Analyze Open Documents</button><button data-action="cancel-project-analysis" disabled>Cancel</button><button data-action="load-project-findings" hidden>Load More Findings</button><span id="project-analysis-status">Uses a bounded snapshot of currently open documents.</span></div><div id="project-list"><div class="panel-empty">Project information will appear here.</div></div></div>
-        <div id="search" class="panel-content developer-panel hidden"><form id="search-form" class="developer-controls"><input id="search-query" type="search" placeholder="Search workspace" aria-label="Search workspace"><input id="search-filter" type="text" placeholder="Files to include (glob)" aria-label="File name filter"><label><input id="search-case" type="checkbox"> Match case</label><label><input id="search-regex" type="checkbox"> Regex</label><button type="submit">Search</button><button type="button" data-action="cancel-search" disabled>Cancel</button></form><div id="search-status" class="subtle">Search starts only when requested. Results are limited to 5,000.</div><div id="search-results" class="developer-results"></div></div>
-        <div id="terminal" class="panel-content terminal-panel hidden"><div class="terminal-toolbar"><button type="button" data-terminal-new>＋ New</button><button type="button" data-terminal-rename disabled>Rename</button><button type="button" data-terminal-restart disabled>Restart</button><button type="button" data-terminal-close disabled>Close</button><span data-terminal-status class="subtle">No terminal sessions.</span></div><div class="terminal-session-tabs" data-terminal-tabs role="tablist" aria-label="Terminal sessions"></div><div class="terminal-session-views" data-terminal-views></div><div class="terminal-shortcut-hint">Ctrl+Shift+C copy · Ctrl+Shift+V paste · Ctrl+L clear display</div></div>
-        <div id="debug" class="panel-content debug-panel hidden">
-          <div class="debug-toolbar"><select data-debug-configuration aria-label="Debug configuration"></select><button type="button" data-debug-start disabled>Start</button><button type="button" data-debug-continue disabled>Continue</button><button type="button" data-debug-pause disabled>Pause</button><button type="button" data-debug-step-over disabled>Step Over</button><button type="button" data-debug-step-into disabled>Step Into</button><button type="button" data-debug-step-out disabled>Step Out</button><button type="button" data-debug-stop disabled>Stop</button><select data-debug-session aria-label="Active debug session"></select><button type="button" data-debug-refresh title="Refresh sessions">↻</button><span data-debug-state class="subtle">No active debug session</span></div>
-          <details data-debug-config-editor class="debug-config-editor"><summary>Configure local DAP profile</summary><form data-debug-config-form class="debug-config-form"><label>Adapter ID <input name="adapter_id" required placeholder="local.dap"></label><label>Adapter name <input name="adapter_name" placeholder="Debug Adapter"></label><label>Adapter executable <input name="adapter_command" required placeholder="/path/to/adapter"></label><label>Adapter arguments <input name="adapter_arguments" placeholder="--stdio"></label><label>Adapter working directory <input name="adapter_directory" required placeholder="/workspace"></label><label>Configuration ID <input name="configuration_id" required placeholder="app.launch"></label><label>Configuration name <input name="configuration_name" placeholder="Launch application"></label><label>Program <input name="program" required placeholder="/workspace/target/debug/app"></label><label>Program arguments <input name="arguments" placeholder="--help"></label><label>Target working directory <input name="working_directory" required placeholder="/workspace"></label><button class="primary" type="submit">Save profile</button><span class="subtle">Saved profiles never start until you review and approve each exact launch.</span></form></details>
-          <div class="debug-columns"><section><h3>Threads</h3><div data-debug-threads></div><h3>Call Stack</h3><div data-debug-stack></div></section><section><h3>Variables</h3><div data-debug-variables></div><h3>Breakpoints</h3><div data-debug-breakpoints></div><h3>Debug Output</h3><div data-debug-output class="debug-output" role="log" aria-live="polite"></div></section></div>
-        </div>
-        <div id="source-control" class="panel-content developer-panel hidden"><div class="developer-controls"><select id="git-repository" aria-label="Git repository"><option value="">No repository selected</option></select><button data-action="refresh-git">↻ Refresh</button></div><div id="git-branch" class="subtle"></div><div class="git-columns"><section><h3>Changes</h3><div id="git-unstaged" class="developer-results"></div></section><section><h3>Staged</h3><div id="git-staged" class="developer-results"></div></section></div><pre id="git-diff" class="git-diff" aria-label="Git diff preview"></pre><form id="git-commit-form" class="developer-controls"><input id="git-commit-message" type="text" placeholder="Commit message" aria-label="Commit message"><button type="submit">Commit staged</button></form></div>
-        <div id="extension-panel-content"></div>
-      </section>
-    </section>
-  </main>
-  <footer class="status-bar">
-    <div class="status-workspace"><span class="status-workspace-icon" aria-hidden="true">▱</span><span>Workspace:</span><strong id="status-workspace">No Workspace</strong></div>
-    <span id="status-message" class="status-message">Ready</span><span id="status-document" class="status-revision"></span><span class="status-spacer"></span>
-    <span id="status-language" class="status-item"></span><span id="status-encoding" class="status-item"></span><span id="status-line-ending" class="status-item"></span><span id="status-cursor" class="status-item"></span>
-  </footer>
-  <dialog id="approval-dialog" class="dialog"><form method="dialog"><header>Run task?</header><p class="subtle">Review the command before it starts. Approval is not a sandbox.</p><dl id="approval-details"></dl><div class="dialog-actions"><button value="deny" class="secondary">Deny</button><button value="approve" class="primary">Approve once</button></div></form></dialog>
-  <dialog id="conflict-dialog" class="dialog conflict"><form method="dialog"><header>File changed outside Koren</header><p id="conflict-path"></p><details><summary>Inspect current disk contents</summary><pre id="conflict-preview"></pre></details><p class="subtle">Choose whether to reload the external version or overwrite it with your buffer. If the file changes again, Koren will ask again.</p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="reload" class="secondary">Reload disk version</button><button value="overwrite" class="primary">Overwrite file</button></div></form></dialog>
-  <dialog id="confirm-dialog" class="dialog"><form method="dialog"><header id="confirm-title">Unsaved changes</header><p id="confirm-message"></p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="discard" class="primary">Discard changes</button></div></form></dialog>
-  <dialog id="recovery-dialog" class="dialog"><header>Recover unsaved edits?</header><p>Choose which drafts to restore. Changed or missing files are restored to a new workspace file so their current contents are never replaced.</p><div id="recovery-items" class="recovery-items"></div><div class="dialog-actions"><button type="button" class="secondary" data-action="close-recovery">Later</button></div></dialog>
-  <dialog id="close-dialog" class="dialog"><form method="dialog"><header>Unsaved documents</header><p>Save your changes before closing Koren Code Editor?</p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="discard" class="secondary">Discard and close</button><button value="save" class="primary">Save all and close</button></div></form></dialog>
-  <dialog id="switch-workspace-dialog" class="dialog"><form method="dialog"><header>Switch workspace?</header><p>Choose what to do with open documents before changing folders.</p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="discard" class="secondary">Discard and switch</button><button value="save" class="primary">Save and switch</button></div></form></dialog>
-  <dialog id="command-dialog" class="dialog command-dialog"><form method="dialog"><header>Command Palette</header><input id="command-search" type="search" placeholder="Search available commands" autocomplete="off" aria-label="Search commands"><div id="command-results" role="listbox" aria-label="Available commands"></div><footer><kbd>↑</kbd><kbd>↓</kbd> navigate <kbd>Enter</kbd> run <kbd>Esc</kbd> close</footer></form></dialog>
-  <dialog id="extensions-dialog" class="dialog extensions-dialog"><form method="dialog"><header>Extensions</header><p class="subtle">Local extensions from the configured Koren extensions folder. Code runs only after you enable and activate it.</p><div id="extension-list" class="extension-list"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
-  <dialog id="language-server-approval-dialog" class="dialog"><form method="dialog"><header>Start language server?</header><p class="subtle">This starts an external program with your user account permissions. Approval is not a sandbox. Review the exact command and workspace.</p><dl id="language-server-approval-details"></dl><div class="dialog-actions"><button value="deny" class="secondary">Deny</button><button value="approve" class="primary">Approve and start</button></div></form></dialog>
-  <dialog id="terminal-approval-dialog" class="dialog"><form><header>Start interactive shell?</header><p class="subtle">Approval grants this shell interactive access using your account permissions. Commands entered later are not individually reviewed, and this is not a filesystem sandbox.</p><dl data-terminal-approval-details></dl><div class="dialog-actions"><button type="submit" value="deny" class="secondary">Deny</button><button type="submit" value="approve" class="primary">Approve and start</button></div></form></dialog>
-  <dialog id="debug-approval-dialog" class="dialog"><form><header>Authorize debugger and target?</header><p class="subtle">The adapter can inspect the target process. Approval is not a sandbox. Environment values are hidden.</p><dl data-debug-approval-details></dl><div class="dialog-actions"><button type="submit" value="deny" class="secondary">Deny</button><button type="submit" value="approve" class="primary">Approve once</button></div></form></dialog>
-  <dialog id="settings-dialog" class="dialog settings-dialog"><form method="dialog"><header>Settings</header><label for="theme-setting">Color theme</label><select id="theme-setting"><option value="dark">OLED Black</option><option value="light">Light</option></select><div id="extension-settings" class="extension-settings"></div><section class="inspection-settings"><h3>Inspections</h3><div id="inspection-settings"></div></section><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
-  <dialog id="info-dialog" class="dialog"><form method="dialog"><header id="info-title"></header><div id="info-content" class="info-content"></div><div class="dialog-actions"><button value="close" class="primary">Close</button></div></form></dialog>
-  <dialog id="workspace-input-dialog" class="dialog"><form id="workspace-input-form"><header id="workspace-input-title"></header><label id="workspace-input-label" for="workspace-input"></label><input id="workspace-input" type="text" autocomplete="off"><div class="dialog-actions"><button type="button" value="cancel" class="secondary">Cancel</button><button type="submit" class="primary">Continue</button></div></form></dialog>
-  <dialog id="workspace-delete-dialog" class="dialog"><form method="dialog"><header>Delete workspace entry?</header><p id="workspace-delete-path"></p><p class="subtle">This permanently deletes the selected entry from disk. Open dirty documents are protected.</p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="delete" class="danger">Delete</button></div></form></dialog>
-  <dialog id="project-wizard-dialog" class="dialog"><form id="project-wizard-form"><header id="project-wizard-title"></header><div id="project-wizard-fields" class="extension-panel-view"></div><p class="subtle">Submitting validates these fields only. Project creation must be performed by a host-authorized extension operation.</p><div class="dialog-actions"><button type="button" class="secondary" data-action="close-wizard">Cancel</button><button type="submit" class="primary">Validate form</button></div></form></dialog>
-  <div id="status-toast" role="status" aria-live="polite"></div>`;
+app.innerHTML = workbenchMarkup;
 
 let terminalPanel: import('./app/terminal').TerminalPanel | null = null;
 let debugPanel: import('./app/debug').DebugPanel | null = null;
@@ -204,6 +61,12 @@ async function loadDebugPanel(): Promise<void> {
 const treeState = new ProjectTreeState();
 const tabs = new TabState();
 const layout: LayoutPreferences = readLayout(localStorage);
+let settingsData = loadSettings(localStorage);
+let settingsSnapshot: SettingsSnapshot = settingsData.snapshot;
+let settingsScope: SettingsScope = 'user';
+let settingsCategory = 'Appearance';
+let settingsModifiedOnly = false;
+let settingsQuery = '';
 const treeRoot = document.querySelector<HTMLDivElement>('#tree')!;
 const editorHost = document.querySelector<HTMLDivElement>('#editor')!;
 const welcome = document.querySelector<HTMLElement>('#welcome')!;
@@ -218,7 +81,7 @@ const rootLabel = document.querySelector<HTMLElement>('#status-workspace')!;
 let workspaceRoot = '';
 let selectedPath = '';
 let runId: number | null = null;
-const documentViews = new Map<number, { state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment; goToDefinition: (view: EditorView) => Promise<void> }>();
+const documentViews = new Map<number, { state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment; wrapConfig: Compartment; goToDefinition: (view: EditorView) => Promise<void> }>();
 const recoveryBaseHashes = new Map<number, string>();
 const recoveryTimers = new Map<number, number>();
 const recoveryWrites = new Map<number, Promise<void>>();
@@ -411,9 +274,14 @@ function applyLayout(): void {
   Object.assign(layout, fitLayoutToViewport(layout, window.innerWidth, window.innerHeight));
   workbench.style.setProperty('--explorer-width', `${layout.explorerWidth}px`);
   workbench.style.setProperty('--bottom-height', `${layout.bottomHeight}px`);
+  document.querySelector<HTMLElement>('.workbench-v2')!.style.setProperty('--bottom-height', `${layout.bottomHeight}px`);
+  workbench.style.setProperty('--secondary-width', `${layout.secondaryWidth}px`);
   document.querySelector('#explorer')!.classList.toggle('collapsed', layout.explorerCollapsed);
   workbench.classList.toggle('explorer-collapsed', layout.explorerCollapsed);
   document.querySelector('#bottom-panel')!.classList.toggle('collapsed', layout.bottomCollapsed);
+  document.querySelector('#secondary-sidebar')!.classList.toggle('collapsed', layout.secondaryCollapsed);
+  workbench.classList.toggle('secondary-collapsed', layout.secondaryCollapsed);
+  renderSidebarView(layout.primaryView);
 }
 function saveLayout(): void { persistLayout(localStorage, layout); }
 function saveSession(): void {
@@ -437,10 +305,58 @@ function setBottomCollapsed(collapsed: boolean): void {
   document.querySelector('#bottom-resizer')!.classList.toggle('hidden', collapsed);
   saveLayout();
 }
+function setSecondaryCollapsed(collapsed: boolean): void {
+  layout.secondaryCollapsed = collapsed;
+  document.querySelector('#secondary-sidebar')!.classList.toggle('collapsed', collapsed);
+  workbench.classList.toggle('secondary-collapsed', collapsed);
+  saveLayout();
+}
+
+function renderSidebarView(view: LayoutPreferences['primaryView']): void {
+  for (const id of ['tree', 'search', 'source-control', 'sidebar-extensions']) {
+    document.querySelector(`#${id}`)?.classList.toggle('hidden', id !== 'tree' && id !== (view === 'git' ? 'source-control' : view === 'extensions' ? 'sidebar-extensions' : view));
+  }
+  for (const button of document.querySelectorAll<HTMLButtonElement>('[data-sidebar-view]')) {
+    const selected = button.dataset.sidebarView === view;
+    button.classList.toggle('selected', selected); button.setAttribute('aria-selected', String(selected));
+  }
+  const title = document.querySelector<HTMLElement>('#primary-sidebar-title');
+  if (title) title.textContent = view === 'git' ? 'GIT' : view.toUpperCase();
+}
+
+function setSidebarView(view: LayoutPreferences['primaryView']): void {
+  layout.primaryView = view;
+  renderSidebarView(view);
+  saveLayout();
+}
+
+function selectSidebarView(view: LayoutPreferences['primaryView']): void {
+  if (view === 'search') { showPanel('search'); return; }
+  if (view === 'git') { showPanel('source-control'); void refreshGitRepositories(); return; }
+  setSidebarView(view);
+  if (view === 'extensions') {
+    if (activePanel === 'search' || activePanel === 'source-control') activePanel = 'output';
+    for (const id of ['output', 'problems', 'tasks', 'projects', 'terminal', 'debug']) document.querySelector(`#${id}`)!.classList.toggle('hidden', id !== activePanel);
+    for (const button of document.querySelectorAll<HTMLButtonElement>('[data-panel]')) { const selected = button.dataset.panel === activePanel; button.classList.toggle('selected', selected); button.setAttribute('aria-selected', String(selected)); }
+    setBottomCollapsed(true); saveSession();
+    void client.call({ method: 'list_extensions' }).then((response) => {
+      const catalog = expect(response, 'extensions').value; renderExtensions(catalog); renderSidebarExtensions(catalog.extensions);
+    }).catch(showError);
+  } else {
+    if (activePanel === 'search' || activePanel === 'source-control') {
+      activePanel = 'output';
+      for (const id of ['output', 'problems', 'tasks', 'projects', 'terminal', 'debug']) document.querySelector(`#${id}`)!.classList.toggle('hidden', id !== 'output');
+      for (const button of document.querySelectorAll<HTMLButtonElement>('[data-panel]')) { const selected = button.dataset.panel === 'output'; button.classList.toggle('selected', selected); button.setAttribute('aria-selected', String(selected)); }
+    }
+    saveSession();
+  }
+}
 
 async function openWorkspace(path: string): Promise<void> {
   const value = expect(await client.call({ method: 'open_workspace', params: { path } }), 'workspace_opened').value;
   workspaceRoot = value.root;
+  document.querySelector<HTMLElement>('#toolbar-workspace')!.textContent = baseName(value.root);
+  applySettingsPreferences();
   rootLabel.textContent = baseName(value.root);
   rootLabel.title = value.root;
   document.querySelector('#status-workspace')!.textContent = baseName(value.root);
@@ -556,12 +472,12 @@ function showWorkspaceContextMenu(event: MouseEvent, path: string, isDirectory: 
 function appendIcon(parent: HTMLElement, kind: string, expanded = false): void {
   const disclosure = document.createElement('span');
   disclosure.className = 'tree-chevron';
-  disclosure.textContent = kind === 'directory' ? (expanded ? '▾' : '▸') : '';
+  if (kind === 'directory') disclosure.innerHTML = expanded ? '<svg viewBox="0 0 16 16"><path d="m4 6 4 4 4-4"/></svg>' : '<svg viewBox="0 0 16 16"><path d="m6 4 4 4-4 4"/></svg>';
   disclosure.setAttribute('aria-hidden', 'true');
   const icon = document.createElement('span');
   icon.className = `tree-icon icon-${kind}`;
   icon.setAttribute('aria-hidden', 'true');
-  icon.textContent = kind === 'directory' ? '▱' : kind === 'symlink' ? '↗' : kind === 'file' ? '◇' : '·';
+  icon.innerHTML = kind === 'directory' ? '<svg viewBox="0 0 16 16"><path d="M2 4.5h4l1.2 1.4H14v6.6H2z"/></svg>' : kind === 'file' ? '<svg viewBox="0 0 16 16"><path d="M4 2.5h5l3 3v8H4z"/><path d="M9 2.5v3h3"/></svg>' : '<svg viewBox="0 0 16 16"><path d="M4 12 12 4M7 4h5v5"/></svg>';
   parent.append(disclosure, icon);
 }
 
@@ -639,9 +555,9 @@ async function openDocument(path: string): Promise<boolean> {
       dirty: content.dirty, language: languageNameForPath(path), lineEnding: lineEndingFor(content.contents),
     };
     tabs.open(tab); selectedPath = path;
-    const { state, pipeline, lineEnding, languageConfig, refreshDebugGutter, goToDefinition: navigateDefinition } = await createDocumentState(tab, content.contents, content.revision);
+    const { state, pipeline, lineEnding, languageConfig, wrapConfig, refreshDebugGutter, goToDefinition: navigateDefinition } = await createDocumentState(tab, content.contents, content.revision);
     debugGutterRefreshers.set(tab.id, refreshDebugGutter);
-    documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig, goToDefinition: navigateDefinition });
+    documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig, wrapConfig, goToDefinition: navigateDefinition });
     if (fingerprint) recoveryBaseHashes.set(tab.id, fingerprint);
     if (!editor) editor = new EditorView({ state, parent: editorHost }); else editor.setState(state);
     welcome.classList.add('hidden'); editorHost.classList.remove('hidden');
@@ -671,11 +587,12 @@ async function navigateDebugSource(path: string, zeroBasedLine: number): Promise
   editor.focus();
 }
 
-async function createDocumentState(tab: EditorTab, contents: string, revision: number): Promise<{ state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment; refreshDebugGutter: () => void; goToDefinition: (view: EditorView) => Promise<void> }> {
+async function createDocumentState(tab: EditorTab, contents: string, revision: number): Promise<{ state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment; wrapConfig: Compartment; refreshDebugGutter: () => void; goToDefinition: (view: EditorView) => Promise<void> }> {
   const lineEnding = lineEndingFor(contents);
   const lineSeparator = lineEnding === 'CRLF' ? '\r\n' : '\n';
   const languageExtensions = await languageForPath(tab.path);
   const languageConfig = new Compartment();
+  const wrapConfig = new Compartment();
   const gutter = debugGutter(absoluteDebugSourcePath(workspaceRoot, tab.path),
     (source, line) => debugPanel?.breakpointState(source, line) ?? null,
     (source) => debugPanel?.executionLine(source) ?? null,
@@ -704,7 +621,14 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
   });
   const state = EditorState.create({
     doc: contents,
-    extensions: [basicSetup, linter(() => []), theme, EditorState.tabSize.of(4), EditorState.lineSeparator.of(lineSeparator), EditorView.lineWrapping, languageConfig.of(languageExtensions), ...serviceExtensions, gutter.extension,
+    extensions: [basicSetup, linter(() => []), theme, syntaxHighlighting(HighlightStyle.define([
+      { tag: tags.keyword, color: 'var(--syntax-keyword)' },
+      { tag: [tags.string, tags.special(tags.string)], color: 'var(--syntax-string)' },
+      { tag: [tags.number, tags.bool, tags.literal], color: 'var(--syntax-number)' },
+      { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: 'var(--syntax-function)' },
+      { tag: [tags.typeName, tags.className], color: 'var(--syntax-type)' },
+      { tag: tags.comment, color: 'var(--syntax-comment)', fontStyle: 'italic' },
+    ])), EditorState.tabSize.of(4), EditorState.lineSeparator.of(lineSeparator), wrapConfig.of(effectiveSetting(settingsSnapshot, 'editor.wordWrap', workspaceRoot || null).value ? EditorView.lineWrapping : []), languageConfig.of(languageExtensions), ...serviceExtensions, gutter.extension,
       EditorView.updateListener.of((update) => {
         const entry = documentViews.get(tab.id);
         if (!entry) return;
@@ -728,7 +652,7 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
     },
   }, () => documentViews.get(tab.id)?.state.doc.toString() ?? contents,
   (newRevision, dirty) => { tabs.update(tab.id, { revision: newRevision, dirty }); renderTabs(); updateStatusDocument(); }, showError);
-  return { state, pipeline, lineEnding, languageConfig, refreshDebugGutter, goToDefinition: (view: EditorView) => goToDefinition(client, languageHost, view) };
+  return { state, pipeline, lineEnding, languageConfig, wrapConfig, refreshDebugGutter, goToDefinition: (view: EditorView) => goToDefinition(client, languageHost, view) };
 }
 
 async function refreshDocumentLanguage(documentId: number): Promise<void> {
@@ -745,6 +669,7 @@ function renderTabs(): void {
     const item = document.createElement('div'); item.className = `tab${tab.id === tabs.activeId ? ' active' : ''}`;
     item.setAttribute('role', 'tab'); item.setAttribute('aria-selected', String(tab.id === tabs.activeId)); item.tabIndex = tab.id === tabs.activeId ? 0 : -1;
     const select = document.createElement('button'); select.className = 'tab-select'; select.textContent = tab.title;
+    const fileIcon = document.createElement('span'); fileIcon.className = 'tab-file-icon'; fileIcon.setAttribute('aria-hidden', 'true'); fileIcon.innerHTML = '<svg viewBox="0 0 16 16"><path d="M4 2.5h5l3 3v8H4z"/><path d="M9 2.5v3h3"/></svg>'; select.prepend(fileIcon);
     select.title = tab.path; select.setAttribute('aria-label', `${tab.title}${tab.dirty ? ', unsaved' : ''}`);
     if (tab.dirty) { const marker = document.createElement('span'); marker.className = 'dirty-marker'; marker.textContent = '●'; marker.setAttribute('aria-label', 'Unsaved changes'); select.prepend(marker); }
     select.addEventListener('click', () => selectTab(tab.id));
@@ -876,9 +801,9 @@ async function showConflict(tab: EditorTab): Promise<void> {
     tabs.update(tab.id, { revision: decision.revision, dirty: decision.dirty });
     if (action === 'reload') {
       const content = expect(await client.call({ method: 'read_document', params: { document_id: tab.id } }), 'document_contents').value;
-      const { state, pipeline, lineEnding, languageConfig, refreshDebugGutter, goToDefinition: navigateDefinition } = await createDocumentState(tab, content.contents, content.revision);
+      const { state, pipeline, lineEnding, languageConfig, wrapConfig, refreshDebugGutter, goToDefinition: navigateDefinition } = await createDocumentState(tab, content.contents, content.revision);
       tabs.update(tab.id, { lineEnding });
-      documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig, goToDefinition: navigateDefinition });
+      documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig, wrapConfig, goToDefinition: navigateDefinition });
       debugGutterRefreshers.set(tab.id, refreshDebugGutter);
       if (tabs.activeId === tab.id && editor) editor.setState(state);
       await deleteRecoveryForDocument(tab.id);
@@ -910,6 +835,7 @@ async function chooseWorkspace(): Promise<void> {
     for (const tab of [...tabs.tabs]) { tabs.close(tab.id); documentViews.delete(tab.id); debugGutterRefreshers.delete(tab.id); }
     workspaceRoot = ''; selectedPath = ''; taskById.clear();
     rootLabel.textContent = 'No Workspace'; rootLabel.removeAttribute('title');
+    document.querySelector<HTMLElement>('#toolbar-workspace')!.textContent = 'Koren Code Editor';
     document.querySelector('#status-workspace')!.textContent = '';
     document.querySelector<HTMLButtonElement>('#menu-open-file')!.disabled = true;
     document.querySelector<HTMLButtonElement>('#welcome-open-file')!.disabled = true;
@@ -1122,41 +1048,192 @@ function handlePlatformEvent(event: PlatformEvent): void {
   }
 }
 
-function setTheme(theme: 'dark' | 'light'): void {
+function setTheme(theme: 'dark' | 'light', clearExtension = true): void {
   document.documentElement.removeAttribute('data-extension-theme');
   for (const token of ['--bg', '--panel', '--raised', '--text', '--muted', '--border', '--accent', '--selected']) document.documentElement.style.removeProperty(token);
   document.documentElement.dataset.theme = theme;
   persistTheme(localStorage, theme);
-  localStorage.removeItem('koren-code:theme-extension');
-  document.querySelector<HTMLSelectElement>('#theme-setting')!.value = theme;
+  if (clearExtension) localStorage.removeItem('koren-code:theme-extension');
+  const selector = document.querySelector<HTMLSelectElement>('#theme-setting');
+  if (selector) selector.value = theme;
 }
 function applyExtensionTheme(theme: ExtensionThemeSummary): void {
   setTheme(theme.base === 'light' ? 'light' : 'dark');
   for (const [property, color] of Object.entries(safeThemeVariables(theme.tokens))) document.documentElement.style.setProperty(property, color);
   document.documentElement.dataset.extensionTheme = theme.id;
   localStorage.setItem('koren-code:theme-extension', theme.id);
-  document.querySelector<HTMLSelectElement>('#theme-setting')!.value = `extension:${theme.id}`;
+  const selector = document.querySelector<HTMLSelectElement>('#theme-setting');
+  if (selector) selector.value = `extension:${theme.id}`;
 }
 async function openSettings(): Promise<void> {
   try {
+    renderSettings();
     const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value;
     renderExtensions(catalog);
     const configuration = expect(await client.call({ method: 'list_inspection_rules' }), 'inspection_configuration').value;
     renderInspectionSettings(configuration);
+    renderSettings();
     document.querySelector<HTMLDialogElement>('#settings-dialog')!.showModal();
   }
   catch (error) { showError(error); }
 }
-function toggleTheme(): void { setTheme(nextTheme(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')); }
+function toggleTheme(): void {
+  const next = nextTheme(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark');
+  try {
+    settingsSnapshot = writeSetting(localStorage, 'appearance.theme', next, 'user', workspaceRoot || null);
+    settingsData = { snapshot: settingsSnapshot, invalid: false };
+  } catch { setTheme(next); return; }
+  setTheme(next);
+  applySettingsPreferences();
+}
+
+const settingsCategories = ['General', 'Appearance', 'Editor', 'Workbench', 'Keybindings', 'Languages', 'Extensions', 'Terminal', 'Source Control', 'Debugging', 'Inspections', 'Workspace', 'Advanced'] as const;
+
+function applySettingsPreferences(): void {
+  const theme = effectiveSetting(settingsSnapshot, 'appearance.theme', workspaceRoot || null).value;
+  setTheme(theme === 'light' ? 'light' : 'dark', false);
+  document.documentElement.dataset.density = String(effectiveSetting(settingsSnapshot, 'workbench.density', workspaceRoot || null).value);
+  document.documentElement.dataset.toolbarVisible = String(effectiveSetting(settingsSnapshot, 'workbench.toolbarVisible', workspaceRoot || null).value);
+  document.documentElement.style.setProperty('--koren-editor-size', `${effectiveSetting(settingsSnapshot, 'editor.fontSize', workspaceRoot || null).value}px`);
+  document.documentElement.dataset.lineNumbers = String(effectiveSetting(settingsSnapshot, 'editor.lineNumbers', workspaceRoot || null).value);
+  const wrap = Boolean(effectiveSetting(settingsSnapshot, 'editor.wordWrap', workspaceRoot || null).value);
+  document.documentElement.dataset.wrap = String(wrap);
+  for (const [documentId, entry] of documentViews) {
+    const effects = entry.wrapConfig.reconfigure(wrap ? EditorView.lineWrapping : []);
+    if (editor && tabs.activeId === documentId) editor.dispatch({ effects });
+    else entry.state = entry.state.update({ effects }).state;
+  }
+  const warning = document.querySelector<HTMLElement>('#settings-warning');
+  if (warning) {
+    warning.textContent = settingsData.invalid ? 'The saved settings record is invalid. It was left untouched; use Reset All Settings to replace it.' : '';
+    warning.classList.toggle('hidden', !settingsData.invalid);
+  }
+  const themeId = localStorage.getItem('koren-code:theme-extension');
+  const contributedTheme = extensionCatalogCache?.themes.find((item) => item.id === themeId);
+  if (contributedTheme && document.documentElement.dataset.extensionTheme !== contributedTheme.id) applyExtensionTheme(contributedTheme);
+}
+
+function renderSettings(): void {
+  const categories = document.querySelector<HTMLElement>('#settings-categories');
+  const builtins = document.querySelector<HTMLElement>('#settings-builtins');
+  if (!categories || !builtins) return;
+  settingsQuery = document.querySelector<HTMLInputElement>('#settings-search')?.value ?? settingsQuery;
+  settingsModifiedOnly = document.querySelector<HTMLInputElement>('#settings-modified')?.checked ?? settingsModifiedOnly;
+  settingsScope = (document.querySelector<HTMLSelectElement>('#settings-scope')?.value ?? settingsScope) as SettingsScope;
+  categories.replaceChildren();
+  for (const category of settingsCategories) {
+    const button = document.createElement('button');
+    button.type = 'button'; button.textContent = category;
+    button.classList.toggle('selected', category === settingsCategory);
+    button.setAttribute('aria-current', String(category === settingsCategory));
+    button.addEventListener('click', () => { settingsCategory = category; renderSettings(); });
+    categories.append(button);
+  }
+  builtins.replaceChildren();
+  const query = settingsQuery.trim();
+  const found = searchSettings(settingsSnapshot, query, settingsModifiedOnly, workspaceRoot || null)
+    .filter((descriptor) => query || descriptor.category === settingsCategory);
+  const extensionSection = document.querySelector<HTMLElement>('#settings-extension-section')!;
+  const inspectionSection = document.querySelector<HTMLElement>('#settings-inspection-section')!;
+  extensionSection.classList.toggle('hidden', settingsCategory !== 'Extensions' || Boolean(query));
+  inspectionSection.classList.toggle('hidden', settingsCategory !== 'Inspections' || Boolean(query));
+  if (settingsCategory === 'Extensions' && !query) {
+    const heading = document.createElement('h2'); heading.textContent = 'Extensions'; builtins.append(heading);
+    const message = document.createElement('p'); message.className = 'settings-intro'; message.textContent = 'Review installed extensions, their permissions, contributed tools, and declared settings.'; builtins.append(message);
+  } else if (settingsCategory === 'Inspections' && !query) {
+    const heading = document.createElement('h2'); heading.textContent = 'Inspections'; builtins.append(heading);
+    const message = document.createElement('p'); message.className = 'settings-intro'; message.textContent = 'Choose inspection profiles and adjust supported rules. Workspace overrides are managed by the inspection service.'; builtins.append(message);
+  }
+  if (!found.length && !['Extensions', 'Inspections'].includes(settingsCategory) && !query) {
+    const heading = document.createElement('h2'); heading.textContent = settingsCategory; builtins.append(heading);
+    const note = document.createElement('p'); note.className = 'settings-unavailable'; note.textContent = `${settingsCategory} settings are not available yet. Existing editor and platform behavior remains unchanged.`; builtins.append(note);
+  }
+  for (const descriptor of found) {
+    if (query && !builtins.querySelector(`[data-settings-group="${CSS.escape(descriptor.category)}"]`)) {
+      const heading = document.createElement('h2'); heading.textContent = descriptor.category; heading.dataset.settingsGroup = descriptor.category; builtins.append(heading);
+    }
+    builtins.append(renderSettingRow(descriptor));
+  }
+  const scope = document.querySelector<HTMLSelectElement>('#settings-scope')!;
+  const workspaceOption = scope.querySelector<HTMLOptionElement>('option[value="workspace"]')!;
+  workspaceOption.disabled = !workspaceRoot;
+  if (!workspaceRoot && settingsScope === 'workspace') { settingsScope = 'user'; scope.value = 'user'; }
+  const status = document.querySelector<HTMLElement>('#settings-storage-status')!;
+  status.textContent = settingsData.invalid ? 'Settings need repair.' : workspaceRoot ? `Saved automatically · ${settingsScope === 'workspace' ? 'Workspace' : 'User'} scope · workspace overrides user values.` : 'Saved automatically · User scope. Open a workspace to edit workspace values.';
+  (document.querySelector<HTMLButtonElement>('#settings-open-file')!).title = 'The settings view is backed by the application preference store; direct file editing is not available yet.';
+}
+
+function renderSettingRow(descriptor: SettingDescriptor): HTMLElement {
+  const row = document.createElement('section'); row.className = 'setting-row';
+  const description = document.createElement('div'); description.className = 'setting-description';
+  const title = document.createElement('strong'); title.textContent = descriptor.title;
+  const id = document.createElement('code'); id.textContent = descriptor.id;
+  const help = document.createElement('p'); help.textContent = descriptor.description;
+  description.append(title, id, help);
+  const effective = effectiveSetting(settingsSnapshot, descriptor.id, workspaceRoot || null);
+  const stored = settingsScope === 'user' ? settingsSnapshot.user[descriptor.id] : (workspaceRoot ? settingsSnapshot.workspaces[workspaceRoot]?.[descriptor.id] : undefined);
+  const value = stored ?? (settingsScope === 'workspace' ? effective.value : descriptor.defaultValue);
+  const controls = document.createElement('div'); controls.className = 'setting-control';
+  let control: HTMLInputElement | HTMLSelectElement;
+  if (descriptor.type === 'boolean') {
+    const input = document.createElement('input'); input.type = 'checkbox'; input.checked = value === true; control = input;
+  } else if (descriptor.type === 'integer') {
+    const input = document.createElement('input'); input.type = 'number'; input.min = String(descriptor.minimum); input.max = String(descriptor.maximum); input.value = String(value); control = input;
+  } else {
+    const select = document.createElement('select');
+    for (const choice of descriptor.choices) { const option = document.createElement('option'); option.value = choice; option.textContent = choice === 'dark' ? 'Koren Dark' : choice === 'light' ? 'Light' : choice[0]!.toUpperCase() + choice.slice(1); select.append(option); }
+    if (descriptor.id === 'appearance.theme') {
+      for (const theme of extensionCatalogCache?.themes ?? []) { const option = document.createElement('option'); option.value = `extension:${theme.id}`; option.textContent = theme.title; select.append(option); }
+      const extensionId = localStorage.getItem('koren-code:theme-extension');
+      select.value = extensionCatalogCache?.themes.some((theme) => theme.id === extensionId) ? `extension:${extensionId}` : String(value);
+    } else select.value = String(value);
+    control = select;
+  }
+  control.disabled = !descriptor.scopes.includes(settingsScope) || (settingsScope === 'workspace' && !workspaceRoot) || settingsData.invalid;
+  control.setAttribute('aria-label', descriptor.title);
+  control.addEventListener('change', () => {
+    if (descriptor.id === 'appearance.theme' && control.value.startsWith('extension:')) {
+      const theme = extensionCatalogCache?.themes.find((item) => item.id === control.value.slice('extension:'.length));
+      if (theme) applyExtensionTheme(theme);
+      return;
+    }
+    const next: boolean | number | string = descriptor.type === 'boolean' ? (control as HTMLInputElement).checked : descriptor.type === 'integer' ? Number(control.value) : control.value;
+    try {
+      settingsSnapshot = writeSetting(localStorage, descriptor.id, next, settingsScope, workspaceRoot || null);
+      settingsData = { snapshot: settingsSnapshot, invalid: false };
+      if (descriptor.id === 'appearance.theme') localStorage.removeItem('koren-code:theme-extension');
+      applySettingsPreferences();
+      renderSettings();
+      setStatus(`Updated ${descriptor.id}`);
+    } catch (error) { showError(error); }
+  });
+  const origin = document.createElement('span'); origin.className = 'setting-origin'; origin.textContent = `Effective: ${effective.origin}${settingsScope === 'workspace' && !workspaceRoot ? ' · open a workspace to edit' : ''}`;
+  const reset = document.createElement('button'); reset.type = 'button'; reset.textContent = 'Reset'; reset.disabled = stored === undefined || !descriptor.scopes.includes(settingsScope) || (settingsScope === 'workspace' && !workspaceRoot) || settingsData.invalid;
+  reset.addEventListener('click', () => {
+    try { settingsSnapshot = resetSetting(localStorage, descriptor.id, settingsScope, workspaceRoot || null); settingsData = { snapshot: settingsSnapshot, invalid: false }; applySettingsPreferences(); renderSettings(); }
+    catch (error) { showError(error); }
+  });
+  controls.append(control, origin, reset); row.append(description, controls); return row;
+}
 
 function showPanel(panel: 'output' | 'problems' | 'tasks' | 'projects' | string): void {
+  if (panel === 'search' || panel === 'source-control') {
+    setSidebarView(panel === 'search' ? 'search' : 'git');
+    for (const button of document.querySelectorAll<HTMLButtonElement>('[data-panel]')) { button.classList.remove('selected'); button.setAttribute('aria-selected', 'false'); }
+    for (const id of ['output', 'problems', 'tasks', 'projects', 'terminal', 'debug']) document.querySelector(`#${id}`)!.classList.add('hidden');
+    for (const host of document.querySelectorAll<HTMLElement>('[data-extension-panel]')) host.classList.add('hidden');
+    activePanel = panel; setBottomCollapsed(true); saveSession();
+    if (panel === 'search') document.querySelector<HTMLInputElement>('#search-query')!.focus();
+    return;
+  }
   if (panel === 'terminal') void loadTerminalPanel().catch(showError);
   if (panel === 'debug') void loadDebugPanel().catch(showError);
+  if (layout.primaryView === 'search' || layout.primaryView === 'git') setSidebarView('files');
   for (const button of document.querySelectorAll<HTMLButtonElement>('[data-panel]')) {
     const selected = button.dataset.panel === panel;
     button.classList.toggle('selected', selected); button.setAttribute('aria-selected', String(selected));
   }
-  for (const id of ['output', 'problems', 'tasks', 'projects', 'search', 'source-control', 'terminal', 'debug']) document.querySelector(`#${id}`)!.classList.toggle('hidden', id !== panel);
+  for (const id of ['output', 'problems', 'tasks', 'projects', 'terminal', 'debug']) document.querySelector(`#${id}`)!.classList.toggle('hidden', id !== panel);
   for (const host of document.querySelectorAll<HTMLElement>('[data-extension-panel]')) host.classList.toggle('hidden', host.dataset.extensionPanel !== panel);
   if (panel.startsWith('org.') || panel.includes('.')) { activeDynamicPanel = panel; localStorage.setItem('koren.activeExtensionPanel', panel); }
   activePanel = panel;
@@ -1547,6 +1624,26 @@ function renderExtensions(catalog: ExtensionCatalog): void {
     host.append(row);
   }
   if (!catalog.extensions.length) host.innerHTML = '<div class="panel-empty">No local extensions installed.</div>';
+  renderSidebarExtensions(catalog.extensions);
+}
+
+function renderSidebarExtensions(extensions: ExtensionSummary[]): void {
+  const host = document.querySelector<HTMLElement>('#sidebar-extensions');
+  if (!host) return;
+  host.replaceChildren();
+  const title = document.createElement('h3'); title.textContent = 'Installed Extensions';
+  const description = document.createElement('p'); description.textContent = 'Extensions add language services and tools when you enable and activate them.';
+  const manage = document.createElement('button'); manage.className = 'small-button'; manage.type = 'button'; manage.textContent = 'Manage Extensions…'; manage.addEventListener('click', () => void openExtensions());
+  host.append(title, description, manage);
+  if (!extensions.length) { const empty = document.createElement('div'); empty.className = 'panel-empty'; empty.textContent = 'No local extensions installed.'; host.append(empty); return; }
+  const list = document.createElement('div'); list.className = 'sidebar-extension-list';
+  for (const extension of extensions) {
+    const row = document.createElement('div'); row.className = 'sidebar-extension-row';
+    const name = document.createElement('strong'); name.textContent = extension.name;
+    const state = document.createElement('span'); state.textContent = extension.state; state.className = `extension-state ${extension.state}`;
+    row.append(name, state); list.append(row);
+  }
+  host.append(list);
 }
 
 function updateCommandCatalog(catalog: ExtensionCatalog): void {
@@ -1620,14 +1717,16 @@ function renderExtensionDocument(host: HTMLElement, view: ExtensionUiDocument): 
 
 function renderExtensionSettings(settings: ExtensionSettingSummary[], themes: ExtensionThemeSummary[]): void {
   const host = document.querySelector<HTMLDivElement>('#extension-settings')!; host.replaceChildren();
-  const themeSelect = document.querySelector<HTMLSelectElement>('#theme-setting')!;
-  const selected = themeSelect.value;
-  for (const option of [...themeSelect.options].filter((item) => item.value.startsWith('extension:'))) option.remove();
-  for (const theme of themes) { const option = document.createElement('option'); option.value = `extension:${theme.id}`; option.textContent = theme.title; themeSelect.append(option); }
-  if ([...themeSelect.options].some((option) => option.value === selected)) themeSelect.value = selected;
+  const themeSelect = document.querySelector<HTMLSelectElement>('#theme-setting');
+  if (themeSelect) {
+    const selected = themeSelect.value;
+    for (const option of [...themeSelect.options].filter((item) => item.value.startsWith('extension:'))) option.remove();
+    for (const theme of themes) { const option = document.createElement('option'); option.value = `extension:${theme.id}`; option.textContent = theme.title; themeSelect.append(option); }
+    if ([...themeSelect.options].some((option) => option.value === selected)) themeSelect.value = selected;
+  }
   const persistedTheme = localStorage.getItem('koren-code:theme-extension');
   const selectedTheme = themes.find((theme) => theme.id === persistedTheme);
-  if (selectedTheme) { themeSelect.value = `extension:${selectedTheme.id}`; applyExtensionTheme(selectedTheme); }
+  if (selectedTheme) { if (themeSelect) themeSelect.value = `extension:${selectedTheme.id}`; applyExtensionTheme(selectedTheme); }
   else if (persistedTheme) setTheme(readTheme(localStorage));
   if (!settings.length) return;
   const heading = document.createElement('h3'); heading.textContent = 'Extension settings'; host.append(heading);
@@ -1860,6 +1959,7 @@ function handleAction(action: string, target: HTMLElement): void {
     case 'toggle-theme': toggleTheme(); break;
     case 'toggle-explorer': setExplorerCollapsed(!layout.explorerCollapsed); break;
     case 'toggle-bottom': setBottomCollapsed(!layout.bottomCollapsed); break;
+    case 'toggle-secondary': setSecondaryCollapsed(!layout.secondaryCollapsed); break;
     case 'show-panel': {
       const panel = target.dataset.panelTarget ?? 'output'; showPanel(panel);
       if (panel === 'search') document.querySelector<HTMLInputElement>('#search-query')!.focus();
@@ -2187,12 +2287,38 @@ document.querySelector<HTMLSelectElement>('#problem-severity-filter')!.addEventL
 document.querySelector<HTMLSelectElement>('#problem-grouping')!.addEventListener('change', (event) => {
   problemGrouping = (event.currentTarget as HTMLSelectElement).value as InspectionGrouping; renderProblems();
 });
-document.querySelector<HTMLSelectElement>('#theme-setting')!.addEventListener('change', (event) => {
-  const value = (event.currentTarget as HTMLSelectElement).value;
-  if (value.startsWith('extension:')) {
-    const theme = extensionCatalogCache?.themes.find((item) => item.id === value.slice('extension:'.length));
-    if (theme) applyExtensionTheme(theme);
-  } else setTheme(value === 'light' ? 'light' : 'dark');
+document.querySelector<HTMLInputElement>('#settings-search')!.addEventListener('input', (event) => {
+  settingsQuery = (event.currentTarget as HTMLInputElement).value;
+  renderSettings();
+  const search = document.querySelector<HTMLInputElement>('#settings-search')!;
+  search.focus(); search.setSelectionRange(settingsQuery.length, settingsQuery.length);
+});
+for (const button of document.querySelectorAll<HTMLButtonElement>('[data-sidebar-view]')) {
+  button.addEventListener('click', () => selectSidebarView(button.dataset.sidebarView as LayoutPreferences['primaryView']));
+}
+document.querySelector<HTMLSelectElement>('#settings-scope')!.addEventListener('change', (event) => {
+  settingsScope = (event.currentTarget as HTMLSelectElement).value as SettingsScope;
+  renderSettings();
+});
+document.querySelector<HTMLInputElement>('#settings-modified')!.addEventListener('change', (event) => {
+  settingsModifiedOnly = (event.currentTarget as HTMLInputElement).checked;
+  renderSettings();
+});
+document.querySelector<HTMLButtonElement>('#settings-reset-category')!.addEventListener('click', () => {
+  const affected = searchSettings(settingsSnapshot, '', false, workspaceRoot || null).filter((descriptor) => descriptor.category === settingsCategory && descriptor.scopes.includes(settingsScope));
+  if (!affected.length) { setStatus(`No built-in ${settingsCategory.toLocaleLowerCase()} settings to reset at ${settingsScope} scope.`); return; }
+  if (!window.confirm(`Restore ${affected.length} ${settingsCategory} setting${affected.length === 1 ? '' : 's'} to inherited values?`)) return;
+  try {
+    for (const descriptor of affected) settingsSnapshot = resetSetting(localStorage, descriptor.id, settingsScope, workspaceRoot || null);
+    settingsData = { snapshot: settingsSnapshot, invalid: false };
+    applySettingsPreferences(); renderSettings();
+  } catch (error) { showError(error); }
+});
+document.querySelector<HTMLButtonElement>('#settings-reset-all')!.addEventListener('click', () => {
+  if (!window.confirm('Reset built-in user and workspace preferences? Session, layout, extension settings, and inspection profiles will be preserved.')) return;
+  settingsSnapshot = resetSettings(localStorage); settingsData = { snapshot: settingsSnapshot, invalid: false };
+  localStorage.removeItem('koren-code:theme-extension');
+  applySettingsPreferences(); renderSettings();
 });
 document.querySelector<HTMLButtonElement>('[data-action="close-recovery"]')!.addEventListener('click', () => document.querySelector<HTMLDialogElement>('#recovery-dialog')!.close());
 runConfiguration.addEventListener('change', syncRunButton);
@@ -2209,6 +2335,19 @@ document.querySelector<HTMLElement>('#explorer-resizer')!.addEventListener('keyd
   if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
   layout.explorerWidth = Math.max(148, layout.explorerWidth + (event.key === 'ArrowRight' ? 12 : -12));
   workbench.style.setProperty('--explorer-width', `${layout.explorerWidth}px`); saveLayout(); event.preventDefault();
+});
+document.querySelector<HTMLElement>('#secondary-resizer')!.addEventListener('pointerdown', (event) => {
+  const move = (moveEvent: PointerEvent) => {
+    layout.secondaryWidth = Math.max(180, Math.min(window.innerWidth - moveEvent.clientX, window.innerWidth * 0.32));
+    workbench.style.setProperty('--secondary-width', `${layout.secondaryWidth}px`);
+  };
+  const stop = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', stop); saveLayout(); };
+  window.addEventListener('pointermove', move); window.addEventListener('pointerup', stop, { once: true }); event.preventDefault();
+});
+document.querySelector<HTMLElement>('#secondary-resizer')!.addEventListener('keydown', (event) => {
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+  layout.secondaryWidth = Math.max(180, Math.min(480, layout.secondaryWidth + (event.key === 'ArrowLeft' ? 12 : -12)));
+  workbench.style.setProperty('--secondary-width', `${layout.secondaryWidth}px`); saveLayout(); event.preventDefault();
 });
 document.querySelector<HTMLElement>('#bottom-resizer')!.addEventListener('pointerdown', (event) => {
   setBottomCollapsed(false);
@@ -2245,8 +2384,7 @@ window.addEventListener('koren-close-request', () => {
   })();
 });
 
-document.documentElement.dataset.theme = readTheme(localStorage);
-document.querySelector<HTMLSelectElement>('#theme-setting')!.value = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
+applySettingsPreferences();
 applyLayout();
 window.addEventListener('resize', () => { applyLayout(); saveLayout(); });
 if (layout.bottomCollapsed) document.querySelector('#bottom-resizer')!.classList.add('hidden');
