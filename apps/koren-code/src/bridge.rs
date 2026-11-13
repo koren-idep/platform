@@ -1441,6 +1441,47 @@ impl DesktopBackend {
                 .map(project_summary)
                 .collect::<Result<Vec<_>, _>>()
                 .map(ResponseValue::Projects),
+            RequestMethod::DiscoverRegisteredProjects {
+                max_directories,
+                max_projects,
+                max_depth,
+            } => {
+                let ids = self
+                    .projects
+                    .discover_all_registered(
+                        &self.workspace,
+                        DiscoveryLimits {
+                            max_directories,
+                            max_projects,
+                            max_depth,
+                        },
+                    )
+                    .map_err(|error| ProtocolError {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("project discovery failed: {error}"),
+                    })?;
+                for id in ids {
+                    let info = self.projects.info(id).map_err(project_error)?;
+                    let tasks = self
+                        .projects
+                        .provider_tasks(&info.provider_id, info)
+                        .map_err(project_error)?;
+                    for task in tasks {
+                        let already_registered = self.tasks.list().iter().any(|(_, existing)| {
+                            existing.key == task.key && existing.project_id == task.project_id
+                        });
+                        if !already_registered {
+                            self.tasks.register(task).map_err(task_error)?;
+                        }
+                    }
+                }
+                self.projects
+                    .list()
+                    .into_iter()
+                    .map(project_summary)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(ResponseValue::Projects)
+            }
             RequestMethod::DiscoverCargoProjects {
                 max_directories,
                 max_projects,
@@ -6492,6 +6533,62 @@ mod tests {
             .unwrap();
         assert!(matches!(request, ResponseValue::ApprovalRequired(_)));
         assert!(!backend.drain_events().is_empty());
+        backend.shutdown();
+    }
+
+    #[test]
+    fn provider_discovery_refresh_detects_cargo_and_keeps_execution_gated() {
+        let temp = Temp::new();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: temp.0.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+
+        let scan = || RequestMethod::DiscoverRegisteredProjects {
+            max_directories: 100,
+            max_projects: 20,
+            max_depth: 8,
+        };
+        assert!(matches!(
+            backend.method(scan()).unwrap(),
+            ResponseValue::Projects(projects) if projects.is_empty()
+        ));
+
+        fs::write(
+            temp.0.join("Cargo.toml"),
+            "[package]\nname='refresh-fixture'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(temp.0.join("src")).unwrap();
+        fs::write(temp.0.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let discovered = backend.method(scan()).unwrap();
+        assert!(matches!(
+            discovered,
+            ResponseValue::Projects(projects) if projects.len() == 1 && projects[0].provider_id == koren_cargo::CARGO_PROVIDER_ID
+        ));
+        let first_tasks = backend.method(RequestMethod::ListTasks).unwrap();
+        let ResponseValue::Tasks(first_tasks) = first_tasks else {
+            panic!("expected provider tasks")
+        };
+        assert!(!first_tasks.is_empty());
+        assert!(matches!(
+            backend.method(scan()).unwrap(),
+            ResponseValue::Projects(projects) if projects.len() == 1
+        ));
+        let second_tasks = backend.method(RequestMethod::ListTasks).unwrap();
+        assert!(
+            matches!(second_tasks, ResponseValue::Tasks(tasks) if tasks.len() == first_tasks.len())
+        );
+        assert!(matches!(
+            backend
+                .method(RequestMethod::RequestTaskExecution {
+                    task_id: first_tasks[0].task_id
+                })
+                .unwrap(),
+            ResponseValue::ApprovalRequired(_)
+        ));
         backend.shutdown();
     }
 

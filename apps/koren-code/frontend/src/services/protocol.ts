@@ -233,6 +233,7 @@ export type ExistingRequestMethod =
   | { method: 'resolve_document_conflict'; params: { document_id: number; expected_revision: number; decision: 'overwrite' | 'reload' } }
   | { method: 'close_document'; params: { document_id: number; discard_unsaved_changes: boolean } }
   | { method: 'list_projects' }
+  | { method: 'discover_registered_projects'; params: { max_directories: number; max_projects: number; max_depth: number } }
   | { method: 'discover_cargo_projects'; params: { max_directories: number; max_projects: number; max_depth: number } }
   | { method: 'cargo_project_info'; params: { project_id: number } }
   | { method: 'list_tasks' }

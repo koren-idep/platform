@@ -246,7 +246,7 @@ kbd {
 .task-summary, .project-info span { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .small-button { min-height: 25px; padding: 2px 10px; border: 1px solid var(--border); border-radius: 5px; }
 .project-icon { color: var(--muted); font-size: 15px; }
-.status-bar { height: 25px; min-height: 25px; margin: 0 10px 5px; padding: 0 8px; display: flex; align-items: center; gap: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--muted); font-size: 11px; }
+.status-bar { height: 25px; min-height: 25px; margin: 0 7px 5px; padding: 0 8px; display: flex; align-items: center; gap: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--muted); font-size: 11px; }
 .status-workspace { height: 100%; display: flex; align-items: center; gap: 8px; padding-right: 14px; border-right: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
 .status-workspace strong { color: var(--text); font-weight: 500; }
 .status-workspace-icon { color: var(--muted); font-size: 14px; }

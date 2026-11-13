@@ -3,11 +3,12 @@ import { filterCommands, nextCommandSelection } from './commands';
 import { DEFAULT_LAYOUT, fitLayoutToViewport, persistLayout, readLayout } from './layout';
 import { persistSession, readSession } from './session';
 import { formatCursorPosition, lineEndingFor } from './status';
+import { workbenchMarkup } from '../workbench-v2/shell';
 
 describe('desktop presentation helpers', () => {
   it('starts a fresh layout with the bottom tool window collapsed', () => {
     expect(readLayout({ getItem: () => null }).bottomCollapsed).toBe(true);
-    expect(DEFAULT_LAYOUT.explorerWidth).toBe(260);
+    expect(DEFAULT_LAYOUT.explorerWidth).toBe(380);
     expect(DEFAULT_LAYOUT.bottomHeight).toBe(220);
   });
 
@@ -23,8 +24,8 @@ describe('desktop presentation helpers', () => {
       getItem: (key: string) => values.get(key) ?? null,
       setItem: (key: string, value: string) => values.set(key, value),
     };
-    persistLayout(storage, { ...DEFAULT_LAYOUT, explorerWidth: 300, bottomCollapsed: true });
-    expect(readLayout(storage)).toMatchObject({ explorerWidth: 300, bottomCollapsed: true });
+    persistLayout(storage, { ...DEFAULT_LAYOUT, explorerWidth: 380, bottomCollapsed: true });
+    expect(readLayout(storage)).toMatchObject({ explorerWidth: 380, bottomCollapsed: true });
     values.set('koren-code:layout', '{"explorerWidth":9000}');
     expect(readLayout(storage).explorerWidth).toBe(480);
   });
@@ -52,5 +53,15 @@ describe('desktop presentation helpers', () => {
     expect(formatCursorPosition(4, 12)).toBe('Ln 4, Col 12');
     expect(lineEndingFor('first\r\nsecond')).toBe('CRLF');
     expect(lineEndingFor('first\nsecond')).toBe('LF');
+  });
+
+  it('hosts Settings as a main-view tab instead of an application-wide overlay', () => {
+    const viewerStart = workbenchMarkup.indexOf('<section class="editor-frame"');
+    const viewerEnd = workbenchMarkup.indexOf('<div class="wb-bottom-area">', viewerStart);
+    const viewerMarkup = workbenchMarkup.slice(viewerStart, viewerEnd);
+    expect(viewerMarkup).toContain('id="tabs"');
+    expect(viewerMarkup).toContain('id="settings-view"');
+    expect(workbenchMarkup.slice(viewerEnd)).not.toContain('id="settings-view"');
+    expect(viewerMarkup).toContain('aria-labelledby="tab-settings"');
   });
 });

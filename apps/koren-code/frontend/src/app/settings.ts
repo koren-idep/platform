@@ -2,32 +2,62 @@ export type SettingsScope = 'user' | 'workspace';
 export type SettingPrimitive = boolean | number | string;
 export type BuiltInSettingId =
   | 'appearance.theme'
+  | 'appearance.classicMenu'
+  | 'appearance.projectColors.enabled'
+  | 'appearance.projectColors.autoAssign'
+  | 'appearance.projectColors.style'
+  | 'appearance.projectColors.intensity'
+  | 'appearance.projectColors.showWorkspaceName'
+  | 'appearance.projectIdentity.color'
+  | 'appearance.projectIdentity.icon'
   | 'workbench.density'
   | 'workbench.toolbarVisible'
   | 'editor.fontSize'
+  | 'editor.tabSize'
+  | 'editor.indentSize'
+  | 'editor.insertSpaces'
   | 'editor.lineNumbers'
   | 'editor.wordWrap';
 
 interface SettingBase {
   id: BuiltInSettingId;
-  category: 'Appearance' | 'Editor' | 'Workbench';
+  category: string;
   title: string;
   description: string;
   scopes: readonly SettingsScope[];
   defaultValue: SettingPrimitive;
+  keywords: readonly string[];
+  owner: 'koren';
+  requiresRestart: boolean;
+  isAvailable: boolean;
 }
 export type SettingDescriptor =
   | (SettingBase & { type: 'boolean' })
   | (SettingBase & { type: 'choice'; choices: readonly string[] })
-  | (SettingBase & { type: 'integer'; minimum: number; maximum: number });
+  | (SettingBase & { type: 'integer'; minimum: number; maximum: number })
+  | (SettingBase & { type: 'color' });
+
+const userScope = ['user'] as const;
+const userWorkspaceScope = ['user', 'workspace'] as const;
 
 export const SETTING_DESCRIPTORS: readonly SettingDescriptor[] = [
-  { id: 'appearance.theme', category: 'Appearance', title: 'Color theme', description: 'Choose Koren Dark or the light theme.', type: 'choice', choices: ['dark', 'light'], defaultValue: 'dark', scopes: ['user'] },
-  { id: 'workbench.density', category: 'Workbench', title: 'Interface density', description: 'Use compact rows or larger comfortable targets.', type: 'choice', choices: ['compact', 'comfortable'], defaultValue: 'compact', scopes: ['user', 'workspace'] },
-  { id: 'workbench.toolbarVisible', category: 'Workbench', title: 'Show toolbar', description: 'Keep primary file and run actions visible below the menu.', type: 'boolean', defaultValue: true, scopes: ['user', 'workspace'] },
-  { id: 'editor.fontSize', category: 'Editor', title: 'Editor font size', description: 'Code font size in pixels.', type: 'integer', minimum: 10, maximum: 24, defaultValue: 14, scopes: ['user', 'workspace'] },
-  { id: 'editor.lineNumbers', category: 'Editor', title: 'Show line numbers', description: 'Display line numbers in the editor gutter.', type: 'boolean', defaultValue: true, scopes: ['user', 'workspace'] },
-  { id: 'editor.wordWrap', category: 'Editor', title: 'Wrap long lines', description: 'Wrap lines that extend beyond the editor width.', type: 'boolean', defaultValue: false, scopes: ['user', 'workspace'] },
+  { id: 'appearance.theme', category: 'Appearance/Theme', title: 'Color theme', description: 'Choose Koren Dark or the light theme.', type: 'choice', choices: ['dark', 'light'], defaultValue: 'dark', scopes: userScope, keywords: ['color', 'contrast'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'appearance.classicMenu', category: 'Appearance/Interface', title: 'Show menu bar', description: 'Show File, Edit, View, Navigate, Run, Tools, and Help in the title bar.', type: 'boolean', defaultValue: true, scopes: userScope, keywords: ['menu', 'compact'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'appearance.projectColors.enabled', category: 'Appearance/Project Identity', title: 'Enable Project Colors', description: 'Display the workspace color as a restrained accent in the application header.', type: 'boolean', defaultValue: true, scopes: userScope, keywords: ['project', 'identity', 'accent'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'appearance.projectColors.autoAssign', category: 'Appearance/Project Identity', title: 'Automatically assign colors', description: 'Choose a stable color for workspaces without a saved color.', type: 'boolean', defaultValue: true, scopes: userScope, keywords: ['project', 'identity', 'automatic'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'appearance.projectColors.style', category: 'Appearance/Project Identity', title: 'Color style', description: 'Choose how the workspace accent appears in the header.', type: 'choice', choices: ['subtle-gradient', 'solid-tint', 'icon-only', 'none'], defaultValue: 'subtle-gradient', scopes: userScope, keywords: ['project', 'gradient', 'solid', 'icon'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'appearance.projectColors.intensity', category: 'Appearance/Project Identity', title: 'Accent intensity', description: 'Set the strength of the workspace color wash.', type: 'integer', minimum: 8, maximum: 40, defaultValue: 22, scopes: userScope, keywords: ['project', 'gradient', 'strength'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'appearance.projectColors.showWorkspaceName', category: 'Appearance/Project Identity', title: 'Show workspace name', description: 'Display the current workspace name in the compact toolbar.', type: 'boolean', defaultValue: true, scopes: userScope, keywords: ['project', 'name'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'appearance.projectIdentity.color', category: 'Appearance/Project Identity', title: 'Project color', description: 'Set a local color for this workspace. This preference is not written to Git.', type: 'color', defaultValue: '#5294d8', scopes: ['workspace'], keywords: ['project', 'custom', 'hex', 'palette'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'appearance.projectIdentity.icon', category: 'Appearance/Project Identity', title: 'Project icon', description: 'Choose a small icon for this workspace.', type: 'choice', choices: ['folder', 'code', 'package', 'tools'], defaultValue: 'folder', scopes: ['workspace'], keywords: ['project', 'icon'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'workbench.density', category: 'Appearance/Interface', title: 'Interface density', description: 'Use compact rows or larger comfortable targets.', type: 'choice', choices: ['compact', 'comfortable'], defaultValue: 'compact', scopes: userWorkspaceScope, keywords: ['spacing', 'rows'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'workbench.toolbarVisible', category: 'Appearance/Interface', title: 'Show toolbar actions', description: 'Show the contextual Run, Search, and Settings actions in the main toolbar.', type: 'boolean', defaultValue: true, scopes: userScope, keywords: ['toolbar', 'buttons'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'editor.fontSize', category: 'Editor/Font and Typography', title: 'Editor font size', description: 'Code font size in pixels.', type: 'integer', minimum: 10, maximum: 24, defaultValue: 14, scopes: userWorkspaceScope, keywords: ['font', 'text', 'size'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'editor.tabSize', category: 'Editor/Indentation', title: 'Tab size', description: 'Number of columns represented by a tab character.', type: 'integer', minimum: 2, maximum: 8, defaultValue: 4, scopes: userWorkspaceScope, keywords: ['indent', 'spaces'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'editor.indentSize', category: 'Editor/Indentation', title: 'Indent size', description: 'Columns inserted by one indentation command.', type: 'integer', minimum: 1, maximum: 8, defaultValue: 4, scopes: userWorkspaceScope, keywords: ['indent', 'spaces', 'tab'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'editor.insertSpaces', category: 'Editor/Indentation', title: 'Insert spaces', description: 'Use spaces instead of tab characters for indentation.', type: 'boolean', defaultValue: true, scopes: userWorkspaceScope, keywords: ['indent', 'tabs'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'editor.lineNumbers', category: 'Editor/Display', title: 'Show line numbers', description: 'Display line numbers in the editor gutter.', type: 'boolean', defaultValue: true, scopes: userWorkspaceScope, keywords: ['gutter', 'line'], owner: 'koren', requiresRestart: false, isAvailable: true },
+  { id: 'editor.wordWrap', category: 'Editor/Display', title: 'Wrap long lines', description: 'Wrap lines that extend beyond the editor width.', type: 'boolean', defaultValue: false, scopes: userWorkspaceScope, keywords: ['wrap', 'line'], owner: 'koren', requiresRestart: false, isAvailable: true },
 ];
 
 export interface SettingsSnapshot {
@@ -52,7 +82,9 @@ export function loadSettings(storage: Pick<Storage, 'getItem'>): LoadedSettings 
   try {
     const parsed = JSON.parse(raw) as Partial<SettingsSnapshot>;
     if (parsed.schema !== 1 || !isRecord(parsed.user) || !isRecord(parsed.workspaces) ||
-        !Object.values(parsed.workspaces).every(isRecord)) return { snapshot: defaultSnapshot(), invalid: true };
+        !Object.values(parsed.workspaces).every(isRecord) ||
+        !Object.entries(parsed.user).every(isStoredValueValid) ||
+        !Object.values(parsed.workspaces).every((values) => Object.entries(values).every(isStoredValueValid))) return { snapshot: defaultSnapshot(), invalid: true };
     return { snapshot: {
       schema: 1,
       user: filterValidStoredValues(parsed.user),
@@ -76,7 +108,7 @@ export function searchSettings(snapshot: SettingsSnapshot, query: string, modifi
   const needle = query.trim().toLocaleLowerCase();
   return SETTING_DESCRIPTORS.filter((descriptor) => {
     const modified = snapshot.user[descriptor.id] !== undefined || (workspace !== null && snapshot.workspaces[workspace]?.[descriptor.id] !== undefined);
-    const matchesText = !needle || `${descriptor.id} ${descriptor.title} ${descriptor.description} ${descriptor.category}`.toLocaleLowerCase().includes(needle);
+    const matchesText = !needle || `${descriptor.id} ${descriptor.title} ${descriptor.description} ${descriptor.category} ${descriptor.keywords.join(' ')}`.toLocaleLowerCase().includes(needle);
     return matchesText && (!modifiedOnly || modified);
   });
 }
@@ -136,6 +168,7 @@ function descriptorFor(id: BuiltInSettingId): SettingDescriptor {
 function validValue(descriptor: SettingDescriptor, value: unknown): value is SettingPrimitive {
   if (descriptor.type === 'boolean') return typeof value === 'boolean';
   if (descriptor.type === 'integer') return typeof value === 'number' && Number.isInteger(value) && value >= descriptor.minimum && value <= descriptor.maximum;
+  if (descriptor.type === 'color') return typeof value === 'string' && /^#[\da-f]{6}$/i.test(value);
   return typeof value === 'string' && descriptor.choices.includes(value);
 }
 
@@ -144,6 +177,11 @@ function filterValidStoredValues(values: Record<string, unknown>): Record<string
     const descriptor = SETTING_DESCRIPTORS.find((item) => item.id === id);
     return descriptor ? validValue(descriptor, value) : isPrimitive(value);
   })) as Record<string, SettingPrimitive>;
+}
+
+function isStoredValueValid([id, value]: [string, unknown]): boolean {
+  const descriptor = SETTING_DESCRIPTORS.find((item) => item.id === id);
+  return descriptor ? validValue(descriptor, value) : isPrimitive(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

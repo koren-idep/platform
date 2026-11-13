@@ -1,11 +1,11 @@
 import { redo, redoDepth, selectAll, undo, undoDepth } from '@codemirror/commands';
-import { Compartment, EditorState } from '@codemirror/state';
+import { Compartment, EditorState, type Extension } from '@codemirror/state';
 import { basicSetup, EditorView } from 'codemirror';
 import { linter, setDiagnostics, type Diagnostic as CodeMirrorDiagnostic } from '@codemirror/lint';
-import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
+import { HighlightStyle, indentUnit, syntaxHighlighting } from '@codemirror/language';
 import { tags } from '@lezer/highlight';
 import { KorenClient, KorenError, createDesktopTransport } from './services/client';
-import type { CargoProjectSummary, ExecutionApprovalSummary, ExtensionCatalog, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary, ExtensionSettingSummary, ExtensionSettingValue, ExtensionSummary, ExtensionThemeSummary, ExtensionToolWindowSummary, ExtensionUiDocument, GitRepositorySummary, GitStatusSummary, InspectionConfigurationSummary, InspectionFinding, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ProjectInspectionSummary, ResponseValue, TaskSummary, TextRange } from './services/protocol';
+import type { ExecutionApprovalSummary, ExtensionCatalog, ExtensionDiagnosticDetailSummary, ExtensionMenuSummary, ExtensionProjectWizardSummary, ExtensionSettingSummary, ExtensionSettingValue, ExtensionSummary, ExtensionThemeSummary, ExtensionToolWindowSummary, ExtensionUiDocument, GitRepositorySummary, GitStatusSummary, InspectionConfigurationSummary, InspectionFinding, LanguageDiagnosticSet, LanguageServerApprovalSummary, LanguageServerSummary, PlatformEvent, ProjectInspectionSummary, ProjectSummary, ResponseValue, TaskSummary, TextRange } from './services/protocol';
 import type { SearchMatch } from './services/protocol';
 import { approvalChoice, conflictChoice } from './app/dialogs';
 import { commandShortcutMatches, filterCommands, nextCommandSelection } from './app/commands';
@@ -14,10 +14,14 @@ import { readLayout, persistLayout, fitLayoutToViewport, type LayoutPreferences 
 import { persistSession, readSession } from './app/session';
 import { canRestoreInPlace } from './app/recovery';
 import { formatCursorPosition, lineEndingFor } from './app/status';
-import { runConfigurationTasks, selectedRunTask } from './app/toolbar';
+import { discoverWorkspaceProjects, openWorkspaceAndDiscoverProjects, type ProjectDiscoverySnapshot } from './app/projectDiscovery';
 import { gitRepositoryChoices, groupSearchMatches, normalizedCommitMessage, partitionGitFiles, searchSummaryText } from './app/developerTools';
 import { nextTheme, persistTheme, readTheme } from './app/theme';
 import { windowActionMessage, type WindowAction } from './app/windowControls';
+import { automaticProjectColor, hasReadableProjectAccent, PROJECT_COLORS } from './app/projectIdentity';
+import { fileIconMarkup, type WorkspaceEntryKind } from './app/fileIcons';
+import { headerMenusInOverflow } from './app/headerLayout';
+import { UI_COMMANDS } from './app/uiCommands';
 import { effectiveSetting, loadSettings, resetSetting, resetSettings, searchSettings, writeSetting, type SettingDescriptor, type SettingsScope, type SettingsSnapshot } from './app/settings';
 import { taskStatus, visibleOutput } from './app/taskPresentation';
 import { extensionCanActivate, extensionToggleLabel, languageServerEnabled } from './app/extensions';
@@ -29,7 +33,7 @@ import { editsFromViewUpdate } from './editor/transactions';
 import { languageForPath, languageIdForPath, languageNameForPath } from './editor/languages';
 import { flushAndSave } from './editor/save';
 import { goToDefinition, languageServiceExtensions } from './editor/languageServices';
-import { installDefinitionShortcut, positionForRange, workspaceRelativePath } from './editor/definitionNavigation';
+import { positionForRange, workspaceRelativePath } from './editor/definitionNavigation';
 import { debugGutter } from './editor/debugGutter';
 import { absoluteDebugSourcePath } from './editor/debugSource';
 import './styles/main.css';
@@ -41,6 +45,21 @@ interface RecoverySnapshot { schema_version: number; id: string; workspace: stri
 interface RecoverySummary { id: string; workspace: string; path: string; revision: number; updated_at_ms: number; byte_length: number }
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = workbenchMarkup;
+
+function updateHeaderMenuOverflow(): void {
+  const nav = document.querySelector<HTMLElement>('#application-menus')!;
+  const overflow = document.querySelector<HTMLDetailsElement>('#menu-overflow')!;
+  const overflowContent = document.querySelector<HTMLElement>('#menu-overflow-content')!;
+  const overflowNames = new Set(headerMenusInOverflow(window.innerWidth));
+  for (const name of ['file', 'edit', 'view', 'navigate', 'run', 'tools', 'help'] as const) {
+    const menu = document.querySelector<HTMLElement>(`#menu-${name}`)!;
+    if (name !== 'file' && overflowNames.has(name as 'edit' | 'view' | 'navigate' | 'run' | 'tools' | 'help')) overflowContent.append(menu);
+    else nav.insertBefore(menu, overflow);
+  }
+  overflow.hidden = overflowContent.childElementCount === 0;
+}
+updateHeaderMenuOverflow();
+window.addEventListener('resize', updateHeaderMenuOverflow);
 
 document.querySelectorAll<HTMLButtonElement>('[data-window-action]').forEach((button) => {
   button.addEventListener('click', () => {
@@ -78,6 +97,10 @@ let settingsScope: SettingsScope = 'user';
 let settingsCategory = 'Appearance';
 let settingsModifiedOnly = false;
 let settingsQuery = '';
+let settingsTabOpen = false;
+let settingsTabActive = false;
+const settingsHistory = ['Appearance'];
+let settingsHistoryIndex = 0;
 const treeRoot = document.querySelector<HTMLDivElement>('#tree')!;
 const editorHost = document.querySelector<HTMLDivElement>('#editor')!;
 const welcome = document.querySelector<HTMLElement>('#welcome')!;
@@ -85,14 +108,15 @@ const tabsHost = document.querySelector<HTMLDivElement>('#tabs')!;
 const outputHost = document.querySelector<HTMLDivElement>('#output')!;
 const taskHost = document.querySelector<HTMLDivElement>('#tasks')!;
 const projectHost = document.querySelector<HTMLDivElement>('#project-list')!;
-const runConfiguration = document.querySelector<HTMLSelectElement>('#run-configuration')!;
 const toast = document.querySelector<HTMLDivElement>('#status-toast')!;
 const workbench = document.querySelector<HTMLElement>('#workbench')!;
 const rootLabel = document.querySelector<HTMLElement>('#status-workspace')!;
 let workspaceRoot = '';
 let selectedPath = '';
+const navigationHistory: string[] = [];
+let navigationHistoryIndex = -1;
 let runId: number | null = null;
-const documentViews = new Map<number, { state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment; wrapConfig: Compartment; goToDefinition: (view: EditorView) => Promise<void> }>();
+const documentViews = new Map<number, { state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment; wrapConfig: Compartment; indentConfig: Compartment; goToDefinition: (view: EditorView) => Promise<void> }>();
 const recoveryBaseHashes = new Map<number, string>();
 const recoveryTimers = new Map<number, number>();
 const recoveryWrites = new Map<number, Promise<void>>();
@@ -117,6 +141,10 @@ let registeredCommands: string[] = [];
 const commandLabels = new Map<string, string>();
 const commandDescriptions = new Map<string, string>();
 const commandMetadata = new Map<string, { description: string; shortcut: string | null; enabled: boolean }>();
+for (const command of UI_COMMANDS) {
+  commandLabels.set(command.id, command.title); commandDescriptions.set(command.id, command.description);
+  commandMetadata.set(command.id, { description: command.description, shortcut: command.shortcut || null, enabled: true });
+}
 let editor: EditorView | null = null;
 let outputRefreshTimer = 0;
 let toastTimer = 0;
@@ -364,20 +392,20 @@ function selectSidebarView(view: LayoutPreferences['primaryView']): void {
 }
 
 async function openWorkspace(path: string): Promise<void> {
-  const value = expect(await client.call({ method: 'open_workspace', params: { path } }), 'workspace_opened').value;
-  workspaceRoot = value.root;
-  document.querySelector<HTMLElement>('#toolbar-workspace')!.textContent = baseName(value.root);
+  const opened = await openWorkspaceAndDiscoverProjects(client, path);
+  workspaceRoot = opened.root;
   applySettingsPreferences();
-  rootLabel.textContent = baseName(value.root);
-  rootLabel.title = value.root;
-  document.querySelector('#status-workspace')!.textContent = baseName(value.root);
+  rootLabel.textContent = baseName(opened.root);
+  rootLabel.title = opened.root;
+  document.querySelector('#status-workspace')!.textContent = baseName(opened.root);
   document.querySelector('#welcome-open-file')!.removeAttribute('disabled');
   document.querySelector<HTMLButtonElement>('#menu-open-file')!.disabled = false;
   treeState.setEntries('', expect(await client.call({ method: 'list_directory', params: { path: '' } }), 'directory_entries').value);
   renderTree();
-  await refreshProjects();
+  if (opened.discovery) renderProjectDiscovery(opened.discovery);
+  else renderProjectDiscoveryError(opened.discoveryError ?? 'Unknown discovery error');
   saveSession();
-  setStatus('Workspace opened');
+  setStatus(opened.discovery ? 'Workspace opened' : 'Workspace opened · project discovery failed');
 }
 
 function baseName(path: string): string { return path.replace(/[\\/]+$/, '').split(/[\\/]/).at(-1) || path; }
@@ -480,7 +508,7 @@ function showWorkspaceContextMenu(event: MouseEvent, path: string, isDirectory: 
   menu.style.left = `${event.clientX}px`; menu.style.top = `${event.clientY}px`; document.body.append(menu);
 }
 
-function appendIcon(parent: HTMLElement, kind: string, expanded = false): void {
+function appendIcon(parent: HTMLElement, kind: WorkspaceEntryKind, expanded = false, path = ''): void {
   const disclosure = document.createElement('span');
   disclosure.className = 'tree-chevron';
   if (kind === 'directory') disclosure.innerHTML = expanded ? '<svg viewBox="0 0 16 16"><path d="m4 6 4 4 4-4"/></svg>' : '<svg viewBox="0 0 16 16"><path d="m6 4 4 4-4 4"/></svg>';
@@ -488,7 +516,7 @@ function appendIcon(parent: HTMLElement, kind: string, expanded = false): void {
   const icon = document.createElement('span');
   icon.className = `tree-icon icon-${kind}`;
   icon.setAttribute('aria-hidden', 'true');
-  icon.innerHTML = kind === 'directory' ? '<svg viewBox="0 0 16 16"><path d="M2 4.5h4l1.2 1.4H14v6.6H2z"/></svg>' : kind === 'file' ? '<svg viewBox="0 0 16 16"><path d="M4 2.5h5l3 3v8H4z"/><path d="M9 2.5v3h3"/></svg>' : '<svg viewBox="0 0 16 16"><path d="M4 12 12 4M7 4h5v5"/></svg>';
+  icon.innerHTML = fileIconMarkup(path, kind, expanded);
   parent.append(disclosure, icon);
 }
 
@@ -500,7 +528,7 @@ function renderTree(): void {
     treeRoot.append(blank); return;
   }
   const heading = document.createElement('div'); heading.className = 'root-row'; heading.title = workspaceRoot;
-  appendIcon(heading, 'directory', true);
+  appendIcon(heading, 'directory', true, baseName(workspaceRoot));
   const headingText = document.createElement('span'); headingText.textContent = baseName(workspaceRoot); heading.append(headingText); treeRoot.append(heading);
   const rootNode = treeState.nodes.get('');
   if (rootNode?.loading) appendTreeMessage('Loading project files…');
@@ -515,7 +543,7 @@ function renderTree(): void {
     row.setAttribute('role', 'treeitem'); row.setAttribute('aria-level', String(depth + 1));
     if (entry.kind === 'directory') row.setAttribute('aria-expanded', String(node?.expanded ?? false));
     if (selectedPath === entry.path) row.setAttribute('aria-current', 'true');
-    appendIcon(row, entry.kind, node?.expanded);
+    appendIcon(row, entry.kind, node?.expanded, entry.name);
     const label = document.createElement('span'); label.textContent = entry.name; row.append(label);
     row.addEventListener('click', () => {
       if (entry.kind === 'directory') {
@@ -565,10 +593,12 @@ async function openDocument(path: string): Promise<boolean> {
       id: opened.document_id, path, title: baseName(path), revision: content.revision,
       dirty: content.dirty, language: languageNameForPath(path), lineEnding: lineEndingFor(content.contents),
     };
-    tabs.open(tab); selectedPath = path;
-    const { state, pipeline, lineEnding, languageConfig, wrapConfig, refreshDebugGutter, goToDefinition: navigateDefinition } = await createDocumentState(tab, content.contents, content.revision);
+    settingsTabActive = false;
+    document.querySelector<HTMLElement>('#settings-view')!.classList.add('hidden');
+    tabs.open(tab); selectedPath = path; recordNavigation(path);
+    const { state, pipeline, lineEnding, languageConfig, wrapConfig, indentConfig, refreshDebugGutter, goToDefinition: navigateDefinition } = await createDocumentState(tab, content.contents, content.revision);
     debugGutterRefreshers.set(tab.id, refreshDebugGutter);
-    documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig, wrapConfig, goToDefinition: navigateDefinition });
+    documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig, wrapConfig, indentConfig, goToDefinition: navigateDefinition });
     if (fingerprint) recoveryBaseHashes.set(tab.id, fingerprint);
     if (!editor) editor = new EditorView({ state, parent: editorHost }); else editor.setState(state);
     welcome.classList.add('hidden'); editorHost.classList.remove('hidden');
@@ -598,12 +628,13 @@ async function navigateDebugSource(path: string, zeroBasedLine: number): Promise
   editor.focus();
 }
 
-async function createDocumentState(tab: EditorTab, contents: string, revision: number): Promise<{ state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment; wrapConfig: Compartment; refreshDebugGutter: () => void; goToDefinition: (view: EditorView) => Promise<void> }> {
+async function createDocumentState(tab: EditorTab, contents: string, revision: number): Promise<{ state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment; wrapConfig: Compartment; indentConfig: Compartment; refreshDebugGutter: () => void; goToDefinition: (view: EditorView) => Promise<void> }> {
   const lineEnding = lineEndingFor(contents);
   const lineSeparator = lineEnding === 'CRLF' ? '\r\n' : '\n';
   const languageExtensions = await languageForPath(tab.path);
   const languageConfig = new Compartment();
   const wrapConfig = new Compartment();
+  const indentConfig = new Compartment();
   const gutter = debugGutter(absoluteDebugSourcePath(workspaceRoot, tab.path),
     (source, line) => debugPanel?.breakpointState(source, line) ?? null,
     (source) => debugPanel?.executionLine(source) ?? null,
@@ -639,7 +670,7 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
       { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: 'var(--syntax-function)' },
       { tag: [tags.typeName, tags.className], color: 'var(--syntax-type)' },
       { tag: tags.comment, color: 'var(--syntax-comment)', fontStyle: 'italic' },
-    ])), EditorState.tabSize.of(4), EditorState.lineSeparator.of(lineSeparator), wrapConfig.of(effectiveSetting(settingsSnapshot, 'editor.wordWrap', workspaceRoot || null).value ? EditorView.lineWrapping : []), languageConfig.of(languageExtensions), ...serviceExtensions, gutter.extension,
+    ])), EditorState.lineSeparator.of(lineSeparator), wrapConfig.of(effectiveSetting(settingsSnapshot, 'editor.wordWrap', workspaceRoot || null).value ? EditorView.lineWrapping : []), indentConfig.of(editorIndentationExtensions()), languageConfig.of(languageExtensions), ...serviceExtensions, gutter.extension,
       EditorView.updateListener.of((update) => {
         const entry = documentViews.get(tab.id);
         if (!entry) return;
@@ -663,7 +694,7 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
     },
   }, () => documentViews.get(tab.id)?.state.doc.toString() ?? contents,
   (newRevision, dirty) => { tabs.update(tab.id, { revision: newRevision, dirty }); renderTabs(); updateStatusDocument(); }, showError);
-  return { state, pipeline, lineEnding, languageConfig, wrapConfig, refreshDebugGutter, goToDefinition: (view: EditorView) => goToDefinition(client, languageHost, view) };
+  return { state, pipeline, lineEnding, languageConfig, wrapConfig, indentConfig, refreshDebugGutter, goToDefinition: (view: EditorView) => goToDefinition(client, languageHost, view) };
 }
 
 async function refreshDocumentLanguage(documentId: number): Promise<void> {
@@ -677,10 +708,11 @@ async function refreshDocumentLanguage(documentId: number): Promise<void> {
 function renderTabs(): void {
   tabsHost.replaceChildren();
   for (const tab of tabs.tabs) {
-    const item = document.createElement('div'); item.className = `tab${tab.id === tabs.activeId ? ' active' : ''}`;
-    item.setAttribute('role', 'tab'); item.setAttribute('aria-selected', String(tab.id === tabs.activeId)); item.tabIndex = tab.id === tabs.activeId ? 0 : -1;
+    const active = !settingsTabActive && tab.id === tabs.activeId;
+    const item = document.createElement('div'); item.className = `tab${active ? ' active' : ''}`;
+    item.setAttribute('role', 'tab'); item.setAttribute('aria-selected', String(active)); item.tabIndex = active ? 0 : -1;
     const select = document.createElement('button'); select.className = 'tab-select'; select.textContent = tab.title;
-    const fileIcon = document.createElement('span'); fileIcon.className = 'tab-file-icon'; fileIcon.setAttribute('aria-hidden', 'true'); fileIcon.innerHTML = '<svg viewBox="0 0 16 16"><path d="M4 2.5h5l3 3v8H4z"/><path d="M9 2.5v3h3"/></svg>'; select.prepend(fileIcon);
+    const fileIcon = document.createElement('span'); fileIcon.className = 'tab-file-icon'; fileIcon.setAttribute('aria-hidden', 'true'); fileIcon.innerHTML = fileIconMarkup(tab.path, 'file'); select.prepend(fileIcon);
     select.title = tab.path; select.setAttribute('aria-label', `${tab.title}${tab.dirty ? ', unsaved' : ''}`);
     if (tab.dirty) { const marker = document.createElement('span'); marker.className = 'dirty-marker'; marker.textContent = '●'; marker.setAttribute('aria-label', 'Unsaved changes'); select.prepend(marker); }
     select.addEventListener('click', () => selectTab(tab.id));
@@ -695,20 +727,75 @@ function renderTabs(): void {
     close.addEventListener('click', () => void closeTab(tab));
     item.append(select, close); tabsHost.append(item);
   }
-  if (!tabs.tabs.length) { editorHost.classList.add('hidden'); welcome.classList.remove('hidden'); }
+  if (settingsTabOpen) {
+    const item = document.createElement('div'); item.className = `tab settings-tab${settingsTabActive ? ' active' : ''}`;
+    item.setAttribute('role', 'tab'); item.setAttribute('aria-selected', String(settingsTabActive)); item.tabIndex = settingsTabActive ? 0 : -1;
+    const select = document.createElement('button'); select.id = 'tab-settings'; select.className = 'tab-select'; select.textContent = 'Settings'; select.setAttribute('aria-label', 'Settings');
+    const icon = document.createElement('span'); icon.className = 'tab-file-icon'; icon.setAttribute('aria-hidden', 'true'); icon.innerHTML = '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.1"/><path d="M8 1.5v2m0 9v2m6.5-6.5h-2m-9 0h-2m11.1-4.6-1.4 1.4m-6.4 6.4-1.4 1.4m9.2 0-1.4-1.4m-6.4-6.4L3.4 2.9"/></svg>'; select.prepend(icon);
+    select.addEventListener('click', () => activateSettingsTab());
+    const close = document.createElement('button'); close.className = 'tab-close'; close.textContent = '×'; close.title = 'Close Settings'; close.setAttribute('aria-label', 'Close Settings');
+    close.addEventListener('click', () => closeSettingsTab());
+    item.append(select, close); tabsHost.append(item);
+  }
+  if (!settingsTabActive && !tabs.tabs.length) { editorHost.classList.add('hidden'); welcome.classList.remove('hidden'); }
 }
 
-function selectTab(id: number): void {
+function selectTab(id: number, record = true): void {
   if (!tabs.select(id)) return;
+  settingsTabActive = false;
+  document.querySelector<HTMLElement>('#settings-view')!.classList.add('hidden');
+  editorHost.classList.remove('hidden'); welcome.classList.add('hidden');
   const tab = tabs.active;
   if (!tab) return;
   selectedPath = tab.path;
+  if (record) recordNavigation(tab.path);
   const entry = documentViews.get(id); if (entry && editor) editor.setState(entry.state);
   renderLanguageDiagnostics(id);
   scheduleInspection(id);
   renderTree(); renderTabs(); updateStatusDocument(); editor?.focus();
   saveSession();
   void client.call({ method: 'read_document', params: { document_id: id } }).catch(showError);
+}
+
+function activateSettingsTab(): void {
+  settingsTabOpen = true;
+  settingsTabActive = true;
+  editorHost.classList.add('hidden'); welcome.classList.add('hidden');
+  document.querySelector<HTMLElement>('#settings-view')!.classList.remove('hidden');
+  renderTabs();
+}
+
+function closeSettingsTab(): void {
+  settingsTabOpen = false;
+  settingsTabActive = false;
+  document.querySelector<HTMLElement>('#settings-view')!.classList.add('hidden');
+  if (tabs.active) selectTab(tabs.active.id, false);
+  else { editorHost.classList.add('hidden'); welcome.classList.remove('hidden'); renderTabs(); updateStatusDocument(); }
+}
+
+function recordNavigation(path: string): void {
+  if (navigationHistory[navigationHistoryIndex] === path) return;
+  navigationHistory.splice(navigationHistoryIndex + 1);
+  navigationHistory.push(path);
+  if (navigationHistory.length > 100) navigationHistory.shift();
+  navigationHistoryIndex = navigationHistory.length - 1;
+  syncNavigationButtons();
+}
+
+function navigateDocumentHistory(direction: -1 | 1): void {
+  const next = navigationHistoryIndex + direction;
+  if (next < 0 || next >= navigationHistory.length) return;
+  const path = navigationHistory[next]!;
+  const tab = tabs.tabs.find((candidate) => candidate.path === path);
+  if (!tab) { setStatus('That document is no longer open.'); return; }
+  navigationHistoryIndex = next;
+  selectTab(tab.id, false);
+  syncNavigationButtons();
+}
+
+function syncNavigationButtons(): void {
+  document.querySelector<HTMLButtonElement>('#navigation-back')!.disabled = navigationHistoryIndex <= 0;
+  document.querySelector<HTMLButtonElement>('#navigation-forward')!.disabled = navigationHistoryIndex < 0 || navigationHistoryIndex >= navigationHistory.length - 1;
 }
 
 function updateStatusDocument(): void {
@@ -755,7 +842,7 @@ async function closeTab(tab: EditorTab): Promise<void> {
     const inspectionTimer = inspectionTimers.get(tab.id); if (inspectionTimer !== undefined) window.clearTimeout(inspectionTimer);
     inspectionTimers.delete(tab.id); inspectionGenerations.delete(tab.id); renderProblems();
     recoveryBaseHashes.delete(tab.id); recoveryTimers.delete(tab.id);
-    if (wasActive && tabs.activeId !== null) selectTab(tabs.activeId); else renderTabs();
+    if (wasActive && tabs.activeId !== null && !settingsTabActive) selectTab(tabs.activeId); else renderTabs();
     updateStatusDocument();
     saveSession();
   } catch (error) { showError(error); }
@@ -812,9 +899,9 @@ async function showConflict(tab: EditorTab): Promise<void> {
     tabs.update(tab.id, { revision: decision.revision, dirty: decision.dirty });
     if (action === 'reload') {
       const content = expect(await client.call({ method: 'read_document', params: { document_id: tab.id } }), 'document_contents').value;
-      const { state, pipeline, lineEnding, languageConfig, wrapConfig, refreshDebugGutter, goToDefinition: navigateDefinition } = await createDocumentState(tab, content.contents, content.revision);
+      const { state, pipeline, lineEnding, languageConfig, wrapConfig, indentConfig, refreshDebugGutter, goToDefinition: navigateDefinition } = await createDocumentState(tab, content.contents, content.revision);
       tabs.update(tab.id, { lineEnding });
-      documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig, wrapConfig, goToDefinition: navigateDefinition });
+      documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig, wrapConfig, indentConfig, goToDefinition: navigateDefinition });
       debugGutterRefreshers.set(tab.id, refreshDebugGutter);
       if (tabs.activeId === tab.id && editor) editor.setState(state);
       await deleteRecoveryForDocument(tab.id);
@@ -846,14 +933,14 @@ async function chooseWorkspace(): Promise<void> {
     for (const tab of [...tabs.tabs]) { tabs.close(tab.id); documentViews.delete(tab.id); debugGutterRefreshers.delete(tab.id); }
     workspaceRoot = ''; selectedPath = ''; taskById.clear();
     rootLabel.textContent = 'No Workspace'; rootLabel.removeAttribute('title');
-    document.querySelector<HTMLElement>('#toolbar-workspace')!.textContent = 'Koren Code Editor';
+    document.querySelector<HTMLElement>('#toolbar-workspace')!.textContent = 'Open Workspace';
     document.querySelector('#status-workspace')!.textContent = '';
     document.querySelector<HTMLButtonElement>('#menu-open-file')!.disabled = true;
     document.querySelector<HTMLButtonElement>('#welcome-open-file')!.disabled = true;
-    taskHost.innerHTML = '<div class="panel-empty">Discover Cargo projects to see available tasks.</div>';
-    projectHost.innerHTML = '<div class="panel-empty">Project information will appear here.</div>';
+    taskHost.innerHTML = '<div class="panel-empty">Detected project tasks will appear here.</div>';
+    projectHost.innerHTML = '<div class="panel-empty">Detected projects will appear here.</div>';
     outputHost.innerHTML = '<div class="panel-empty">Task output will appear here.</div>';
-    runId = null; updateRunConfigurations([]); setCancelEnabled(false);
+    runId = null; setCancelEnabled(false);
     treeState.reset(); renderTree(); renderTabs(); updateStatusDocument();
     await openWorkspace(path);
   } catch (error) { showError(error); }
@@ -873,51 +960,52 @@ async function chooseFile(): Promise<void> {
   } catch (error) { showError(error); }
 }
 
-async function refreshProjects(): Promise<void> {
-  try {
-    const list = expect(await client.call({ method: 'list_projects' }), 'projects').value;
-    renderProjectList(list.map((project) => `${project.display_name} · ${project.provider_id}`));
-  } catch (error) { showError(error); }
-}
-
-async function discoverCargo(): Promise<void> {
+async function refreshProjectDiscovery(): Promise<void> {
   if (!workspaceRoot) { setStatus('Open a workspace first'); return; }
   try {
-    const response = expect(await client.call({ method: 'discover_cargo_projects', params: { max_directories: 6000, max_projects: 256, max_depth: 32 } }), 'cargo_projects');
-    renderCargoProjects(response.value);
-    const tasks = expect(await client.call({ method: 'list_tasks' }), 'tasks').value;
-    taskById.clear(); for (const task of tasks) taskById.set(task.task_id, task);
-    updateRunConfigurations(tasks);
-    renderTasks(tasks); showPanel('tasks'); setStatus(`Found ${response.value.length} Cargo project${response.value.length === 1 ? '' : 's'}`);
-    for (const button of document.querySelectorAll<HTMLButtonElement>('[data-action="run-cargo"]')) button.disabled = !tasks.some((task) => task.key.endsWith(`.${button.dataset.command}`));
-  } catch (error) { showError(error); }
+    const snapshot = await discoverWorkspaceProjects(client);
+    renderProjectDiscovery(snapshot);
+    setStatus(`Project refresh complete · ${snapshot.projects.length} project${snapshot.projects.length === 1 ? '' : 's'}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    renderProjectDiscoveryError(message);
+    setStatus(`Project discovery failed: ${message}`);
+    showError(new Error(`Project discovery failed: ${message}`));
+  }
 }
 
-function renderCargoProjects(projects: CargoProjectSummary[]): void {
+function renderProjectDiscovery(snapshot: ProjectDiscoverySnapshot): void {
+  renderProjectList(snapshot.projects);
+  taskById.clear(); for (const task of snapshot.tasks) taskById.set(task.task_id, task);
+  renderTasks(snapshot.tasks);
+}
+
+function renderProjectDiscoveryError(message: string): void {
+  projectHost.replaceChildren();
+  const projectError = document.createElement('div'); projectError.className = 'panel-empty'; projectError.textContent = `Project discovery failed: ${message}`;
+  projectHost.append(projectError);
+  taskHost.replaceChildren();
+  const taskError = document.createElement('div'); taskError.className = 'panel-empty'; taskError.textContent = 'Tasks are unavailable until project discovery succeeds.';
+  taskHost.append(taskError);
+}
+
+function renderProjectList(projects: ProjectSummary[]): void {
   projectHost.replaceChildren();
   for (const project of projects) {
     const row = document.createElement('div'); row.className = 'cargo-project';
-    const icon = document.createElement('span'); icon.className = 'project-icon'; icon.textContent = '▱'; icon.setAttribute('aria-hidden', 'true');
+    const icon = document.createElement('span'); icon.className = 'project-icon'; icon.textContent = '◇'; icon.setAttribute('aria-hidden', 'true');
     const info = document.createElement('div'); info.className = 'project-info';
-    const name = document.createElement('strong'); name.textContent = project.project.display_name;
-    const meta = document.createElement('span'); meta.textContent = `${project.is_workspace ? 'Workspace' : 'Package'} · ${project.members.length} members`;
+    const name = document.createElement('strong'); name.textContent = project.display_name;
+    const meta = document.createElement('span'); meta.textContent = `${project.provider_id} · ${project.root}`;
     info.append(name, meta); row.append(icon, info); projectHost.append(row);
   }
-  if (!projects.length) projectHost.innerHTML = '<div class="panel-empty">No Cargo projects found in this workspace.</div>';
-}
-
-function renderProjectList(projects: string[]): void {
-  projectHost.replaceChildren();
-  for (const display of projects) {
-    const row = document.createElement('div'); row.className = 'cargo-project'; row.textContent = display; projectHost.append(row);
-  }
-  if (!projects.length) projectHost.innerHTML = '<div class="panel-empty">Project information will appear here.</div>';
+  if (!projects.length) projectHost.innerHTML = '<div class="panel-empty">No supported projects detected in this workspace.</div>';
 }
 
 function renderTasks(tasks: TaskSummary[]): void {
   taskHost.replaceChildren();
   for (const task of tasks) {
-    if (task.category === 'custom' || task.key.endsWith('.metadata')) continue;
+    if (task.category === 'custom') continue;
     const row = document.createElement('div'); row.className = 'task-row';
     const details = document.createElement('div'); details.className = 'task-info';
     const title = document.createElement('span'); title.className = 'task-title'; title.textContent = task.display_name;
@@ -926,38 +1014,11 @@ function renderTasks(tasks: TaskSummary[]): void {
     const run = document.createElement('button'); run.className = 'small-button'; run.textContent = 'Run'; run.addEventListener('click', () => void requestTask(task));
     row.append(details, run); taskHost.append(row);
   }
-  if (!taskHost.childElementCount) taskHost.innerHTML = '<div class="panel-empty">Discover Cargo projects to load available tasks.</div>';
-}
-
-function updateRunConfigurations(tasks: TaskSummary[]): void {
-  const configurations = runConfigurationTasks(tasks);
-  runConfiguration.replaceChildren();
-  if (!configurations.length) {
-    const option = document.createElement('option'); option.value = ''; option.textContent = 'No run configuration';
-    runConfiguration.append(option); runConfiguration.disabled = true;
-  } else {
-    for (const task of configurations) {
-      const option = document.createElement('option'); option.value = String(task.task_id); option.textContent = task.display_name;
-      runConfiguration.append(option);
-    }
-    runConfiguration.value = String(configurations[0]!.task_id); runConfiguration.disabled = false;
-  }
-  syncRunButton();
-}
-
-function syncRunButton(): void {
-  const task = selectedRunTask([...taskById.values()], runConfiguration.value);
-  document.querySelector<HTMLButtonElement>('#toolbar-run')!.disabled = !task || runId !== null;
-}
-
-async function runSelectedConfiguration(): Promise<void> {
-  const task = selectedRunTask([...taskById.values()], runConfiguration.value);
-  if (!task) { setStatus('Discover a runnable project first'); return; }
-  await requestTask(task);
+  if (!taskHost.childElementCount) taskHost.innerHTML = '<div class="panel-empty">No tasks are provided by detected projects.</div>';
 }
 
 async function runCargoCommand(operation: string): Promise<void> {
-  if (!taskById.size) { setStatus('Discover Cargo projects first'); return; }
+  if (!taskById.size) { setStatus('No project tasks are available. Use Refresh Project to retry discovery.'); return; }
   const task = [...taskById.values()].find((candidate) => candidate.key === `cargo.workspace.${operation}`)
     ?? [...taskById.values()].find((candidate) => candidate.key.endsWith(`.${operation}`));
   if (!task) { setStatus(`No Cargo ${operation} task is available`); return; }
@@ -1010,7 +1071,6 @@ async function updateTaskOutput(id: number): Promise<void> {
 function setCancelEnabled(enabled: boolean): void {
   const button = document.querySelector<HTMLButtonElement>('[data-action="cancel-task"]')!;
   button.disabled = !enabled;
-  syncRunButton();
 }
 function queueOutputRefresh(id: number): void {
   if (outputRefreshTimer) window.clearTimeout(outputRefreshTimer);
@@ -1077,6 +1137,7 @@ function applyExtensionTheme(theme: ExtensionThemeSummary): void {
   if (selector) selector.value = `extension:${theme.id}`;
 }
 async function openSettings(): Promise<void> {
+  activateSettingsTab();
   try {
     renderSettings();
     const catalog = expect(await client.call({ method: 'list_extensions' }), 'extensions').value;
@@ -1084,7 +1145,7 @@ async function openSettings(): Promise<void> {
     const configuration = expect(await client.call({ method: 'list_inspection_rules' }), 'inspection_configuration').value;
     renderInspectionSettings(configuration);
     renderSettings();
-    document.querySelector<HTMLDialogElement>('#settings-dialog')!.showModal();
+    if (settingsTabActive) document.querySelector<HTMLInputElement>('#settings-search')!.focus();
   }
   catch (error) { showError(error); }
 }
@@ -1098,22 +1159,31 @@ function toggleTheme(): void {
   applySettingsPreferences();
 }
 
-const settingsCategories = ['General', 'Appearance', 'Editor', 'Workbench', 'Keybindings', 'Languages', 'Extensions', 'Terminal', 'Source Control', 'Debugging', 'Inspections', 'Workspace', 'Advanced'] as const;
+const settingsCategories = [
+  'General', 'General/Startup', 'General/Application', 'General/Window',
+  'Appearance', 'Appearance/Theme', 'Appearance/Interface', 'Appearance/Project Identity', 'Appearance/Panels',
+  'Editor', 'Editor/Font and Typography', 'Editor/Indentation', 'Editor/Display', 'Editor/Editing', 'Editor/Tabs',
+  'Files and Saving', 'Search', 'Keybindings', 'Languages', 'Extensions', 'Terminal', 'Source Control',
+  'Debugging', 'Inspections and Diagnostics', 'Workspace and Projects', 'Accessibility', 'Advanced',
+] as const;
 
 function applySettingsPreferences(): void {
   const theme = effectiveSetting(settingsSnapshot, 'appearance.theme', workspaceRoot || null).value;
   setTheme(theme === 'light' ? 'light' : 'dark', false);
   document.documentElement.dataset.density = String(effectiveSetting(settingsSnapshot, 'workbench.density', workspaceRoot || null).value);
   document.documentElement.dataset.toolbarVisible = String(effectiveSetting(settingsSnapshot, 'workbench.toolbarVisible', workspaceRoot || null).value);
+  const showMenuBar = Boolean(effectiveSetting(settingsSnapshot, 'appearance.classicMenu', null).value);
+  document.querySelector('.workbench-v2')!.classList.toggle('menu-labels-hidden', !showMenuBar);
   document.documentElement.style.setProperty('--koren-editor-size', `${effectiveSetting(settingsSnapshot, 'editor.fontSize', workspaceRoot || null).value}px`);
   document.documentElement.dataset.lineNumbers = String(effectiveSetting(settingsSnapshot, 'editor.lineNumbers', workspaceRoot || null).value);
   const wrap = Boolean(effectiveSetting(settingsSnapshot, 'editor.wordWrap', workspaceRoot || null).value);
   document.documentElement.dataset.wrap = String(wrap);
   for (const [documentId, entry] of documentViews) {
-    const effects = entry.wrapConfig.reconfigure(wrap ? EditorView.lineWrapping : []);
+    const effects = [entry.wrapConfig.reconfigure(wrap ? EditorView.lineWrapping : []), entry.indentConfig.reconfigure(editorIndentationExtensions())];
     if (editor && tabs.activeId === documentId) editor.dispatch({ effects });
     else entry.state = entry.state.update({ effects }).state;
   }
+  applyProjectIdentity();
   const warning = document.querySelector<HTMLElement>('#settings-warning');
   if (warning) {
     warning.textContent = settingsData.invalid ? 'The saved settings record is invalid. It was left untouched; use Reset All Settings to replace it.' : '';
@@ -1122,6 +1192,64 @@ function applySettingsPreferences(): void {
   const themeId = localStorage.getItem('koren-code:theme-extension');
   const contributedTheme = extensionCatalogCache?.themes.find((item) => item.id === themeId);
   if (contributedTheme && document.documentElement.dataset.extensionTheme !== contributedTheme.id) applyExtensionTheme(contributedTheme);
+}
+
+function editorIndentationExtensions(): Extension[] {
+  const tabSize = Number(effectiveSetting(settingsSnapshot, 'editor.tabSize', workspaceRoot || null).value);
+  const indentSize = Number(effectiveSetting(settingsSnapshot, 'editor.indentSize', workspaceRoot || null).value);
+  const spaces = Boolean(effectiveSetting(settingsSnapshot, 'editor.insertSpaces', workspaceRoot || null).value);
+  return [EditorState.tabSize.of(tabSize), indentUnit.of(spaces ? ' '.repeat(indentSize) : '\t')];
+}
+
+function applyProjectIdentity(): void {
+  const enabled = Boolean(effectiveSetting(settingsSnapshot, 'appearance.projectColors.enabled', null).value);
+  const autoAssign = Boolean(effectiveSetting(settingsSnapshot, 'appearance.projectColors.autoAssign', null).value);
+  const style = String(effectiveSetting(settingsSnapshot, 'appearance.projectColors.style', null).value);
+  const intensity = Number(effectiveSetting(settingsSnapshot, 'appearance.projectColors.intensity', null).value);
+  const showName = Boolean(effectiveSetting(settingsSnapshot, 'appearance.projectColors.showWorkspaceName', null).value);
+  const storedColor = workspaceRoot ? settingsSnapshot.workspaces[workspaceRoot]?.['appearance.projectIdentity.color'] : undefined;
+  const color = typeof storedColor === 'string' && hasReadableProjectAccent(storedColor)
+    ? storedColor
+    : workspaceRoot && autoAssign ? automaticProjectColor(workspaceRoot) : '#5294d8';
+  const icon = workspaceRoot ? String(settingsSnapshot.workspaces[workspaceRoot]?.['appearance.projectIdentity.icon'] ?? 'folder') : 'folder';
+  const root = document.documentElement;
+  root.style.setProperty('--project-color', color);
+  root.style.setProperty('--project-intensity', `${intensity}%`);
+  root.dataset.projectColors = String(enabled && Boolean(workspaceRoot));
+  root.dataset.projectColorStyle = style;
+  const name = document.querySelector<HTMLElement>('#toolbar-workspace');
+  if (name) name.textContent = workspaceRoot ? (showName ? baseName(workspaceRoot) : 'Workspace') : 'Open Workspace';
+  document.querySelector<HTMLButtonElement>('#workspace-selector')?.setAttribute('aria-label', workspaceRoot ? `Workspace ${baseName(workspaceRoot)}` : 'Open Workspace');
+  const iconHost = document.querySelector<HTMLElement>('#project-icon');
+  if (iconHost) iconHost.innerHTML = projectIdentityIcon(icon);
+  const branch = document.querySelector<HTMLElement>('#toolbar-branch');
+  const branchButton = document.querySelector<HTMLButtonElement>('.branch-selector');
+  if (branch) branch.textContent = gitStatus?.branch ?? '';
+  if (branchButton) branchButton.hidden = !gitStatus?.branch;
+  renderProjectIdentityPreview(color, icon, style, enabled);
+}
+
+function projectIdentityIcon(icon: string): string {
+  const paths: Record<string, string> = {
+    folder: '<path d="M2 4.5h4l1.2 1.4H14v6.6H2z"/>',
+    code: '<path d="m5.5 4-4 4 4 4M10.5 4l4 4-4 4"/>',
+    package: '<path d="m8 1.8 5.6 3.1v6.2L8 14.2l-5.6-3.1V4.9zM2.4 4.9 8 8l5.6-3.1M8 8v6.2"/>',
+    tools: '<path d="M9.5 3.2a3 3 0 0 0-3.8 3.8l-4 4 2.3 2.3 4-4a3 3 0 0 0 3.8-3.8l-1.9 1.9-2.3-2.3z"/>',
+  };
+  return `<svg viewBox="0 0 16 16" aria-hidden="true">${paths[icon] ?? paths.folder}</svg>`;
+}
+
+function renderProjectIdentityPreview(color: string, icon: string, style: string, enabled: boolean): void {
+  const host = document.querySelector<HTMLElement>('#project-identity-preview');
+  if (!host) return;
+  host.style.setProperty('--preview-color', color);
+  host.dataset.style = style;
+  host.dataset.enabled = String(enabled);
+  const title = host.querySelector<HTMLElement>('.settings-preview-title')!;
+  title.replaceChildren();
+  const mark = document.createElement('span'); mark.className = 'project-icon-mark'; mark.innerHTML = projectIdentityIcon(icon);
+  const name = document.createElement('span'); name.textContent = workspaceRoot ? baseName(workspaceRoot) : 'Workspace preview';
+  title.append(mark, name);
 }
 
 function renderSettings(): void {
@@ -1134,36 +1262,79 @@ function renderSettings(): void {
   categories.replaceChildren();
   for (const category of settingsCategories) {
     const button = document.createElement('button');
-    button.type = 'button'; button.textContent = category;
+    button.type = 'button'; button.textContent = category.split('/').at(-1) ?? category;
+    button.dataset.level = String(category.split('/').length - 1);
     button.classList.toggle('selected', category === settingsCategory);
     button.setAttribute('aria-current', String(category === settingsCategory));
-    button.addEventListener('click', () => { settingsCategory = category; renderSettings(); });
+    button.addEventListener('click', () => selectSettingsCategory(category));
+    button.addEventListener('keydown', (event) => {
+      if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const items = [...categories.querySelectorAll<HTMLButtonElement>('button')];
+      const index = items.indexOf(button);
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : Math.max(0, Math.min(items.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)));
+      items[next]?.focus();
+    });
     categories.append(button);
   }
   builtins.replaceChildren();
   const query = settingsQuery.trim();
   const found = searchSettings(settingsSnapshot, query, settingsModifiedOnly, workspaceRoot || null)
-    .filter((descriptor) => query || descriptor.category === settingsCategory);
+    .filter((descriptor) => query || descriptor.category === settingsCategory || descriptor.category.startsWith(`${settingsCategory}/`));
   const extensionSection = document.querySelector<HTMLElement>('#settings-extension-section')!;
   const inspectionSection = document.querySelector<HTMLElement>('#settings-inspection-section')!;
-  extensionSection.classList.toggle('hidden', settingsCategory !== 'Extensions' || Boolean(query));
-  inspectionSection.classList.toggle('hidden', settingsCategory !== 'Inspections' || Boolean(query));
-  if (settingsCategory === 'Extensions' && !query) {
+  extensionSection.classList.toggle('hidden', !settingsCategory.startsWith('Extensions') || Boolean(query));
+  inspectionSection.classList.toggle('hidden', !settingsCategory.startsWith('Inspections') || Boolean(query));
+  if (settingsCategory === 'Keybindings') {
+    const heading = document.createElement('h2'); heading.textContent = 'Keybindings'; builtins.append(heading);
+    renderKeybindings(builtins, settingsQuery);
+  }
+  if (settingsCategory.startsWith('Extensions') && !query) {
     const heading = document.createElement('h2'); heading.textContent = 'Extensions'; builtins.append(heading);
     const message = document.createElement('p'); message.className = 'settings-intro'; message.textContent = 'Review installed extensions, their permissions, contributed tools, and declared settings.'; builtins.append(message);
-  } else if (settingsCategory === 'Inspections' && !query) {
-    const heading = document.createElement('h2'); heading.textContent = 'Inspections'; builtins.append(heading);
+    const installedHeading = document.createElement('h3'); installedHeading.textContent = 'Installed'; builtins.append(installedHeading);
+    const catalog = extensionCatalogCache;
+    if (!catalog?.extensions.length) {
+      const empty = document.createElement('p'); empty.className = 'settings-unavailable'; empty.textContent = catalog ? 'No local extensions installed.' : 'Loading installed extensions…'; builtins.append(empty);
+    } else {
+      const list = document.createElement('div'); list.className = 'settings-extension-list';
+      for (const extension of catalog.extensions) {
+        const row = document.createElement('div'); row.className = 'settings-extension-row';
+        const details = document.createElement('div'); details.className = 'setting-description';
+        const title = document.createElement('strong'); title.textContent = extension.name;
+        const metadata = document.createElement('p'); metadata.textContent = `${extension.id} · ${extension.version} · ${extension.state}`;
+        details.append(title, metadata);
+        const manage = document.createElement('button'); manage.type = 'button'; manage.textContent = 'Manage…'; manage.addEventListener('click', () => void openExtensions());
+        row.append(details, manage); list.append(row);
+      }
+      builtins.append(list);
+    }
+  } else if (settingsCategory.startsWith('Inspections') && !query) {
+    const heading = document.createElement('h2'); heading.textContent = 'Inspections and Diagnostics'; builtins.append(heading);
     const message = document.createElement('p'); message.className = 'settings-intro'; message.textContent = 'Choose inspection profiles and adjust supported rules. Workspace overrides are managed by the inspection service.'; builtins.append(message);
   }
-  if (!found.length && !['Extensions', 'Inspections'].includes(settingsCategory) && !query) {
+  if (!found.length && !settingsCategory.startsWith('Extensions') && !settingsCategory.startsWith('Inspections') && settingsCategory !== 'Keybindings' && !query) {
     const heading = document.createElement('h2'); heading.textContent = settingsCategory; builtins.append(heading);
-    const note = document.createElement('p'); note.className = 'settings-unavailable'; note.textContent = `${settingsCategory} settings are not available yet. Existing editor and platform behavior remains unchanged.`; builtins.append(note);
+    const note = document.createElement('p'); note.className = 'settings-unavailable'; note.textContent = `${settingsCategory} has no supported settings yet. No inactive controls are shown.`; builtins.append(note);
   }
   for (const descriptor of found) {
-    if (query && !builtins.querySelector(`[data-settings-group="${CSS.escape(descriptor.category)}"]`)) {
-      const heading = document.createElement('h2'); heading.textContent = descriptor.category; heading.dataset.settingsGroup = descriptor.category; builtins.append(heading);
+    const group = descriptor.category.split('/').at(-1) ?? descriptor.category;
+    if ((query || settingsCategory === 'Appearance' || settingsCategory === 'Editor') && !builtins.querySelector(`[data-settings-group="${CSS.escape(descriptor.category)}"]`)) {
+      const heading = document.createElement('h3'); heading.textContent = group; heading.dataset.settingsGroup = descriptor.category; builtins.append(heading);
     }
     builtins.append(renderSettingRow(descriptor));
+  }
+  if (settingsCategory === 'Appearance/Project Identity' && !query) {
+    const button = document.createElement('button'); button.type = 'button'; button.textContent = 'Reset Project Identity';
+    button.className = 'small-button'; button.disabled = !workspaceRoot;
+    button.addEventListener('click', () => resetProjectIdentity());
+    builtins.append(button);
+    const preview = document.createElement('section'); preview.id = 'project-identity-preview'; preview.className = 'settings-preview';
+    preview.innerHTML = '<div class="settings-preview-title"></div>';
+    builtins.append(preview);
+    const color = workspaceRoot ? String(settingsSnapshot.workspaces[workspaceRoot]?.['appearance.projectIdentity.color'] ?? automaticProjectColor(workspaceRoot)) : '#5294d8';
+    const icon = workspaceRoot ? String(settingsSnapshot.workspaces[workspaceRoot]?.['appearance.projectIdentity.icon'] ?? 'folder') : 'folder';
+    renderProjectIdentityPreview(color, icon, String(effectiveSetting(settingsSnapshot, 'appearance.projectColors.style', null).value), Boolean(effectiveSetting(settingsSnapshot, 'appearance.projectColors.enabled', null).value));
   }
   const scope = document.querySelector<HTMLSelectElement>('#settings-scope')!;
   const workspaceOption = scope.querySelector<HTMLOptionElement>('option[value="workspace"]')!;
@@ -1172,6 +1343,8 @@ function renderSettings(): void {
   const status = document.querySelector<HTMLElement>('#settings-storage-status')!;
   status.textContent = settingsData.invalid ? 'Settings need repair.' : workspaceRoot ? `Saved automatically · ${settingsScope === 'workspace' ? 'Workspace' : 'User'} scope · workspace overrides user values.` : 'Saved automatically · User scope. Open a workspace to edit workspace values.';
   (document.querySelector<HTMLButtonElement>('#settings-open-file')!).title = 'The settings view is backed by the application preference store; direct file editing is not available yet.';
+  document.querySelector<HTMLButtonElement>('#settings-history-back')!.disabled = settingsHistoryIndex <= 0;
+  document.querySelector<HTMLButtonElement>('#settings-history-forward')!.disabled = settingsHistoryIndex >= settingsHistory.length - 1;
 }
 
 function renderSettingRow(descriptor: SettingDescriptor): HTMLElement {
@@ -1183,16 +1356,47 @@ function renderSettingRow(descriptor: SettingDescriptor): HTMLElement {
   description.append(title, id, help);
   const effective = effectiveSetting(settingsSnapshot, descriptor.id, workspaceRoot || null);
   const stored = settingsScope === 'user' ? settingsSnapshot.user[descriptor.id] : (workspaceRoot ? settingsSnapshot.workspaces[workspaceRoot]?.[descriptor.id] : undefined);
-  const value = stored ?? (settingsScope === 'workspace' ? effective.value : descriptor.defaultValue);
+  const value = descriptor.id === 'appearance.projectIdentity.color' && stored === undefined && workspaceRoot
+    ? automaticProjectColor(workspaceRoot)
+    : stored ?? (settingsScope === 'workspace' ? effective.value : descriptor.defaultValue);
   const controls = document.createElement('div'); controls.className = 'setting-control';
   let control: HTMLInputElement | HTMLSelectElement;
   if (descriptor.type === 'boolean') {
     const input = document.createElement('input'); input.type = 'checkbox'; input.checked = value === true; control = input;
   } else if (descriptor.type === 'integer') {
-    const input = document.createElement('input'); input.type = 'number'; input.min = String(descriptor.minimum); input.max = String(descriptor.maximum); input.value = String(value); control = input;
+    const input = document.createElement('input'); input.type = descriptor.id === 'appearance.projectColors.intensity' ? 'range' : 'number'; input.min = String(descriptor.minimum); input.max = String(descriptor.maximum); input.value = String(value); input.setAttribute('aria-valuetext', `${value}%`); control = input;
+  } else if (descriptor.type === 'color') {
+    const wrap = document.createElement('div'); wrap.className = 'project-color-controls';
+    const input = document.createElement('input'); input.type = 'color'; input.value = String(value); input.setAttribute('aria-label', `${descriptor.title} color picker`);
+    const text = document.createElement('input'); text.type = 'text'; text.value = String(value); text.maxLength = 7; text.setAttribute('aria-label', `${descriptor.title} hexadecimal color`);
+    const palette = document.createElement('select'); palette.setAttribute('aria-label', 'Project color preset');
+    const automatic = document.createElement('option'); automatic.value = 'automatic'; automatic.textContent = 'Automatic'; palette.append(automatic);
+    for (const preset of PROJECT_COLORS) { const option = document.createElement('option'); option.value = preset.value; option.textContent = preset.name; palette.append(option); }
+    const colorValue = String(value).toLowerCase();
+    palette.value = PROJECT_COLORS.find(({ value: preset }) => preset === colorValue)?.value ?? 'automatic';
+    input.addEventListener('input', () => {
+      text.value = input.value;
+      if (hasReadableProjectAccent(input.value)) renderProjectIdentityPreview(input.value, String(settingsSnapshot.workspaces[workspaceRoot]?.['appearance.projectIdentity.icon'] ?? 'folder'), String(effectiveSetting(settingsSnapshot, 'appearance.projectColors.style', null).value), Boolean(effectiveSetting(settingsSnapshot, 'appearance.projectColors.enabled', null).value));
+    });
+    input.addEventListener('change', () => { text.value = input.value; writeDescriptorValue(descriptor, input.value); });
+    text.addEventListener('input', () => {
+      const next = text.value.trim();
+      if (hasReadableProjectAccent(next)) renderProjectIdentityPreview(next, String(settingsSnapshot.workspaces[workspaceRoot]?.['appearance.projectIdentity.icon'] ?? 'folder'), String(effectiveSetting(settingsSnapshot, 'appearance.projectColors.style', null).value), Boolean(effectiveSetting(settingsSnapshot, 'appearance.projectColors.enabled', null).value));
+    });
+    text.addEventListener('change', () => {
+      const next = text.value.trim();
+      if (!hasReadableProjectAccent(next)) { text.setCustomValidity('Enter a readable hex color such as #3794ff.'); text.reportValidity(); return; }
+      text.setCustomValidity(''); input.value = next; palette.value = PROJECT_COLORS.some(({ value: preset }) => preset === next.toLowerCase()) ? next.toLowerCase() : 'automatic'; writeDescriptorValue(descriptor, next.toLowerCase());
+    });
+    palette.addEventListener('change', () => {
+      if (palette.value === 'automatic') { resetProjectColorToAutomatic(); return; }
+      input.value = palette.value; text.value = palette.value; writeDescriptorValue(descriptor, palette.value);
+    });
+    wrap.append(input, palette, text); controls.append(wrap);
+    control = text;
   } else {
     const select = document.createElement('select');
-    for (const choice of descriptor.choices) { const option = document.createElement('option'); option.value = choice; option.textContent = choice === 'dark' ? 'Koren Dark' : choice === 'light' ? 'Light' : choice[0]!.toUpperCase() + choice.slice(1); select.append(option); }
+    for (const choice of descriptor.choices) { const option = document.createElement('option'); option.value = choice; option.textContent = choiceLabel(choice); select.append(option); }
     if (descriptor.id === 'appearance.theme') {
       for (const theme of extensionCatalogCache?.themes ?? []) { const option = document.createElement('option'); option.value = `extension:${theme.id}`; option.textContent = theme.title; select.append(option); }
       const extensionId = localStorage.getItem('koren-code:theme-extension');
@@ -1200,7 +1404,9 @@ function renderSettingRow(descriptor: SettingDescriptor): HTMLElement {
     } else select.value = String(value);
     control = select;
   }
-  control.disabled = !descriptor.scopes.includes(settingsScope) || (settingsScope === 'workspace' && !workspaceRoot) || settingsData.invalid;
+  const canEdit = descriptor.scopes.includes(settingsScope) && !(settingsScope === 'workspace' && !workspaceRoot) && !settingsData.invalid;
+  controls.querySelectorAll<HTMLInputElement | HTMLSelectElement>('input,select').forEach((element) => { element.disabled = !canEdit; });
+  control.disabled = !canEdit;
   control.setAttribute('aria-label', descriptor.title);
   control.addEventListener('change', () => {
     if (descriptor.id === 'appearance.theme' && control.value.startsWith('extension:')) {
@@ -1208,23 +1414,129 @@ function renderSettingRow(descriptor: SettingDescriptor): HTMLElement {
       if (theme) applyExtensionTheme(theme);
       return;
     }
+    if (descriptor.type === 'color') return;
     const next: boolean | number | string = descriptor.type === 'boolean' ? (control as HTMLInputElement).checked : descriptor.type === 'integer' ? Number(control.value) : control.value;
-    try {
-      settingsSnapshot = writeSetting(localStorage, descriptor.id, next, settingsScope, workspaceRoot || null);
-      settingsData = { snapshot: settingsSnapshot, invalid: false };
-      if (descriptor.id === 'appearance.theme') localStorage.removeItem('koren-code:theme-extension');
-      applySettingsPreferences();
-      renderSettings();
-      setStatus(`Updated ${descriptor.id}`);
-    } catch (error) { showError(error); }
+    writeDescriptorValue(descriptor, next);
   });
-  const origin = document.createElement('span'); origin.className = 'setting-origin'; origin.textContent = `Effective: ${effective.origin}${settingsScope === 'workspace' && !workspaceRoot ? ' · open a workspace to edit' : ''}`;
+  const origin = document.createElement('span'); origin.className = 'setting-origin';
+  const originLabel = descriptor.id === 'appearance.projectIdentity.color' && stored === undefined && workspaceRoot && Boolean(effectiveSetting(settingsSnapshot, 'appearance.projectColors.autoAssign', null).value)
+    ? 'automatic workspace color' : effective.origin;
+  origin.textContent = `Effective: ${originLabel}${settingsScope === 'workspace' && !workspaceRoot ? ' · open a workspace to edit' : ''}`;
   const reset = document.createElement('button'); reset.type = 'button'; reset.textContent = 'Reset'; reset.disabled = stored === undefined || !descriptor.scopes.includes(settingsScope) || (settingsScope === 'workspace' && !workspaceRoot) || settingsData.invalid;
   reset.addEventListener('click', () => {
     try { settingsSnapshot = resetSetting(localStorage, descriptor.id, settingsScope, workspaceRoot || null); settingsData = { snapshot: settingsSnapshot, invalid: false }; applySettingsPreferences(); renderSettings(); }
     catch (error) { showError(error); }
   });
-  controls.append(control, origin, reset); row.append(description, controls); return row;
+  if (descriptor.type !== 'color') controls.append(control);
+  controls.append(origin, reset); row.append(description, controls); return row;
+}
+
+function choiceLabel(choice: string): string {
+  const labels: Record<string, string> = { dark: 'Koren Dark', light: 'Light', 'subtle-gradient': 'Subtle Gradient', 'solid-tint': 'Solid Tint', 'icon-only': 'Icon Only', none: 'None' };
+  return labels[choice] ?? choice.split(/[-_]/).map((word) => word[0]!.toUpperCase() + word.slice(1)).join(' ');
+}
+
+function writeDescriptorValue(descriptor: SettingDescriptor, value: boolean | number | string): void {
+  try {
+    settingsSnapshot = writeSetting(localStorage, descriptor.id, value, settingsScope, workspaceRoot || null);
+    settingsData = { snapshot: settingsSnapshot, invalid: false };
+    if (descriptor.id === 'appearance.theme') localStorage.removeItem('koren-code:theme-extension');
+    applySettingsPreferences();
+    renderSettings();
+    setStatus(`Updated ${descriptor.id}`);
+  } catch (error) { showError(error); }
+}
+
+function selectSettingsCategory(category: string): void {
+  if (settingsHistory[settingsHistoryIndex] !== category) {
+    settingsHistory.splice(settingsHistoryIndex + 1);
+    settingsHistory.push(category);
+    settingsHistoryIndex = settingsHistory.length - 1;
+  }
+  settingsCategory = category;
+  renderSettings();
+}
+
+function moveSettingsHistory(direction: -1 | 1): void {
+  settingsHistoryIndex = Math.max(0, Math.min(settingsHistory.length - 1, settingsHistoryIndex + direction));
+  settingsCategory = settingsHistory[settingsHistoryIndex] ?? 'Appearance';
+  renderSettings();
+}
+
+function resetProjectIdentity(): void {
+  if (!workspaceRoot || settingsData.invalid) return;
+  try {
+    settingsSnapshot = resetSetting(localStorage, 'appearance.projectIdentity.color', 'workspace', workspaceRoot);
+    settingsSnapshot = resetSetting(localStorage, 'appearance.projectIdentity.icon', 'workspace', workspaceRoot);
+    settingsData = { snapshot: settingsSnapshot, invalid: false };
+    applySettingsPreferences(); renderSettings();
+  } catch (error) { showError(error); }
+}
+
+function resetProjectColorToAutomatic(): void {
+  if (!workspaceRoot) return;
+  try {
+    settingsSnapshot = resetSetting(localStorage, 'appearance.projectIdentity.color', 'workspace', workspaceRoot);
+    settingsData = { snapshot: settingsSnapshot, invalid: false };
+    applySettingsPreferences(); renderSettings();
+  } catch (error) { showError(error); }
+}
+
+function renderKeybindings(host: HTMLElement, query: string): void {
+  const visible = [...commandMetadata.entries()].filter(([id, value]) => `${id} ${commandLabels.get(id) ?? ''} ${value.shortcut ?? ''}`.toLowerCase().includes(query.toLowerCase()));
+  if (!visible.length) {
+    const note = document.createElement('p'); note.className = 'settings-unavailable'; note.textContent = registeredCommands.length ? 'No registered commands match this search.' : 'Command keybindings are unavailable until the command registry loads.'; host.append(note); return;
+  }
+  for (const [id, metadata] of visible) {
+    const row = document.createElement('div'); row.className = 'keybinding-row';
+    const label = document.createElement('span'); label.textContent = commandLabels.get(id) ?? id;
+    const shortcut = document.createElement('kbd'); shortcut.textContent = metadata.shortcut ?? 'Unassigned';
+    const edit = document.createElement('button'); edit.type = 'button'; edit.textContent = 'Record shortcut';
+    edit.addEventListener('click', () => {
+      edit.textContent = 'Press a shortcut…'; edit.focus();
+      const record = (event: KeyboardEvent) => {
+        event.preventDefault(); event.stopPropagation();
+        const modifiers = [event.ctrlKey || event.metaKey ? 'Ctrl' : '', event.altKey ? 'Alt' : '', event.shiftKey ? 'Shift' : ''].filter(Boolean);
+        if (['Control', 'Shift', 'Alt', 'Meta'].includes(event.key)) return;
+        const binding = [...modifiers, event.key.length === 1 ? event.key.toUpperCase() : event.key].join('+');
+        const conflict = [...commandMetadata.entries()].find(([otherId, other]) => otherId !== id && other.shortcut?.toLowerCase() === binding.toLowerCase());
+        document.removeEventListener('keydown', record, true);
+        if (conflict) { edit.textContent = 'Record shortcut'; showError(new Error(`Shortcut conflicts with ${commandLabels.get(conflict[0]) ?? conflict[0]}.`)); return; }
+        shortcut.textContent = binding;
+        commandMetadata.set(id, { ...metadata, shortcut: binding });
+        const overrides = JSON.parse(localStorage.getItem('koren-code:keybindings:v1') ?? '{}') as Record<string, string>;
+        overrides[id] = binding; localStorage.setItem('koren-code:keybindings:v1', JSON.stringify(overrides));
+        edit.textContent = 'Record shortcut';
+      };
+      document.addEventListener('keydown', record, true);
+    });
+    const reset = document.createElement('button'); reset.type = 'button'; reset.textContent = 'Restore default'; reset.disabled = !loadKeybindingOverrides()[id];
+    reset.addEventListener('click', () => {
+      const overrides = loadKeybindingOverrides(); delete overrides[id]; localStorage.setItem('koren-code:keybindings:v1', JSON.stringify(overrides));
+      const uiCommand = UI_COMMANDS.find((item) => item.id === id);
+      const command = extensionCatalogCache?.built_in_commands.concat(extensionCatalogCache.commands).find((item) => item.id === id);
+      commandMetadata.set(id, { ...metadata, shortcut: uiCommand?.shortcut || command?.shortcut || null });
+      renderSettings();
+    });
+    row.append(label, shortcut, edit, reset); host.append(row);
+  }
+}
+
+function loadKeybindingOverrides(): Record<string, string> {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem('koren-code:keybindings:v1') ?? '{}');
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+      : {};
+  } catch { return {}; }
+}
+
+function applyKeybindingOverrides(): void {
+  const overrides = loadKeybindingOverrides();
+  for (const [id, shortcut] of Object.entries(overrides)) {
+    const metadata = commandMetadata.get(id);
+    if (metadata) commandMetadata.set(id, { ...metadata, shortcut });
+  }
 }
 
 function showPanel(panel: 'output' | 'problems' | 'tasks' | 'projects' | string): void {
@@ -1659,11 +1971,16 @@ function renderSidebarExtensions(extensions: ExtensionSummary[]): void {
 
 function updateCommandCatalog(catalog: ExtensionCatalog): void {
   commandLabels.clear(); commandDescriptions.clear(); commandMetadata.clear();
+  for (const command of UI_COMMANDS) {
+    commandLabels.set(command.id, command.title); commandDescriptions.set(command.id, command.description);
+    commandMetadata.set(command.id, { description: command.description, shortcut: command.shortcut || null, enabled: true });
+  }
   for (const command of [...catalog.built_in_commands, ...catalog.commands]) {
     commandLabels.set(command.id, command.title); commandDescriptions.set(command.id, command.description);
     commandMetadata.set(command.id, { description: command.description, shortcut: command.shortcut, enabled: command.enabled });
   }
-  registeredCommands = [...catalog.built_in_commands, ...catalog.commands].map((command) => command.id);
+  applyKeybindingOverrides();
+  registeredCommands = [...UI_COMMANDS.map(({ id }) => id), ...catalog.built_in_commands, ...catalog.commands].map((command) => typeof command === 'string' ? command : command.id);
 }
 
 function loadOpenExtensionPanels(): string[] {
@@ -1937,6 +2254,8 @@ function renderCommandResults(query: string): void {
 }
 async function executeCommand(command: string): Promise<void> {
   document.querySelector<HTMLDialogElement>('#command-dialog')!.close();
+  const localCommand = UI_COMMANDS.find(({ id }) => id === command);
+  if (localCommand) { handleAction(localCommand.action, document.body); return; }
   try {
     const active = tabs.active;
     if (active) {
@@ -1961,6 +2280,7 @@ function handleAction(action: string, target: HTMLElement): void {
     case 'source-control': showPanel('source-control'); void refreshGitRepositories(); break;
     case 'refresh-git': void refreshGitRepositories(); break;
     case 'cancel-search': cancelWorkspaceSearch(); break;
+    case 'search-workspace': showPanel('search'); document.querySelector<HTMLInputElement>('#search-query')!.focus(); break;
     case 'save': void saveActive(); break;
     case 'save-all': void saveAll(); break;
     case 'close-active': if (tabs.active) void closeTab(tabs.active); else setStatus('No open tab to close'); break;
@@ -1971,12 +2291,13 @@ function handleAction(action: string, target: HTMLElement): void {
     case 'toggle-explorer': setExplorerCollapsed(!layout.explorerCollapsed); break;
     case 'toggle-bottom': setBottomCollapsed(!layout.bottomCollapsed); break;
     case 'toggle-secondary': setSecondaryCollapsed(!layout.secondaryCollapsed); break;
+    case 'navigate-back': navigateDocumentHistory(-1); break;
+    case 'navigate-forward': navigateDocumentHistory(1); break;
     case 'show-panel': {
       const panel = target.dataset.panelTarget ?? 'output'; showPanel(panel);
       if (panel === 'search') document.querySelector<HTMLInputElement>('#search-query')!.focus();
       break;
     }
-    case 'run-selected': void runSelectedConfiguration(); break;
     case 'settings': {
       void openSettings(); break;
     }
@@ -1986,7 +2307,7 @@ function handleAction(action: string, target: HTMLElement): void {
     case 'go-to-definition': void runGoToDefinition(); break;
     case 'next-tab': cycleTab(1); break;
     case 'previous-tab': cycleTab(-1); break;
-    case 'discover': void discoverCargo(); break;
+    case 'refresh-project': void refreshProjectDiscovery(); break;
     case 'run-cargo': void runCargoCommand(target.dataset.command ?? ''); break;
     case 'cancel-task': if (runId !== null) void client.call({ method: 'cancel_task', params: { run_id: runId } }).then(() => setStatus('Cancellation requested')).catch(showError); break;
     case 'refresh': if (workspaceRoot) void refreshDirectory(''); else setStatus('Open a workspace first'); break;
@@ -2253,23 +2574,10 @@ document.addEventListener('keydown', (event) => {
     const shortcut = [...commandMetadata.entries()].find(([_, metadata]) => metadata.enabled && metadata.shortcut && commandShortcutMatches(event, metadata.shortcut));
     if (shortcut) { event.preventDefault(); void executeCommand(shortcut[0]); return; }
   }
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'o') { event.preventDefault(); event.shiftKey ? void chooseFile() : void chooseWorkspace(); }
-  else if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'n') { event.preventDefault(); void createWorkspaceEntry(parentPath(selectedPath), false); }
-  else if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'f') { event.preventDefault(); showPanel('search'); document.querySelector<HTMLInputElement>('#search-query')!.focus(); }
-  else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); void saveActive(); }
-  else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'w' && tabs.active) { event.preventDefault(); void closeTab(tabs.active); }
-  else if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'p') { event.preventDefault(); void openCommandPalette(); }
-  else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'b') { event.preventDefault(); setExplorerCollapsed(!layout.explorerCollapsed); }
-  else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'j') { event.preventDefault(); setBottomCollapsed(!layout.bottomCollapsed); }
-  else if ((event.ctrlKey || event.metaKey) && event.key === '`') { event.preventDefault(); if (layout.bottomCollapsed || !document.querySelector<HTMLButtonElement>('[data-panel="terminal"]')!.classList.contains('selected')) showPanel('terminal'); else setBottomCollapsed(true); }
-  else if ((event.ctrlKey || event.metaKey) && event.key === 'Tab') { event.preventDefault(); cycleTab(event.shiftKey ? -1 : 1); }
-  else if (event.altKey && event.key.toLowerCase() === 't') { event.preventDefault(); toggleTheme(); }
-  else if (event.key === 'F6') { event.preventDefault(); editor?.focus(); }
-  else if (event.key === 'F5' && runId !== null) { event.preventDefault(); void client.call({ method: 'cancel_task', params: { run_id: runId } }).then(() => setStatus('Cancellation requested')).catch(showError); }
+  if ((event.ctrlKey || event.metaKey) && event.key === '`') { event.preventDefault(); if (layout.bottomCollapsed || !document.querySelector<HTMLButtonElement>('[data-panel="terminal"]')!.classList.contains('selected')) showPanel('terminal'); else setBottomCollapsed(true); }
+  else if (event.key === 'Escape' && settingsTabActive) { event.preventDefault(); closeSettingsTab(); }
   else if (event.key === 'Escape') for (const menu of document.querySelectorAll<HTMLDetailsElement>('.menu-group[open]')) { menu.open = false; menu.querySelector('summary')?.focus(); }
 });
-
-installDefinitionShortcut(document, () => document.querySelector<HTMLDialogElement>('#command-dialog')!.open, () => { void runGoToDefinition(); });
 
 document.querySelector<HTMLInputElement>('#command-search')!.addEventListener('input', (event) => {
   commandSelection = 0; renderCommandResults((event.target as HTMLInputElement).value);
@@ -2304,6 +2612,8 @@ document.querySelector<HTMLInputElement>('#settings-search')!.addEventListener('
   const search = document.querySelector<HTMLInputElement>('#settings-search')!;
   search.focus(); search.setSelectionRange(settingsQuery.length, settingsQuery.length);
 });
+document.querySelector<HTMLButtonElement>('#settings-history-back')!.addEventListener('click', () => moveSettingsHistory(-1));
+document.querySelector<HTMLButtonElement>('#settings-history-forward')!.addEventListener('click', () => moveSettingsHistory(1));
 for (const button of document.querySelectorAll<HTMLButtonElement>('[data-sidebar-view]')) {
   button.addEventListener('click', () => selectSidebarView(button.dataset.sidebarView as LayoutPreferences['primaryView']));
 }
@@ -2316,7 +2626,7 @@ document.querySelector<HTMLInputElement>('#settings-modified')!.addEventListener
   renderSettings();
 });
 document.querySelector<HTMLButtonElement>('#settings-reset-category')!.addEventListener('click', () => {
-  const affected = searchSettings(settingsSnapshot, '', false, workspaceRoot || null).filter((descriptor) => descriptor.category === settingsCategory && descriptor.scopes.includes(settingsScope));
+  const affected = searchSettings(settingsSnapshot, '', false, workspaceRoot || null).filter((descriptor) => (descriptor.category === settingsCategory || descriptor.category.startsWith(`${settingsCategory}/`)) && descriptor.scopes.includes(settingsScope));
   if (!affected.length) { setStatus(`No built-in ${settingsCategory.toLocaleLowerCase()} settings to reset at ${settingsScope} scope.`); return; }
   if (!window.confirm(`Restore ${affected.length} ${settingsCategory} setting${affected.length === 1 ? '' : 's'} to inherited values?`)) return;
   try {
@@ -2332,7 +2642,6 @@ document.querySelector<HTMLButtonElement>('#settings-reset-all')!.addEventListen
   applySettingsPreferences(); renderSettings();
 });
 document.querySelector<HTMLButtonElement>('[data-action="close-recovery"]')!.addEventListener('click', () => document.querySelector<HTMLDialogElement>('#recovery-dialog')!.close());
-runConfiguration.addEventListener('change', syncRunButton);
 
 document.querySelector<HTMLElement>('#explorer-resizer')!.addEventListener('pointerdown', (event) => {
   const move = (moveEvent: PointerEvent) => {
