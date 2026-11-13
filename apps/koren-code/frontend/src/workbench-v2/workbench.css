@@ -62,9 +62,9 @@
 
 /* Workbench canvas and one-row toolbar. */
 .workbench-v2 { grid-template-rows: 44px minmax(0, 1fr) 25px; background: #08090a; position: relative; }
-.wb-title-toolbar { flex-direction: row; align-items: center; gap: 4px; background: #08090a; border-bottom: 1px solid #202226; }
+.wb-title-toolbar { flex-direction: row; align-items: center; gap: 4px; background: #08090a; border-bottom: 0; }
 .workbench-v2.menu-labels-hidden .menus { display: none; }
-.wb-title-toolbar { height: 44px; min-width: 0; display: flex; align-items: stretch; gap: 0; padding: 0; overflow: visible; background: var(--wb-header); border-bottom: 1px solid #202226; }
+.wb-title-toolbar { height: 44px; min-width: 0; display: flex; align-items: stretch; gap: 0; padding: 0; overflow: visible; background: var(--wb-header); border-bottom: 0; }
 .project-menu-region { min-width: 0; max-width: 100%; height: 44px; flex: 0 1 auto; display: flex; align-items: stretch; overflow: visible; background: var(--wb-header); }
 .workspace-selector { height: 44px; min-width: 0; max-width: none; flex: 0 1 clamp(200px, 18vw, 290px); display: flex; align-items: center; gap: 9px; margin: 0; padding: 0 13px; border: 0; border-radius: 0; color: var(--text); white-space: nowrap; background: transparent; transition: filter 140ms ease; }
 .workspace-selector:hover { filter: brightness(1.12); }
@@ -92,7 +92,8 @@
 .navigation-actions { flex: 0 0 auto; gap: 4px; padding: 0 9px; }
 .utility-actions { flex: 0 0 auto; gap: 7px; padding: 0 9px; }
 .utility-group { gap: 4px; }
-.edit-actions { padding-right: 9px; border-right: 1px solid color-mix(in srgb, var(--wb-border) 72%, transparent); }
+.edit-actions { position: relative; margin-right: 4px; padding-right: 0; }
+.edit-actions::after { width: 1px; height: 14px; margin-left: 8px; align-self: center; background: color-mix(in srgb, var(--wb-border) 72%, transparent); content: ''; }
 .branch-selector { max-width: 150px; height: 32px; color: var(--muted); font-size: 12px; }
 .branch-selector, .toolbar-button { min-width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 0 6px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); }
 .branch-selector { gap: 6px; }
@@ -180,8 +181,8 @@
 .settings-extension-row button { padding: 5px 9px; border: 1px solid var(--border); border-radius: 4px; }
 .workbench-v2 .status-bar { background: #08090a; border: 0; }
 :root[data-project-colors="false"] .project-menu-region { background: var(--wb-header); }
-:root[data-project-colors="true"][data-project-color-style="subtle-gradient"] .project-menu-region { background: linear-gradient(90deg, color-mix(in srgb, var(--project-color) var(--project-intensity), var(--wb-header)) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .62), var(--wb-header)) 34%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .24), var(--wb-header)) 72%, var(--wb-header) 100%); }
-:root[data-project-colors="true"][data-project-color-style="solid-tint"] .project-menu-region { background: linear-gradient(90deg, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .72), var(--wb-header)) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .38), var(--wb-header)) 58%, var(--wb-header) 100%); }
+:root[data-project-colors="true"][data-project-color-style="subtle-gradient"] .project-menu-region { background: linear-gradient(180deg, transparent 55%, color-mix(in srgb, var(--wb-header) 65%, transparent) 82%, var(--wb-header) 100%), linear-gradient(90deg, color-mix(in srgb, var(--project-color) var(--project-intensity), var(--wb-header)) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .62), var(--wb-header)) 34%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .24), var(--wb-header)) 72%, var(--wb-header) 100%); }
+:root[data-project-colors="true"][data-project-color-style="solid-tint"] .project-menu-region { background: linear-gradient(180deg, transparent 55%, color-mix(in srgb, var(--wb-header) 65%, transparent) 82%, var(--wb-header) 100%), linear-gradient(90deg, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .72), var(--wb-header)) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .38), var(--wb-header)) 58%, var(--wb-header) 100%); }
 :root[data-project-colors="true"][data-project-color-style="icon-only"] .project-menu-region { background: var(--wb-header); }
 :root[data-project-colors="true"][data-project-color-style="icon-only"] .project-icon-mark { color: var(--project-color); }
 :root[data-project-colors="true"][data-project-color-style="subtle-gradient"] .project-icon-mark,
