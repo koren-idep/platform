@@ -114,8 +114,8 @@
 .workbench-v2 .workbench { position: relative; z-index: 0; padding: 8px 7px 5px; }
 .workbench-v2 .explorer, .secondary-sidebar { border: 0; border-radius: 7px; background: #151719; }
 .workbench-v2 .explorer .panel-heading, .workbench-v2 .explorer-footer { display: none; }
-.workbench-v2 .primary-sidebar-tabs { min-height: 35px; padding: 3px 6px; border-bottom: 0; gap: 2px; }
-.workbench-v2 .primary-sidebar-tabs button { flex: 0 1 auto; padding: 0 8px; border-radius: 4px; color: #abb1bb; font-size: 12px; }
+.workbench-v2 .primary-sidebar-tabs { min-height: 34px; padding: 2px 5px; border-bottom: 0; gap: 2px; }
+.workbench-v2 .primary-sidebar-tabs button { flex: 0 1 auto; padding: 0 6px; border-radius: 4px; color: #abb1bb; font-size: 12px; }
 .workbench-v2 .primary-sidebar-tabs button.selected { background: #303235; box-shadow: inset 0 0 0 1px #404348; }
 .workbench-v2 .primary-sidebar-tabs button:hover { color: var(--text); background-color: #25282c; }
 .workbench-v2 .tree-row { height: 25px; border-radius: 4px; }
@@ -126,11 +126,11 @@
 .workbench-v2 .explorer-resizer, .workbench-v2 .secondary-resizer { background: transparent; }
 .workbench-v2 .main-column { gap: 5px; background: transparent; }
 .workbench-v2 .editor-frame { border-radius: 7px; background: #151719; }
-.workbench-v2 .tabs { height: 32px; min-height: 32px; padding: 3px 4px; gap: 2px; border: 0; background: #151719; }
-.workbench-v2 .tab { min-width: 98px; height: 26px; border: 0; border-radius: 4px; }
+.workbench-v2 .tabs { height: 31px; min-height: 31px; padding: 3px; gap: 2px; border: 0; background: #151719; }
+.workbench-v2 .tab { min-width: 94px; height: 25px; border: 0; border-radius: 4px; }
 .workbench-v2 .tab.active { background: #263746; box-shadow: inset 0 0 0 1px #3573a5; }
-.workbench-v2 .tab-select { padding-left: 6px; }
-.workbench-v2 .tab-close { width: 21px; height: 21px; flex-basis: 21px; margin-right: 3px; }
+.workbench-v2 .tab-select { gap: 6px; padding: 0 5px 0 4px; }
+.workbench-v2 .tab-close { width: 19px; height: 19px; flex-basis: 19px; margin-right: 2px; }
 .workbench-v2 .tree-chevron svg, .workbench-v2 .tree-icon svg, .workbench-v2 .tab-file-icon svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; vertical-align: middle; }
 .workbench-v2 .tree-chevron { color: var(--muted); }
 .workbench-v2 .tab-file-icon { display: inline-flex; flex: 0 0 16px; color: var(--muted); }
