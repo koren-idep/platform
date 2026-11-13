@@ -256,6 +256,6 @@ An additional no-debugger Linux/Xvfb idle sample over 5 seconds measured 3 proce
 
 ## Phase 9.5 real-tool desktop observations
 
-The 2026-11-12 Phase 9.5 acceptance session reused the Linux/Xvfb smoke boundary. The existing three-run no-tool baseline has a median 174.2 ms to visible window and 395,056 KiB process-tree RSS at +1 s. A later PR smoke sample reported 175.6 ms and 395,224 KiB; the final completion run reported 174.1 ms and 405,464 KiB. These remain startup smoke samples, not interactive performance measurements.
+The 2026-11-12 Phase 9.5 acceptance session reused the Linux/Xvfb smoke boundary. The existing three-run no-tool baseline has a median 174.2 ms to visible window and 395,056 KiB process-tree RSS at +1 s. Later PR smoke samples reported 175.6 ms/395,224 KiB and 170.4 ms/404,836 KiB. These remain startup smoke samples, not interactive performance measurements.
 
 During the real rust-analyzer 1.99.1 fixture session, one `ps` sample showed about 646 MiB RSS for the analyzer, about 27 MiB for each of its two proc-macro helper processes, and about 204 MiB for the Koren process. This is a single instantaneous sample while the small Cargo fixture was active; it does not isolate WebKit shared pages, peak indexing usage, or idle memory. GDB was exercised through a separate approved session, but adapter startup and breakpoint latency were not timed. LSP initialization, edit-to-diagnostic, save-conflict preview, and restart restoration latency were not instrumented. No benchmark claim is made for those paths.
