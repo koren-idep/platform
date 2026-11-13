@@ -66,7 +66,7 @@
 .workbench-v2.menu-labels-hidden .menus { display: none; }
 .wb-title-toolbar { height: 44px; min-width: 0; display: flex; align-items: stretch; gap: 0; padding: 0; overflow: visible; background: var(--wb-header); border-bottom: 0; }
 .project-menu-region { position: relative; z-index: 1; isolation: isolate; min-width: 0; max-width: 100%; height: 44px; flex: 0 1 auto; display: flex; align-items: stretch; overflow: visible; background: transparent; }
-.project-menu-region::before { content: ''; position: absolute; z-index: 0; inset: 0 0 -92px; display: none; pointer-events: none; background: radial-gradient(ellipse 100% 104px at 8% 8px, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .68), transparent) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .4), transparent) 38%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .14), transparent) 74%, transparent 96%); }
+.project-menu-region::before { content: ''; position: absolute; z-index: 0; inset: 0; display: none; pointer-events: none; background: radial-gradient(ellipse 106% 50px at 8% 8px, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .68), transparent) 0%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .4), transparent) 38%, color-mix(in srgb, var(--project-color) calc(var(--project-intensity) * .14), transparent) 74%, transparent 96%); }
 .project-menu-region > * { position: relative; z-index: 1; }
 .workspace-selector { height: 44px; min-width: 0; max-width: none; flex: 0 1 clamp(200px, 18vw, 290px); display: flex; align-items: center; gap: 9px; margin: 0; padding: 0 13px; border: 0; border-radius: 0; color: var(--text); white-space: nowrap; background: transparent; transition: filter 140ms ease; }
 .workspace-selector:hover { filter: brightness(1.12); }
@@ -111,11 +111,11 @@
 .window-controls button:hover { background: color-mix(in srgb, var(--wb-text) 10%, var(--wb-header)); }
 .window-controls button svg { width: 14px; height: 14px; }
 .window-controls .window-close:hover { background: #c42b1c; color: #fff; }
-.workbench-v2 .workbench { position: relative; z-index: 0; padding: 8px 7px 5px; }
+.workbench-v2 .workbench { padding: 8px 7px 5px; }
 .workbench-v2 .explorer, .secondary-sidebar { border: 0; border-radius: 7px; background: #151719; }
 .workbench-v2 .explorer .panel-heading, .workbench-v2 .explorer-footer { display: none; }
-.workbench-v2 .primary-sidebar-tabs { min-height: 34px; padding: 2px 5px; border-bottom: 0; gap: 2px; }
-.workbench-v2 .primary-sidebar-tabs button { flex: 0 1 auto; padding: 0 6px; border-radius: 4px; color: #abb1bb; font-size: 12px; }
+.workbench-v2 .primary-sidebar-tabs { min-height: 30px; padding: 1px 4px; border-bottom: 0; gap: 2px; }
+.workbench-v2 .primary-sidebar-tabs button { flex: 0 1 auto; padding: 0 4px; border-radius: 4px; color: #abb1bb; font-size: 12px; }
 .workbench-v2 .primary-sidebar-tabs button.selected { background: #303235; box-shadow: inset 0 0 0 1px #404348; }
 .workbench-v2 .primary-sidebar-tabs button:hover { color: var(--text); background-color: #25282c; }
 .workbench-v2 .tree-row { height: 25px; border-radius: 4px; }
@@ -127,10 +127,10 @@
 .workbench-v2 .main-column { gap: 5px; background: transparent; }
 .workbench-v2 .editor-frame { border-radius: 7px; background: #151719; }
 .workbench-v2 .tabs { height: 31px; min-height: 31px; padding: 3px; gap: 2px; border: 0; background: #151719; }
-.workbench-v2 .tab { min-width: 94px; height: 25px; border: 0; border-radius: 4px; }
+.workbench-v2 .tab { min-width: 90px; height: 24px; border: 0; border-radius: 4px; }
 .workbench-v2 .tab.active { background: #263746; box-shadow: inset 0 0 0 1px #3573a5; }
-.workbench-v2 .tab-select { gap: 6px; padding: 0 5px 0 4px; }
-.workbench-v2 .tab-close { width: 19px; height: 19px; flex-basis: 19px; margin-right: 2px; }
+.workbench-v2 .tab-select { gap: 5px; padding: 0 4px 0 3px; }
+.workbench-v2 .tab-close { width: 17px; height: 17px; flex-basis: 17px; margin-right: 1px; }
 .workbench-v2 .tree-chevron svg, .workbench-v2 .tree-icon svg, .workbench-v2 .tab-file-icon svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; vertical-align: middle; }
 .workbench-v2 .tree-chevron { color: var(--muted); }
 .workbench-v2 .tab-file-icon { display: inline-flex; flex: 0 0 16px; color: var(--muted); }
