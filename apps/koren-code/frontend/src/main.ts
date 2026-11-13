@@ -10,6 +10,7 @@ import { commandShortcutMatches, filterCommands, nextCommandSelection } from './
 import { activePanelLayout, diagnosticDetailMatches, extensionMenusAt, safeThemeVariables, validExtensionSettingValue } from './app/extensions';
 import { readLayout, persistLayout, fitLayoutToViewport, type LayoutPreferences } from './app/layout';
 import { persistSession, readSession } from './app/session';
+import { canRestoreInPlace } from './app/recovery';
 import { formatCursorPosition, lineEndingFor } from './app/status';
 import { runConfigurationTasks, selectedRunTask } from './app/toolbar';
 import { gitRepositoryChoices, groupSearchMatches, normalizedCommitMessage, partitionGitFiles, searchSummaryText } from './app/developerTools';
@@ -29,6 +30,8 @@ import { absoluteDebugSourcePath } from './editor/debugSource';
 import './styles/main.css';
 
 const client = new KorenClient(createDesktopTransport());
+interface RecoverySnapshot { schema_version: number; id: string; workspace: string; path: string; contents: string; base_sha256: string; revision: number; updated_at_ms: number }
+interface RecoverySummary { id: string; workspace: string; path: string; revision: number; updated_at_ms: number; byte_length: number }
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
   <header class="menu-bar">
@@ -164,6 +167,7 @@ app.innerHTML = `
   <dialog id="approval-dialog" class="dialog"><form method="dialog"><header>Run task?</header><p class="subtle">Review the command before it starts. Approval is not a sandbox.</p><dl id="approval-details"></dl><div class="dialog-actions"><button value="deny" class="secondary">Deny</button><button value="approve" class="primary">Approve once</button></div></form></dialog>
   <dialog id="conflict-dialog" class="dialog conflict"><form method="dialog"><header>File changed outside Koren</header><p id="conflict-path"></p><details><summary>Inspect current disk contents</summary><pre id="conflict-preview"></pre></details><p class="subtle">Choose whether to reload the external version or overwrite it with your buffer. If the file changes again, Koren will ask again.</p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="reload" class="secondary">Reload disk version</button><button value="overwrite" class="primary">Overwrite file</button></div></form></dialog>
   <dialog id="confirm-dialog" class="dialog"><form method="dialog"><header id="confirm-title">Unsaved changes</header><p id="confirm-message"></p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="discard" class="primary">Discard changes</button></div></form></dialog>
+  <dialog id="recovery-dialog" class="dialog"><header>Recover unsaved edits?</header><p>Choose which drafts to restore. Changed or missing files are restored to a new workspace file so their current contents are never replaced.</p><div id="recovery-items" class="recovery-items"></div><div class="dialog-actions"><button type="button" class="secondary" data-action="close-recovery">Later</button></div></dialog>
   <dialog id="close-dialog" class="dialog"><form method="dialog"><header>Unsaved documents</header><p>Save your changes before closing Koren Code Editor?</p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="discard" class="secondary">Discard and close</button><button value="save" class="primary">Save all and close</button></div></form></dialog>
   <dialog id="switch-workspace-dialog" class="dialog"><form method="dialog"><header>Switch workspace?</header><p>Choose what to do with open documents before changing folders.</p><div class="dialog-actions"><button value="cancel" class="secondary">Cancel</button><button value="discard" class="secondary">Discard and switch</button><button value="save" class="primary">Save and switch</button></div></form></dialog>
   <dialog id="command-dialog" class="dialog command-dialog"><form method="dialog"><header>Command Palette</header><input id="command-search" type="search" placeholder="Search available commands" autocomplete="off" aria-label="Search commands"><div id="command-results" role="listbox" aria-label="Available commands"></div><footer><kbd>↑</kbd><kbd>↓</kbd> navigate <kbd>Enter</kbd> run <kbd>Esc</kbd> close</footer></form></dialog>
@@ -213,6 +217,12 @@ let workspaceRoot = '';
 let selectedPath = '';
 let runId: number | null = null;
 const documentViews = new Map<number, { state: EditorState; pipeline: DocumentEditPipeline; lineEnding: 'LF' | 'CRLF'; languageConfig: Compartment }>();
+const recoveryBaseHashes = new Map<number, string>();
+const recoveryTimers = new Map<number, number>();
+const recoveryWrites = new Map<number, Promise<void>>();
+const recoverySnapshotIds = new Map<number, Set<string>>();
+let nextRecoveryRequestId = 1;
+const pendingRecoveryRequests = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
 const taskById = new Map<number, TaskSummary>();
 const activeLanguageServers = new Map<string, number>();
 const diagnosticsByDocument = new Map<number, Map<string, LanguageDiagnosticSet>>();
@@ -262,6 +272,138 @@ function setStatus(message: string): void {
   toastTimer = window.setTimeout(() => toast.classList.remove('visible'), 2200);
 }
 function showError(error: unknown): void { setStatus(error instanceof Error ? error.message : String(error)); }
+
+window.addEventListener('koren-recovery-response', (event) => {
+  const response = (event as CustomEvent<{ request_id: number; ok: boolean; value?: unknown; error?: string }>).detail;
+  const pending = pendingRecoveryRequests.get(response.request_id);
+  if (!pending) return;
+  pendingRecoveryRequests.delete(response.request_id);
+  if (response.ok) pending.resolve(response.value);
+  else pending.reject(new Error(response.error ?? 'Recovery request failed'));
+});
+
+async function recoveryRequest<T>(operation: string, payload: unknown = {}): Promise<T> {
+  if (!window.ipc) throw new Error('Desktop recovery bridge is unavailable.');
+  const requestId = nextRecoveryRequestId++;
+  return await new Promise<T>((resolve, reject) => {
+    pendingRecoveryRequests.set(requestId, { resolve: (value) => resolve(value as T), reject });
+    window.ipc!.postMessage(JSON.stringify({ type: 'recovery_request', request_id: requestId, operation, payload }));
+  });
+}
+
+async function fetchRecoveryFingerprint(path: string): Promise<string> {
+  const value = await recoveryRequest<{ sha256: string }>('fingerprint', { workspace: workspaceRoot, path });
+  return value.sha256;
+}
+
+function scheduleRecoverySnapshot(documentId: number): void {
+  const previous = recoveryTimers.get(documentId);
+  if (previous !== undefined) window.clearTimeout(previous);
+  recoveryTimers.set(documentId, window.setTimeout(() => {
+    recoveryTimers.delete(documentId);
+    const previousWrite = recoveryWrites.get(documentId) ?? Promise.resolve();
+    const write = previousWrite.then(() => persistRecoverySnapshot(documentId)).catch(showError);
+    recoveryWrites.set(documentId, write);
+    void write.finally(() => { if (recoveryWrites.get(documentId) === write) recoveryWrites.delete(documentId); });
+  }, 900));
+}
+
+async function persistRecoverySnapshot(documentId: number): Promise<void> {
+  const tab = tabs.tabs.find((candidate) => candidate.id === documentId);
+  const entry = documentViews.get(documentId);
+  const baseSha256 = recoveryBaseHashes.get(documentId);
+  if (!tab || !entry || !workspaceRoot) return;
+  await entry.pipeline.flush();
+  const status = expect(await client.call({ method: 'read_document', params: { document_id: documentId } }), 'document_contents').value;
+  if (!status.dirty) { await deleteRecoveryForDocument(documentId, false); return; }
+  if (!baseSha256) { setStatus(`Crash recovery is unavailable for ${tab.path}.`); return; }
+  const contents = entry.state.doc.toString();
+  if (new TextEncoder().encode(contents).length > 1024 * 1024) {
+    setStatus(`Crash recovery is limited to 1 MiB per document; ${tab.path} is too large.`); return;
+  }
+  const result = await recoveryRequest<{ id: string }>('write', { schema_version: 1, id: '', workspace: workspaceRoot, path: tab.path,
+    contents, base_sha256: baseSha256, revision: status.revision, updated_at_ms: Date.now() });
+  const ids = recoverySnapshotIds.get(documentId) ?? new Set<string>();
+  ids.add(result.id); recoverySnapshotIds.set(documentId, ids);
+}
+
+async function deleteRecoveryForDocument(documentId: number, waitForWrite = true): Promise<void> {
+  const timer = recoveryTimers.get(documentId);
+  if (timer !== undefined) window.clearTimeout(timer);
+  recoveryTimers.delete(documentId);
+  const pending = recoveryWrites.get(documentId);
+  if (waitForWrite && pending) await pending.catch(() => undefined);
+  const ids = recoverySnapshotIds.get(documentId) ?? new Set<string>();
+  for (const id of ids) await recoveryRequest('discard', { id });
+  const tab = tabs.tabs.find((candidate) => candidate.id === documentId);
+  if (workspaceRoot && tab) await recoveryRequest('discard', { workspace: workspaceRoot, path: tab.path });
+  recoverySnapshotIds.delete(documentId);
+}
+
+async function loadRecoverySnapshots(): Promise<void> {
+  let snapshots: RecoverySummary[];
+  try { snapshots = await recoveryRequest<RecoverySummary[]>('list'); }
+  catch { return; }
+  if (!snapshots.length) return;
+  const list = document.querySelector<HTMLDivElement>('#recovery-items')!;
+  list.replaceChildren();
+  for (const snapshot of snapshots) {
+    const row = document.createElement('section'); row.className = 'recovery-item';
+    const details = document.createElement('div');
+    const path = document.createElement('strong'); path.textContent = snapshot.path;
+    const metadata = document.createElement('span'); metadata.textContent = `${snapshot.workspace} · ${(snapshot.byte_length / 1024).toFixed(1)} KiB · revision ${snapshot.revision}`;
+    details.append(path, metadata);
+    const restore = document.createElement('button'); restore.type = 'button'; restore.className = 'primary'; restore.textContent = 'Restore';
+    restore.addEventListener('click', () => { restore.disabled = true; void restoreRecoverySnapshot(snapshot).then(() => { row.remove(); closeRecoveryWhenEmpty(list); }).catch(showError).finally(() => { restore.disabled = false; }); });
+    const discard = document.createElement('button'); discard.type = 'button'; discard.className = 'secondary'; discard.textContent = 'Discard';
+    discard.addEventListener('click', () => { discard.disabled = true; void recoveryRequest('discard', { id: snapshot.id })
+      .then(() => { row.remove(); closeRecoveryWhenEmpty(list); }).catch(showError).finally(() => { discard.disabled = false; }); });
+    row.append(details, restore, discard); list.append(row);
+  }
+  document.querySelector<HTMLDialogElement>('#recovery-dialog')!.showModal();
+}
+
+function closeRecoveryWhenEmpty(list: HTMLElement): void {
+  if (list.childElementCount === 0) document.querySelector<HTMLDialogElement>('#recovery-dialog')!.close();
+}
+
+async function restoreRecoverySnapshot(summary: RecoverySummary): Promise<void> {
+  if (!workspaceRoot) await openWorkspace(summary.workspace);
+  if (workspaceRoot !== summary.workspace) throw new Error('Open the matching workspace before restoring this draft.');
+  const snapshot = await recoveryRequest<RecoverySnapshot>('get', { id: summary.id });
+  let targetPath = snapshot.path;
+  let currentHash: string | null = null;
+  try { currentHash = await fetchRecoveryFingerprint(snapshot.path); } catch { /* A missing target is restored as a separate file. */ }
+  const unchanged = canRestoreInPlace(snapshot.base_sha256, currentHash);
+  let opened = unchanged && await openDocument(targetPath);
+  if (!opened) {
+    targetPath = await createRecoveryCopy(snapshot.path);
+    opened = await openDocument(targetPath);
+    if (!opened) throw new Error(`Could not open the recovery copy for ${snapshot.path}.`);
+  }
+  const tab = tabs.active;
+  if (!tab || !editor) throw new Error('The recovered document is not available in the editor.');
+  const previousIds = recoverySnapshotIds.get(tab.id) ?? new Set<string>();
+  previousIds.add(snapshot.id); recoverySnapshotIds.set(tab.id, previousIds);
+  editor.dispatch({ changes: { from: 0, to: editor.state.doc.length, insert: snapshot.contents }, selection: { anchor: 0 } });
+  editor.focus();
+  setStatus(unchanged ? `Recovered unsaved edits to ${targetPath}.` : `The original changed or disappeared; recovered edits to ${targetPath}.`);
+}
+
+async function createRecoveryCopy(originalPath: string): Promise<string> {
+  const filename = originalPath.split('/').at(-1) || 'document';
+  const extensionIndex = filename.lastIndexOf('.');
+  const stem = (extensionIndex > 0 ? filename.slice(0, extensionIndex) : filename).replace(/[^\p{L}\p{N}_.-]/gu, '_').slice(0, 100) || 'document';
+  const extension = extensionIndex > 0 ? filename.slice(extensionIndex).replace(/[^.\p{L}\p{N}]/gu, '').slice(0, 20) : '';
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const path = `recovered-${stem}-${Date.now()}-${attempt}${extension}`;
+    try {
+      expect(await client.call({ method: 'create_workspace_file', params: { path } }), 'workspace_entry');
+      return path;
+    } catch { /* Retry with another non-replacing destination. */ }
+  }
+  throw new Error('Could not create a new workspace file for the recovery draft.');
+}
 
 function applyLayout(): void {
   Object.assign(layout, fitLayoutToViewport(layout, window.innerWidth, window.innerHeight));
@@ -486,6 +628,10 @@ async function openDocument(path: string): Promise<boolean> {
     const alreadyOpen = tabs.tabs.find((tab) => tab.id === opened.document_id);
     if (alreadyOpen) { selectTab(alreadyOpen.id); return true; }
     const content = expect(await client.call({ method: 'read_document', params: { document_id: opened.document_id } }), 'document_contents').value;
+    const fingerprint = await fetchRecoveryFingerprint(path).catch((error: unknown) => {
+      setStatus(`Crash recovery unavailable for ${path}: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    });
     const tab: EditorTab = {
       id: opened.document_id, path, title: baseName(path), revision: content.revision,
       dirty: content.dirty, language: languageNameForPath(path), lineEnding: lineEndingFor(content.contents),
@@ -494,6 +640,7 @@ async function openDocument(path: string): Promise<boolean> {
     const { state, pipeline, lineEnding, languageConfig, refreshDebugGutter } = await createDocumentState(tab, content.contents, content.revision);
     debugGutterRefreshers.set(tab.id, refreshDebugGutter);
     documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig });
+    if (fingerprint) recoveryBaseHashes.set(tab.id, fingerprint);
     if (!editor) editor = new EditorView({ state, parent: editorHost }); else editor.setState(state);
     welcome.classList.add('hidden'); editorHost.classList.remove('hidden');
     renderTree(); renderTabs(); updateStatusDocument(); editor.focus();
@@ -561,6 +708,7 @@ async function createDocumentState(tab: EditorTab, contents: string, revision: n
         entry.state = update.state;
         if (update.docChanged) {
           entry.pipeline.enqueue(editsFromViewUpdate(update));
+          scheduleRecoverySnapshot(tab.id);
           diagnosticsByDocument.delete(tab.id);
           inspectionFindingsByDocument.delete(tab.id);
           scheduleInspection(tab.id);
@@ -661,11 +809,13 @@ async function closeTab(tab: EditorTab): Promise<void> {
     const action = tab.dirty ? await askDialog(document.querySelector<HTMLDialogElement>('#confirm-dialog')!, 'Unsaved changes', `Discard changes to ${tab.title}?`) : 'discard';
     if (action === 'cancel') return;
     await documentViews.get(tab.id)?.pipeline.flush();
+    if (action === 'discard') await deleteRecoveryForDocument(tab.id);
     await client.call({ method: 'close_document', params: { document_id: tab.id, discard_unsaved_changes: action === 'discard' } });
     const wasActive = tabs.activeId === tab.id;
     tabs.close(tab.id); documentViews.delete(tab.id); debugGutterRefreshers.delete(tab.id); diagnosticsByDocument.delete(tab.id); inspectionFindingsByDocument.delete(tab.id);
     const inspectionTimer = inspectionTimers.get(tab.id); if (inspectionTimer !== undefined) window.clearTimeout(inspectionTimer);
     inspectionTimers.delete(tab.id); inspectionGenerations.delete(tab.id); renderProblems();
+    recoveryBaseHashes.delete(tab.id); recoveryTimers.delete(tab.id);
     if (wasActive && tabs.activeId !== null) selectTab(tabs.activeId); else renderTabs();
     updateStatusDocument();
     saveSession();
@@ -677,7 +827,10 @@ async function saveActive(): Promise<void> {
   try {
     const entry = documentViews.get(tab.id)!;
     const result = await flushAndSave(entry.pipeline, async (expectedRevision) => expect(await client.call({ method: 'save_document', params: { document_id: tab.id, expected_revision: expectedRevision } }), 'document_saved').value);
-    tabs.update(tab.id, { revision: result.revision, dirty: result.dirty }); renderTabs(); updateStatusDocument(); setStatus('Saved');
+    await deleteRecoveryForDocument(tab.id).catch((error: unknown) => {
+      setStatus(`Saved, but recovery data could not be cleared: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    tabs.update(tab.id, { revision: result.revision, dirty: result.dirty }); renderTabs(); updateStatusDocument();
   } catch (error) {
     if (error instanceof KorenError && error.code === 'conflict') { await showConflict(tab); return; }
     showError(error);
@@ -685,18 +838,23 @@ async function saveActive(): Promise<void> {
 }
 
 async function saveAll(): Promise<boolean> {
+  let recoveryCleanupError: string | null = null;
   for (const tab of tabs.tabs) {
     if (!tab.dirty) continue;
     try {
       const entry = documentViews.get(tab.id); if (!entry) return false;
       const result = await flushAndSave(entry.pipeline, async (revision) => expect(await client.call({ method: 'save_document', params: { document_id: tab.id, expected_revision: revision } }), 'document_saved').value);
+      await deleteRecoveryForDocument(tab.id).catch((error: unknown) => {
+        recoveryCleanupError = error instanceof Error ? error.message : String(error);
+      });
       tabs.update(tab.id, { revision: result.revision, dirty: result.dirty });
     } catch (error) {
       if (error instanceof KorenError && error.code === 'conflict') await showConflict(tab); else showError(error);
       return false;
     }
   }
-  renderTabs(); updateStatusDocument(); setStatus('All files saved');
+  renderTabs(); updateStatusDocument();
+  setStatus(recoveryCleanupError ? `Files saved, but recovery data could not be cleared: ${recoveryCleanupError}` : 'All files saved');
   return tabs.tabs.every((tab) => !tab.dirty);
 }
 
@@ -720,6 +878,7 @@ async function showConflict(tab: EditorTab): Promise<void> {
       documentViews.set(tab.id, { state, pipeline, lineEnding, languageConfig });
       debugGutterRefreshers.set(tab.id, refreshDebugGutter);
       if (tabs.activeId === tab.id && editor) editor.setState(state);
+      await deleteRecoveryForDocument(tab.id);
     }
     renderTabs(); updateStatusDocument();
   } catch (error) { showError(error); }
@@ -741,6 +900,7 @@ async function chooseWorkspace(): Promise<void> {
       discard = action === 'discard';
     }
     for (const tab of [...tabs.tabs]) {
+      if (discard) await deleteRecoveryForDocument(tab.id);
       await client.call({ method: 'close_document', params: { document_id: tab.id, discard_unsaved_changes: discard } });
     }
     await client.call({ method: 'close_workspace' });
@@ -2028,6 +2188,7 @@ document.querySelector<HTMLSelectElement>('#theme-setting')!.addEventListener('c
     if (theme) applyExtensionTheme(theme);
   } else setTheme(value === 'light' ? 'light' : 'dark');
 });
+document.querySelector<HTMLButtonElement>('[data-action="close-recovery"]')!.addEventListener('click', () => document.querySelector<HTMLDialogElement>('#recovery-dialog')!.close());
 runConfiguration.addEventListener('change', syncRunButton);
 
 document.querySelector<HTMLElement>('#explorer-resizer')!.addEventListener('pointerdown', (event) => {
@@ -2061,12 +2222,20 @@ document.querySelector<HTMLElement>('#bottom-resizer')!.addEventListener('keydow
 window.addEventListener('koren-close-request', () => {
   void (async () => {
     const dialog = document.querySelector<HTMLDialogElement>('#close-dialog')!;
+    try { for (const entry of documentViews.values()) await entry.pipeline.flush(); }
+    catch (error) { showError(error); window.ipc?.postMessage(JSON.stringify({ type: 'close_decision', allow: false })); return; }
     const dirty = tabs.tabs.some((tab) => tab.dirty);
-    if (!dirty) { window.ipc?.postMessage(JSON.stringify({ type: 'close_decision', allow: true })); return; }
+    if (!dirty) {
+      for (const tab of tabs.tabs) await deleteRecoveryForDocument(tab.id);
+      window.ipc?.postMessage(JSON.stringify({ type: 'close_decision', allow: true })); return;
+    }
     dialog.showModal();
     const action = await new Promise<string>((resolve) => dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true }));
     if (action === 'save') window.ipc?.postMessage(JSON.stringify({ type: 'close_decision', allow: await saveAll() }));
-    else window.ipc?.postMessage(JSON.stringify({ type: 'close_decision', allow: action === 'discard' }));
+    else {
+      if (action === 'discard') for (const tab of tabs.tabs) await deleteRecoveryForDocument(tab.id);
+      window.ipc?.postMessage(JSON.stringify({ type: 'close_decision', allow: action === 'discard' }));
+    }
   })();
 });
 
@@ -2078,27 +2247,38 @@ if (layout.bottomCollapsed) document.querySelector('#bottom-resizer')!.classList
 renderTree(); renderTabs(); updateStatusDocument();
 void (async () => { for await (const events of client.subscribeEvents()) events.forEach(handlePlatformEvent); })();
 void (async () => {
-  const saved = readSession(localStorage);
-  if (!saved) return;
-  restoringSession = true;
-  try {
-    try { await openWorkspace(saved.workspace); }
-    catch { setStatus('The previous workspace is unavailable. Open a workspace to continue.'); return; }
-    const missing: string[] = [];
-    for (const path of saved.openFiles) if (!await openDocument(path)) missing.push(path);
-    if (saved.activeFile) {
-      const active = tabs.tabs.find((tab) => tab.path === saved.activeFile);
-      if (active) selectTab(active.id);
-    }
-    const restoreBottomCollapsed = layout.bottomCollapsed;
-    activePanel = saved.activePanel;
-    showPanel(saved.activePanel);
-    setBottomCollapsed(restoreBottomCollapsed);
-    if (missing.length) setStatus(`Session restored; ${missing.length} file${missing.length === 1 ? '' : 's'} could not be reopened.`);
-  } finally {
-    restoringSession = false;
-    saveSession();
+  const requestedWorkspace = new URLSearchParams(window.location.search).get('workspace');
+  if (requestedWorkspace) {
+    try { await openWorkspace(requestedWorkspace); }
+    catch (error) { showError(error); }
+    await loadRecoverySnapshots();
+    return;
   }
+  const saved = readSession(localStorage);
+  if (saved) {
+    restoringSession = true;
+    try {
+      try { await openWorkspace(saved.workspace); }
+      catch { setStatus('The previous workspace is unavailable. Open a workspace to continue.'); }
+      if (workspaceRoot) {
+        const missing: string[] = [];
+        for (const path of saved.openFiles) if (!await openDocument(path)) missing.push(path);
+        if (saved.activeFile) {
+          const active = tabs.tabs.find((tab) => tab.path === saved.activeFile);
+          if (active) selectTab(active.id);
+        }
+        const restoreBottomCollapsed = layout.bottomCollapsed;
+        activePanel = saved.activePanel;
+        showPanel(saved.activePanel);
+        setBottomCollapsed(restoreBottomCollapsed);
+        if (missing.length) setStatus(`Session restored; ${missing.length} file${missing.length === 1 ? '' : 's'} could not be reopened.`);
+      }
+    } finally {
+      restoringSession = false;
+      saveSession();
+    }
+  }
+  await loadRecoverySnapshots();
 })();
 
 export { client, renderTree, renderTabs, showPanel };

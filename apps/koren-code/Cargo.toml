@@ -16,6 +16,8 @@ include_dir = "0.7"
 mime_guess = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10.9"
+dirs = "7"
 tao = "0.37.2"
 wry = "0.57.2"
 koren-core = { workspace = true }

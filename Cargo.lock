@@ -1222,6 +1222,7 @@ name = "koren-code"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "dirs",
  "git2",
  "gtk",
  "include_dir",
@@ -1244,6 +1245,7 @@ dependencies = [
  "mime_guess",
  "serde",
  "serde_json",
+ "sha2",
  "tao",
  "wry",
 ]
