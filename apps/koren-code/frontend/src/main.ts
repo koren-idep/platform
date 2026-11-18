@@ -393,9 +393,22 @@ function selectSidebarView(view: LayoutPreferences['primaryView']): void {
   }
 }
 
+function updateWelcomeForWorkspace(): void {
+  const hasWorkspace = Boolean(workspaceRoot);
+  const actions = welcome.querySelector<HTMLElement>('.welcome-actions')!;
+  const openFolder = welcome.querySelector<HTMLButtonElement>('[data-action="open"]')!;
+  const openFile = document.querySelector<HTMLButtonElement>('#welcome-open-file')!;
+  welcome.querySelector<HTMLElement>('.welcome-title')!.textContent = hasWorkspace ? 'No file open' : 'Koren Code Editor';
+  welcome.querySelector<HTMLElement>('p')!.textContent = hasWorkspace ? 'Choose a file from the project to start editing.' : 'A focused workspace for your code.';
+  openFile.classList.toggle('primary-button', hasWorkspace);
+  openFolder.classList.toggle('primary-button', !hasWorkspace);
+  actions.prepend(hasWorkspace ? openFile : openFolder);
+}
+
 async function openWorkspace(path: string): Promise<void> {
   const opened = await openWorkspaceAndDiscoverProjects(client, path);
   workspaceRoot = opened.root;
+  updateWelcomeForWorkspace();
   applySettingsPreferences();
   rootLabel.textContent = baseName(opened.root);
   rootLabel.title = opened.root;
@@ -404,6 +417,7 @@ async function openWorkspace(path: string): Promise<void> {
   document.querySelector<HTMLButtonElement>('#menu-open-file')!.disabled = false;
   treeState.setEntries('', expect(await client.call({ method: 'list_directory', params: { path: '' } }), 'directory_entries').value);
   renderTree();
+  if (layout.primaryView === 'git') void refreshGitRepositories();
   if (opened.discovery) renderProjectDiscovery(opened.discovery);
   else renderProjectDiscoveryError(opened.discoveryError ?? 'Unknown discovery error');
   saveSession();
@@ -934,6 +948,7 @@ async function chooseWorkspace(): Promise<void> {
     await client.call({ method: 'close_workspace' });
     for (const tab of [...tabs.tabs]) { tabs.close(tab.id); documentViews.delete(tab.id); debugGutterRefreshers.delete(tab.id); }
     workspaceRoot = ''; selectedPath = ''; taskById.clear();
+    updateWelcomeForWorkspace();
     rootLabel.textContent = 'No Workspace'; rootLabel.removeAttribute('title');
     document.querySelector<HTMLElement>('#toolbar-workspace')!.textContent = 'Open Workspace';
     document.querySelector('#status-workspace')!.textContent = '';
@@ -2390,7 +2405,10 @@ async function refreshGitStatus(): Promise<void> {
 }
 
 function renderGitStatus(): void {
-  document.querySelector('#git-branch')!.textContent = gitStatus ? `${gitStatus.root} · ${gitStatus.branch ?? 'detached HEAD'}` : 'No local Git repository selected.';
+  const sourceControl = document.querySelector<HTMLElement>('#source-control')!;
+  sourceControl.classList.toggle('git-ready', Boolean(gitStatus));
+  sourceControl.classList.toggle('git-has-choices', gitRepositories.length > 0);
+  document.querySelector('#git-branch')!.textContent = gitStatus ? `${gitStatus.root} · ${gitStatus.branch ?? 'detached HEAD'}` : gitRepositories.length ? 'Select a Git repository.' : 'No Git repository found in this workspace.';
   const renderFiles = (hostId: string, staged: boolean) => {
     const host = document.querySelector<HTMLDivElement>(`#${hostId}`)!; host.replaceChildren();
     const partition = partitionGitFiles(gitStatus?.files ?? []);
