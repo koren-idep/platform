@@ -37,3 +37,14 @@ executing their contents. `save_run_file` validates all entries, writes a
 temporary file beside the target, syncs it, then replaces the target by rename.
 The caller is responsible for choosing the user configuration path or the
 workspace `.koren/runs.toml` path and for surfacing I/O errors.
+
+The desktop bridge exposes additive protocol-v2 methods to list, save, delete,
+select, preview, and request a run configuration. User definitions live in
+`runs.toml` under Koren's configuration directory; workspace definitions live
+in `.koren/runs.toml`. Selection is saved per workspace in the user
+configuration directory. Each one-shot request resolves variables again and
+creates a new exact task approval snapshot. A dirty document with `save =
+"ask"` requires an explicit `save` or `disk` choice; saving uses the document
+service and its conflict checks. Preview and registration never authorize a
+process. Interactive terminal output and tool references are reserved by the
+model but are not yet launchable through this bridge.

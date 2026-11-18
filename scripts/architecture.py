@@ -6,7 +6,7 @@ import sys
 
 ALLOWED_INTERNAL_DEPS = {
     "koren-core": set(),
-    "koren-protocol": set(),
+    "koren-protocol": {"koren-run"},
     "koren-commands": {"koren-core", "koren-protocol"},
     "koren-extensions": set(),
     "koren-lsp": {"koren-documents", "koren-protocol"},
@@ -16,9 +16,10 @@ ALLOWED_INTERNAL_DEPS = {
     "koren-documents": {"koren-core", "koren-protocol", "koren-workspace"},
     "koren-projects": {"koren-core", "koren-workspace", "koren-tasks"},
     "koren-tasks": {"koren-core"},
+    "koren-run": set(),
     "koren-cargo": {"koren-projects", "koren-tasks", "koren-workspace"},
     "koren-headless": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo"},
-    "koren-code": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo", "koren-extensions", "koren-inspections", "koren-lua", "koren-lsp"},
+    "koren-code": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo", "koren-extensions", "koren-inspections", "koren-lua", "koren-lsp", "koren-run"},
 }
 BACKEND_PACKAGES = set(ALLOWED_INTERNAL_DEPS) - {"koren-headless", "koren-code"}
 FORBIDDEN_BACKEND_DEPS = {

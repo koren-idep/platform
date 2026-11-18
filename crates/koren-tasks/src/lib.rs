@@ -451,6 +451,11 @@ impl TaskManager {
     pub fn list(&self) -> Vec<(TaskId, &TaskDefinition)> {
         self.definitions.iter().map(|(a, b)| (*a, b)).collect()
     }
+    /// Removes a definition after its one-shot approval was consumed. Existing runs retain output.
+    /// The caller must first invalidate or consume any pending approval for this task ID.
+    pub fn unregister(&mut self, id: TaskId) -> Option<TaskDefinition> {
+        self.definitions.remove(&id)
+    }
     fn definition(&self, id: TaskId) -> Result<&TaskDefinition, TaskError> {
         self.definitions.get(&id).ok_or(TaskError::NotFound)
     }
@@ -1275,6 +1280,28 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn unregister_after_start_preserves_one_shot_output() {
+        let mut tasks = TaskManager::new(TaskOptions::default()).unwrap();
+        let id = tasks.register(def("one-shot")).unwrap();
+        let run = tasks
+            .start(id, &TaskCaller::InteractiveUser, &Allow)
+            .unwrap();
+        assert!(tasks.unregister(id).is_some());
+        assert_eq!(tasks.list().len(), 0);
+        assert!(matches!(
+            wait_finished(&tasks, run).state,
+            TaskState::Succeeded { .. }
+        ));
+        assert!(
+            tasks
+                .output(run)
+                .unwrap()
+                .stdout
+                .contains("fixture:one-shot")
+        );
+    }
+
     #[test]
     fn execution_authorization_output_status_and_failure_are_explicit() {
         let mut m = TaskManager::new(TaskOptions::default()).unwrap();

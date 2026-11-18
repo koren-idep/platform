@@ -89,6 +89,22 @@ pub enum RequestMethod {
         /// Definition ID.
         id: String,
     },
+    /// Resolve a definition against the current workspace and optional document, without running it.
+    PreviewRunConfiguration {
+        /// Owner-scoped definition identity.
+        identity: RunConfigurationIdentity,
+        /// Active document identity, if present.
+        file_document_id: Option<u64>,
+    },
+    /// Request one fresh run; execution still requires host approval.
+    RequestRunConfiguration {
+        /// Owner-scoped definition identity.
+        identity: RunConfigurationIdentity,
+        /// Active document identity, if present.
+        file_document_id: Option<u64>,
+        /// Explicit choice for a dirty file: `save` or `disk`.
+        dirty_action: Option<String>,
+    },
     /// Enumerate commands registered by the host.
     ListCommands,
     /// Invoke a registered command without arguments.
@@ -860,6 +876,23 @@ pub enum ResponseValue {
     },
     /// One editable run definition was stored or deleted.
     RunConfigurationChanged,
+    /// Fully resolved command preview; environment values are only shown in approval UI.
+    RunConfigurationPreview {
+        /// Executable path or name.
+        executable: String,
+        /// Direct argument vector.
+        arguments: Vec<String>,
+        /// Absolute working directory.
+        working_directory: String,
+        /// Names of environment overrides.
+        environment_keys: Vec<String>,
+        /// Whether the active file is dirty.
+        dirty_file: bool,
+        /// Configured save policy.
+        save_policy: String,
+        /// Output destination.
+        output: String,
+    },
     /// Available command identifiers.
     Commands(Vec<String>),
     /// Text returned by a command.

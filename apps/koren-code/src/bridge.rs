@@ -42,7 +42,10 @@ use koren_protocol::{
     SearchSummary as ProtocolSearchSummary, TaskLifecycle, TaskSummary, TerminalApprovalSummary,
     TerminalLifecycle, TerminalSessionSummary, TextEdit, validate_version,
 };
-use koren_run::{RunFile, load_run_file, save_run_file, validate as validate_run};
+use koren_run::{
+    OutputDestination, RunContext, RunFile, SavePolicy, load_run_file, resolve as resolve_run,
+    save_run_file, validate as validate_run,
+};
 use koren_search::{SearchEvent, SearchJob, SearchOptions, SearchService};
 use koren_tasks::{
     ExecutionRequestId, TaskApprovalManager, TaskAuthorizationDecision, TaskCaller, TaskDefinition,
@@ -328,6 +331,8 @@ struct DesktopBackend {
     projects: ProjectManager,
     cargo: CargoProvider,
     tasks: TaskManager,
+    ephemeral_task_ids: BTreeMap<u64, TaskId>,
+    next_ephemeral_task: u64,
     approvals: TaskApprovalManager,
     terminals: TerminalManager,
     terminal_approvals: BTreeMap<u64, PendingTerminalApproval>,
@@ -525,6 +530,182 @@ impl DesktopBackend {
         write_run_selections(&path, &selections)
     }
 
+    fn prepare_run(
+        &mut self,
+        identity: &RunConfigurationIdentity,
+        file_document_id: Option<u64>,
+        dirty_action: Option<&str>,
+        for_execution: bool,
+    ) -> Result<(koren_run::RunConfiguration, koren_run::ResolvedRun, bool), ProtocolError> {
+        if !matches!(dirty_action, None | Some("save" | "disk")) {
+            return Err(invalid("dirty action must be save or disk"));
+        }
+        let entry = self
+            .run_configuration_entries()?
+            .into_iter()
+            .find(|entry| &entry.identity == identity)
+            .ok_or_else(|| ProtocolError {
+                code: ErrorCode::NotFound,
+                message: "run configuration was not found".into(),
+            })?;
+        if for_execution && entry.configuration.output != OutputDestination::Run {
+            return Err(invalid(
+                "interactive run configurations require terminal support",
+            ));
+        }
+        let workspace = self
+            .workspace
+            .root()
+            .map_err(workspace_error)?
+            .to_path_buf();
+        let mut dirty = false;
+        let mut dirty_revision = None;
+        let file = if let Some(document_id) = file_document_id {
+            let snapshot = self
+                .documents
+                .snapshot(DocumentId(document_id))
+                .map_err(document_error)?;
+            dirty = snapshot.info.dirty;
+            if dirty {
+                dirty_revision = Some((DocumentId(document_id), snapshot.info.revision));
+            }
+            snapshot.info.path.map(|path| workspace.join(path))
+        } else {
+            None
+        };
+        let resolved = resolve_run(
+            &entry.configuration,
+            &RunContext {
+                workspace: &workspace,
+                file: file.as_deref(),
+            },
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        if for_execution && dirty {
+            match (entry.configuration.save, dirty_action) {
+                (SavePolicy::Ask, None) => {
+                    return Err(invalid("save or use on-disk contents before running"));
+                }
+                (_, Some("save")) | (SavePolicy::Save, None) => {
+                    if let Some((document_id, revision)) = dirty_revision {
+                        self.documents
+                            .save(document_id, revision)
+                            .map_err(document_error)?;
+                    }
+                }
+                (_, Some("disk")) | (SavePolicy::Disk, None) => {}
+                (_, Some(_)) => return Err(invalid("dirty action must be save or disk")),
+            }
+        }
+        Ok((entry.configuration, resolved, dirty))
+    }
+
+    fn preview_run_configuration(
+        &mut self,
+        identity: &RunConfigurationIdentity,
+        file_document_id: Option<u64>,
+    ) -> Result<ResponseValue, ProtocolError> {
+        let (configuration, resolved, dirty_file) =
+            self.prepare_run(identity, file_document_id, None, false)?;
+        Ok(ResponseValue::RunConfigurationPreview {
+            executable: resolved.executable,
+            arguments: resolved.args,
+            working_directory: resolved.cwd.to_string_lossy().into_owned(),
+            environment_keys: resolved.environment.keys().cloned().collect(),
+            dirty_file,
+            save_policy: match configuration.save {
+                SavePolicy::Ask => "ask",
+                SavePolicy::Save => "save",
+                SavePolicy::Disk => "disk",
+            }
+            .into(),
+            output: match configuration.output {
+                OutputDestination::Run => "run",
+                OutputDestination::Terminal => "terminal",
+            }
+            .into(),
+        })
+    }
+
+    fn request_run_configuration(
+        &mut self,
+        identity: &RunConfigurationIdentity,
+        file_document_id: Option<u64>,
+        dirty_action: Option<&str>,
+    ) -> Result<ResponseValue, ProtocolError> {
+        self.cleanup_expired_run_tasks();
+        let (configuration, resolved, _) =
+            self.prepare_run(identity, file_document_id, dirty_action, true)?;
+        let root = self
+            .workspace
+            .root()
+            .map_err(workspace_error)?
+            .to_path_buf();
+        self.next_ephemeral_task = self
+            .next_ephemeral_task
+            .checked_add(1)
+            .ok_or_else(|| invalid("run identity space exhausted"))?;
+        let task_id = self
+            .tasks
+            .register(TaskDefinition {
+                key: format!(
+                    "run:{}:{}:{}:{}",
+                    identity.source, identity.owner, identity.id, self.next_ephemeral_task
+                ),
+                display_name: configuration.name,
+                category: koren_tasks::TaskCategory::Run,
+                executable: PathBuf::from(resolved.executable),
+                arguments: resolved.args,
+                working_directory: resolved.cwd,
+                environment: resolved.environment,
+                timeout: configuration.timeout_ms.map(Duration::from_millis),
+                project_id: None,
+            })
+            .map_err(task_error)?;
+        let outcome = self.approvals.request_execution(
+            &mut self.tasks,
+            task_id,
+            TaskCaller::InteractiveUser,
+            root,
+            &AlwaysRequireApproval,
+            Duration::from_secs(120),
+        );
+        match outcome {
+            Ok(TaskExecutionRequestOutcome::ApprovalRequired(request)) => {
+                self.ephemeral_task_ids.insert(request.id.get(), task_id);
+                Ok(ResponseValue::ApprovalRequired(approval_summary(
+                    &request,
+                    &self.approvals,
+                )?))
+            }
+            Ok(TaskExecutionRequestOutcome::Started(run)) => {
+                self.tasks.unregister(task_id);
+                Ok(ResponseValue::TaskStarted { run_id: run.get() })
+            }
+            Err(error) => {
+                self.tasks.unregister(task_id);
+                Err(task_error(error))
+            }
+        }
+    }
+
+    fn cleanup_expired_run_tasks(&mut self) {
+        let live = self
+            .approvals
+            .pending_requests()
+            .into_iter()
+            .map(|request| request.id.get())
+            .collect::<BTreeSet<_>>();
+        self.ephemeral_task_ids.retain(|request_id, task_id| {
+            if live.contains(request_id) {
+                true
+            } else {
+                self.tasks.unregister(*task_id);
+                false
+            }
+        });
+    }
+
     fn new() -> Result<Self, String> {
         let mut platform = Platform::new();
         platform.initialize().map_err(|error| error.to_string())?;
@@ -588,6 +769,8 @@ impl DesktopBackend {
             projects,
             cargo,
             tasks: TaskManager::new(TaskOptions::default()).map_err(|error| error.to_string())?,
+            ephemeral_task_ids: BTreeMap::new(),
+            next_ephemeral_task: 0,
             approvals: TaskApprovalManager::new(),
             terminals: TerminalManager::default(),
             terminal_approvals: BTreeMap::new(),
@@ -1040,6 +1223,17 @@ impl DesktopBackend {
                 }
                 self.persist_run_selection(Some(identity))?;
                 Ok(ResponseValue::RunConfigurationChanged)
+            }
+            RequestMethod::PreviewRunConfiguration {
+                identity,
+                file_document_id,
+            } => self.preview_run_configuration(&identity, file_document_id),
+            RequestMethod::RequestRunConfiguration {
+                identity,
+                file_document_id,
+                dirty_action,
+            } => {
+                self.request_run_configuration(&identity, file_document_id, dirty_action.as_deref())
             }
             RequestMethod::Ping => Ok(ResponseValue::Pong),
             RequestMethod::ListCommands => {
@@ -1680,6 +1874,7 @@ impl DesktopBackend {
                 self.tasks
                     .list()
                     .into_iter()
+                    .filter(|(id, _)| !self.ephemeral_task_ids.values().any(|temp| temp == id))
                     .map(|(id, task)| task_summary(id.get(), task))
                     .collect(),
             )),
@@ -1714,6 +1909,7 @@ impl DesktopBackend {
                 }
             }
             RequestMethod::ListPendingApprovals => {
+                self.cleanup_expired_run_tasks();
                 let requests = self
                     .approvals
                     .pending_requests()
@@ -1763,6 +1959,9 @@ impl DesktopBackend {
                     .approvals
                     .approve(&mut self.tasks, id)
                     .map_err(task_error)?;
+                if let Some(task_id) = self.ephemeral_task_ids.remove(&request_id) {
+                    self.tasks.unregister(task_id);
+                }
                 Ok(ResponseValue::TaskApproved {
                     request_id,
                     run_id: run_id.get(),
@@ -1772,6 +1971,9 @@ impl DesktopBackend {
                 self.approvals
                     .deny(ExecutionRequestId::from_raw(request_id))
                     .map_err(task_error)?;
+                if let Some(task_id) = self.ephemeral_task_ids.remove(&request_id) {
+                    self.tasks.unregister(task_id);
+                }
                 Ok(ResponseValue::TaskDenied { request_id })
             }
             RequestMethod::TaskStatus { run_id } | RequestMethod::TaskOutput { run_id } => self
@@ -5640,7 +5842,7 @@ mod tests {
         backend
             .method(RequestMethod::SaveRunConfiguration {
                 scope: "workspace".into(),
-                configuration,
+                configuration: configuration.clone(),
             })
             .unwrap();
         assert!(matches!(
@@ -5670,6 +5872,55 @@ mod tests {
             ResponseValue::RunConfigurations { selected: Some(selected), .. } if selected.id == "fixture"
         ));
         assert_eq!(backend.tasks.list().len(), 0);
+        let identity = RunConfigurationIdentity {
+            source: "workspace".into(),
+            owner: String::new(),
+            id: "fixture".into(),
+        };
+        let first = backend
+            .method(RequestMethod::RequestRunConfiguration {
+                identity: identity.clone(),
+                file_document_id: None,
+                dirty_action: None,
+            })
+            .unwrap();
+        let first = match first {
+            ResponseValue::ApprovalRequired(request) => request,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(first.arguments, [workspace.to_string_lossy().into_owned()]);
+        let mut changed = configuration;
+        changed.args = vec!["changed".into()];
+        backend
+            .method(RequestMethod::SaveRunConfiguration {
+                scope: "workspace".into(),
+                configuration: changed,
+            })
+            .unwrap();
+        let second = backend
+            .method(RequestMethod::RequestRunConfiguration {
+                identity,
+                file_document_id: None,
+                dirty_action: None,
+            })
+            .unwrap();
+        let second = match second {
+            ResponseValue::ApprovalRequired(request) => request,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_ne!(first.request_id, second.request_id);
+        assert_eq!(second.arguments, ["changed"]);
+        backend
+            .method(RequestMethod::DenyTaskExecution {
+                request_id: first.request_id,
+            })
+            .unwrap();
+        backend
+            .method(RequestMethod::DenyTaskExecution {
+                request_id: second.request_id,
+            })
+            .unwrap();
+        assert_eq!(backend.tasks.list().len(), 0);
         let path = workspace.join(".koren/runs.toml");
         fs::write(path, "schema = 1\n[[run]]\nid = 'broken'\n").unwrap();
         assert!(
@@ -5678,6 +5929,183 @@ mod tests {
                 .is_err()
         );
         assert_eq!(backend.tasks.list().len(), 0);
+    }
+
+    #[test]
+    fn rejected_run_configuration_does_not_save_dirty_document() {
+        let temp = Temp::new();
+        let file = temp.0.join("main.txt");
+        fs::write(&file, "original").unwrap();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend.settings_path = Some(temp.0.join("config/settings.json"));
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: temp.0.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        let ResponseValue::DocumentOpened { document_id, .. } = backend
+            .method(RequestMethod::OpenDocument {
+                path: "main.txt".into(),
+            })
+            .unwrap()
+        else {
+            panic!("expected document");
+        };
+        backend
+            .method(RequestMethod::ApplyDocumentEdits {
+                document_id,
+                expected_revision: 0,
+                edits: vec![TextEdit {
+                    range: koren_protocol::TextRange {
+                        start: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 8,
+                        },
+                    },
+                    new_text: "modified".into(),
+                }],
+            })
+            .unwrap();
+        backend
+            .method(RequestMethod::SaveRunConfiguration {
+                scope: "workspace".into(),
+                configuration: koren_run::RunConfiguration {
+                    id: "terminal".into(),
+                    name: "Terminal".into(),
+                    executable: Some("echo".into()),
+                    tool: None,
+                    args: vec![],
+                    cwd: "${workspace}".into(),
+                    environment: BTreeMap::new(),
+                    languages: vec![],
+                    output: OutputDestination::Terminal,
+                    save: SavePolicy::Save,
+                    timeout_ms: None,
+                    debug_adapter: None,
+                },
+            })
+            .unwrap();
+        assert!(
+            backend
+                .method(RequestMethod::RequestRunConfiguration {
+                    identity: RunConfigurationIdentity {
+                        source: "workspace".into(),
+                        owner: String::new(),
+                        id: "terminal".into(),
+                    },
+                    file_document_id: Some(document_id),
+                    dirty_action: None,
+                })
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(file).unwrap(), "original");
+        assert!(
+            backend
+                .documents
+                .info(DocumentId(document_id))
+                .unwrap()
+                .dirty
+        );
+    }
+
+    #[test]
+    fn run_configuration_asks_before_using_dirty_file() {
+        let temp = Temp::new();
+        let workspace = temp.0.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("hello.txt"), "hello").unwrap();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend.settings_path = Some(temp.0.join("config/extension-settings.json"));
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: workspace.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        let document_id = match backend
+            .method(RequestMethod::OpenDocument {
+                path: "hello.txt".into(),
+            })
+            .unwrap()
+        {
+            ResponseValue::DocumentOpened { document_id, .. } => document_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        backend
+            .method(RequestMethod::ApplyDocumentEdits {
+                document_id,
+                expected_revision: 0,
+                edits: vec![TextEdit {
+                    range: koren_protocol::TextRange {
+                        start: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: koren_protocol::TextPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                    },
+                    new_text: "changed ".into(),
+                }],
+            })
+            .unwrap();
+        let configuration = koren_run::RunConfiguration {
+            id: "dirty".into(),
+            name: "Dirty fixture".into(),
+            executable: Some("definitely-not-a-real-executable".into()),
+            tool: None,
+            args: vec!["${file}".into()],
+            cwd: "${workspace}".into(),
+            environment: BTreeMap::new(),
+            languages: Vec::new(),
+            output: OutputDestination::Run,
+            save: SavePolicy::Ask,
+            timeout_ms: None,
+            debug_adapter: None,
+        };
+        backend
+            .method(RequestMethod::SaveRunConfiguration {
+                scope: "workspace".into(),
+                configuration,
+            })
+            .unwrap();
+        let identity = RunConfigurationIdentity {
+            source: "workspace".into(),
+            owner: String::new(),
+            id: "dirty".into(),
+        };
+        assert!(
+            backend
+                .method(RequestMethod::RequestRunConfiguration {
+                    identity: identity.clone(),
+                    file_document_id: Some(document_id),
+                    dirty_action: None,
+                })
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("hello.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(backend.tasks.list().len(), 0);
+        assert!(matches!(
+            backend
+                .method(RequestMethod::RequestRunConfiguration {
+                    identity,
+                    file_document_id: Some(document_id),
+                    dirty_action: Some("disk".into()),
+                })
+                .unwrap(),
+            ResponseValue::ApprovalRequired(_)
+        ));
+        assert_eq!(
+            fs::read_to_string(workspace.join("hello.txt")).unwrap(),
+            "hello"
+        );
     }
 
     #[test]
