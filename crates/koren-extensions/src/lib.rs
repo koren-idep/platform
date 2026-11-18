@@ -1364,7 +1364,7 @@ impl<'a> ContributionBuilder<'a> {
                 .collect::<Vec<_>>(),
             &full_id,
         )?;
-        contribution.id = full_id.clone();
+        contribution.id.clone_from(&full_id);
         validate_run_configuration_contribution(&contribution)?;
         self.values.run_configurations.push(contribution);
         Ok(full_id)
