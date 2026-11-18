@@ -59,6 +59,8 @@ pub struct LuaHostContext {
     pub active_document: Option<LuaDocumentContext>,
     /// Effective host-validated namespaced extension settings.
     pub settings: BTreeMap<String, SettingValue>,
+    /// Host-resolved tool references (tool ID -> executable path); resolution never grants execution.
+    pub resolved_tools: BTreeMap<String, String>,
 }
 
 /// Active document data made available to extensions that declare `document_read`.
@@ -1630,6 +1632,28 @@ fn create_api(
         api.set("run", run)?;
     }
 
+    if manifest.capabilities.contains(&Capability::Tools) {
+        let tools = lua.create_table()?;
+        let host_context = Arc::clone(context);
+        tools.set(
+            "resolve",
+            lua.create_function(move |lua, tool_id: String| {
+                let guard = host_context
+                    .lock()
+                    .map_err(|_| mlua::Error::RuntimeError("host context poisoned".into()))?;
+                let Some(exec) = guard.resolved_tools.get(&tool_id) else {
+                    return Ok(Value::Nil);
+                };
+                let entry = lua.create_table()?;
+                entry.set("id", tool_id)?;
+                entry.set("executable", exec.as_str())?;
+                entry.set("available", true)?;
+                Ok(Value::Table(entry))
+            })?,
+        )?;
+        api.set("tools", tools)?;
+    }
+
     Ok(api)
 }
 
@@ -1743,6 +1767,7 @@ mod tests {
             debug_adapters: Vec::new(),
             debug_configurations: Vec::new(),
             run_configurations: Vec::new(),
+            tools: Vec::new(),
         }
     }
 
@@ -2137,5 +2162,41 @@ mod tests {
         assert_eq!(staged.run_configurations[0].output, "terminal");
         assert_eq!(staged.run_configurations[0].save, "save");
         assert!(staged.run_configurations[0].configurable_arguments);
+    }
+
+    #[test]
+    fn lua_tools_resolve_is_capability_gated_and_returns_host_resolved_reference() {
+        let no_cap = manifest(&[Capability::Commands]);
+        let mut no_cap_builder = builder(&no_cap);
+        LuaExtensionRuntime::activate_source(
+            &no_cap,
+            r#"local m={}; function m.activate() assert(koren.tools == nil) end; return m"#,
+            LuaHostContext::default(),
+            LuaLimits::default(),
+            &mut no_cap_builder,
+        )
+        .unwrap();
+
+        let with_cap = manifest(&[Capability::Tools]);
+        let mut cap_builder = builder(&with_cap);
+        let mut ctx = LuaHostContext::default();
+        ctx.resolved_tools
+            .insert("lune".into(), "/usr/local/bin/lune".into());
+        LuaExtensionRuntime::activate_source(
+            &with_cap,
+            r#"
+                local m = {}
+                function m.activate()
+                    local t = koren.tools.resolve("lune")
+                    assert(t ~= nil and t.id == "lune" and t.executable == "/usr/local/bin/lune" and t.available == true)
+                    assert(koren.tools.resolve("missing") == nil)
+                end
+                return m
+            "#,
+            ctx,
+            LuaLimits::default(),
+            &mut cap_builder,
+        )
+        .unwrap();
     }
 }

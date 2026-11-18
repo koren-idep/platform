@@ -50,6 +50,8 @@ pub enum Capability {
     Themes,
     /// Declare declarative run configurations; execution still requires host approval.
     RunConfigurations,
+    /// Declare optional external tool requirements and resolve host-configured tools.
+    Tools,
 }
 
 /// Conditions a host may use to decide when to activate an enabled extension.
@@ -217,6 +219,44 @@ fn default_run_save() -> String {
     "ask".into()
 }
 
+fn default_tool_optional() -> bool {
+    true
+}
+
+/// Declarative external tool requirement contributed by an extension.
+///
+/// Declaring a tool never installs or executes any binary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolContribution {
+    /// Stable tool identifier (e.g. `lune`, `lua-language-server`).
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Human-readable description of what the tool provides.
+    #[serde(default)]
+    pub description: String,
+    /// Tool category (`language-server`, `runtime`, `compiler`, `formatter`, `linter`, `build-tool`, `debugger`).
+    pub category: String,
+    /// Whether the extension remains usable without this tool.
+    #[serde(default = "default_tool_optional")]
+    pub optional: bool,
+    /// Candidate executable filenames (without path separators).
+    pub executables: Vec<String>,
+    /// Optional local discovery directory hints.
+    #[serde(default)]
+    pub discovery_hints: Vec<String>,
+    /// Supported platforms (`linux`, `mac_os`, `windows`). Empty means all.
+    #[serde(default)]
+    pub platforms: Vec<String>,
+    /// Supported architectures (`x86_64`, `aarch64`). Empty means all.
+    #[serde(default)]
+    pub architectures: Vec<String>,
+    /// Optional version requirement string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_requirement: Option<String>,
+}
+
 /// Versioned extension metadata loaded from `koren-extension.toml`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -258,6 +298,9 @@ pub struct ExtensionManifest {
     /// Optional declarative run configurations.
     #[serde(default)]
     pub run_configurations: Vec<RunConfigurationContribution>,
+    /// Optional external tool declarations.
+    #[serde(default)]
+    pub tools: Vec<ToolContribution>,
 }
 
 impl ExtensionManifest {
@@ -339,6 +382,9 @@ impl ExtensionManifest {
             return Err(ExtensionError::MissingCapability(
                 Capability::RunConfigurations,
             ));
+        }
+        if !self.tools.is_empty() && !self.capabilities.contains(&Capability::Tools) {
+            return Err(ExtensionError::MissingCapability(Capability::Tools));
         }
         self.validate_contributions()?;
         Ok(())
@@ -920,6 +966,8 @@ pub struct ExtensionContributions {
     pub project_wizards: Vec<ProjectWizardContribution>,
     /// Declarative run configurations.
     pub run_configurations: Vec<RunConfigurationContribution>,
+    /// Declared external tools.
+    pub tools: Vec<ToolContribution>,
 }
 
 /// A command and its callback registered by an extension.
@@ -977,6 +1025,7 @@ impl<'a> ContributionBuilder<'a> {
                 debug_adapters: manifest.debug_adapters.clone(),
                 debug_configurations: manifest.debug_configurations.clone(),
                 run_configurations,
+                tools: manifest.tools.clone(),
                 ..ExtensionContributions::default()
             },
         }
@@ -2444,6 +2493,7 @@ mod tests {
             debug_adapters: Vec::new(),
             debug_configurations: Vec::new(),
             run_configurations: Vec::new(),
+            tools: Vec::new(),
         }
     }
 
