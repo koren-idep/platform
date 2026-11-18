@@ -504,11 +504,12 @@ impl ProjectProvider for CargoProvider {
     }
 }
 
-fn cargo_commands() -> [(&'static str, TaskCategory, &'static str); 4] {
+fn cargo_commands() -> [(&'static str, TaskCategory, &'static str); 5] {
     [
         ("build", TaskCategory::Build, "build"),
         ("check", TaskCategory::Check, "check"),
         ("test", TaskCategory::Test, "test"),
+        ("clippy", TaskCategory::Check, "clippy"),
         ("clean", TaskCategory::Clean, "clean"),
     ]
 }
