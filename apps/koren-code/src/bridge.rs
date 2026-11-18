@@ -37,11 +37,12 @@ use koren_protocol::{
     InspectionFinding, InspectionProposedTextEdit, InspectionRelatedLocation,
     InspectionRuleSummary, LanguageServerApprovalSummary, LanguageServerSummary,
     ProjectInspectionFindingPage, ProjectInspectionSummary, ProjectLifecycle, ProjectSummary,
-    ProtocolError, Request, RequestMethod, Response, ResponseValue, SearchMatch,
-    SearchProgress as ProtocolSearchProgress, SearchSummary as ProtocolSearchSummary,
-    TaskLifecycle, TaskSummary, TerminalApprovalSummary, TerminalLifecycle, TerminalSessionSummary,
-    TextEdit, validate_version,
+    ProtocolError, Request, RequestMethod, Response, ResponseValue, RunConfigurationIdentity,
+    RunConfigurationSummary, SearchMatch, SearchProgress as ProtocolSearchProgress,
+    SearchSummary as ProtocolSearchSummary, TaskLifecycle, TaskSummary, TerminalApprovalSummary,
+    TerminalLifecycle, TerminalSessionSummary, TextEdit, validate_version,
 };
+use koren_run::{RunFile, load_run_file, save_run_file, validate as validate_run};
 use koren_search::{SearchEvent, SearchJob, SearchOptions, SearchService};
 use koren_tasks::{
     ExecutionRequestId, TaskApprovalManager, TaskAuthorizationDecision, TaskCaller, TaskDefinition,
@@ -433,6 +434,97 @@ impl ServerAuthorizer for ApproveLanguageServer {
 }
 
 impl DesktopBackend {
+    fn run_config_path(&self, scope: &str) -> Result<PathBuf, ProtocolError> {
+        match scope {
+            "user" => self
+                .settings_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(|parent| parent.join("runs.toml"))
+                .ok_or_else(|| invalid("user configuration directory is unavailable")),
+            "workspace" => self
+                .workspace
+                .root()
+                .map(|root| root.join(".koren/runs.toml"))
+                .map_err(workspace_error),
+            _ => Err(invalid("run scope must be user or workspace")),
+        }
+    }
+
+    fn run_configuration_entries(&self) -> Result<Vec<RunConfigurationSummary>, ProtocolError> {
+        let mut entries = Vec::new();
+        for scope in ["user", "workspace"] {
+            let path = match self.run_config_path(scope) {
+                Ok(path) => path,
+                Err(error) if scope == "workspace" && error.code == ErrorCode::NotOpen => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let file: RunFile = load_run_file(&path)
+                .map_err(|error| invalid(format!("{}: {error}", path.display())))?;
+            entries.extend(
+                file.runs
+                    .into_iter()
+                    .map(|configuration| RunConfigurationSummary {
+                        identity: RunConfigurationIdentity {
+                            source: scope.into(),
+                            owner: String::new(),
+                            id: configuration.id.clone(),
+                        },
+                        configuration,
+                        editable: true,
+                    }),
+            );
+        }
+        Ok(entries)
+    }
+
+    fn list_run_configurations(&self) -> Result<ResponseValue, ProtocolError> {
+        let entries = self.run_configuration_entries()?;
+        let selected = self
+            .selected_run_for_workspace()?
+            .filter(|selected| entries.iter().any(|entry| entry.identity == *selected));
+        Ok(ResponseValue::RunConfigurations { entries, selected })
+    }
+
+    fn selected_run_for_workspace(
+        &self,
+    ) -> Result<Option<RunConfigurationIdentity>, ProtocolError> {
+        let root = match self.workspace.root() {
+            Ok(root) => root,
+            Err(_) => return Ok(None),
+        };
+        let selections = read_run_selections(&self.run_selection_path()?)?;
+        Ok(selections
+            .get(&root.to_string_lossy().into_owned())
+            .cloned())
+    }
+
+    fn run_selection_path(&self) -> Result<PathBuf, ProtocolError> {
+        self.settings_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|parent| parent.join("run-selections.json"))
+            .ok_or_else(|| invalid("user configuration directory is unavailable"))
+    }
+
+    fn persist_run_selection(
+        &self,
+        selected: Option<RunConfigurationIdentity>,
+    ) -> Result<(), ProtocolError> {
+        let root = self.workspace.root().map_err(workspace_error)?;
+        let path = self.run_selection_path()?;
+        let mut selections = read_run_selections(&path)?;
+        let key = root.to_string_lossy().into_owned();
+        if let Some(selected) = selected {
+            selections.insert(key, selected);
+        } else {
+            selections.remove(&key);
+        }
+        write_run_selections(&path, &selections)
+    }
+
     fn new() -> Result<Self, String> {
         let mut platform = Platform::new();
         platform.initialize().map_err(|error| error.to_string())?;
@@ -904,6 +996,51 @@ impl DesktopBackend {
 
     fn method(&mut self, method: RequestMethod) -> Result<ResponseValue, ProtocolError> {
         match method {
+            RequestMethod::ListRunConfigurations => self.list_run_configurations(),
+            RequestMethod::SaveRunConfiguration {
+                scope,
+                configuration,
+            } => {
+                validate_run(&configuration).map_err(|error| invalid(error.to_string()))?;
+                let path = self.run_config_path(&scope)?;
+                let mut file = load_run_file(&path).map_err(|error| invalid(error.to_string()))?;
+                file.runs.retain(|run| run.id != configuration.id);
+                file.runs.push(configuration);
+                save_run_file(&path, &file).map_err(|error| invalid(error.to_string()))?;
+                Ok(ResponseValue::RunConfigurationChanged)
+            }
+            RequestMethod::DeleteRunConfiguration { scope, id } => {
+                let path = self.run_config_path(&scope)?;
+                let mut file = load_run_file(&path).map_err(|error| invalid(error.to_string()))?;
+                let before = file.runs.len();
+                file.runs.retain(|run| run.id != id);
+                if file.runs.len() == before {
+                    return Err(ProtocolError {
+                        code: ErrorCode::NotFound,
+                        message: "run configuration was not found".into(),
+                    });
+                }
+                save_run_file(&path, &file).map_err(|error| invalid(error.to_string()))?;
+                if self
+                    .selected_run_for_workspace()?
+                    .is_some_and(|selected| selected.source == scope && selected.id == id)
+                {
+                    self.persist_run_selection(None)?;
+                }
+                Ok(ResponseValue::RunConfigurationChanged)
+            }
+            RequestMethod::SelectRunConfiguration { source, owner, id } => {
+                let identity = RunConfigurationIdentity { source, owner, id };
+                let entries = self.run_configuration_entries()?;
+                if !entries.iter().any(|entry| entry.identity == identity) {
+                    return Err(ProtocolError {
+                        code: ErrorCode::NotFound,
+                        message: "run configuration was not found".into(),
+                    });
+                }
+                self.persist_run_selection(Some(identity))?;
+                Ok(ResponseValue::RunConfigurationChanged)
+            }
             RequestMethod::Ping => Ok(ResponseValue::Pong),
             RequestMethod::ListCommands => {
                 let mut ids = self
@@ -5206,6 +5343,50 @@ fn extension_settings_path() -> Option<PathBuf> {
         .then(|| base.join("koren/extension-settings.json"))
 }
 
+fn read_run_selections(
+    path: &Path,
+) -> Result<BTreeMap<String, RunConfigurationIdentity>, ProtocolError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(invalid(format!("{}: {error}", path.display()))),
+    };
+    serde_json::from_slice(&bytes).map_err(|error| invalid(format!("{}: {error}", path.display())))
+}
+
+fn write_run_selections(
+    path: &Path,
+    selections: &BTreeMap<String, RunConfigurationIdentity>,
+) -> Result<(), ProtocolError> {
+    use std::io::Write as _;
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("run selection path has no parent"))?;
+    std::fs::create_dir_all(parent).map_err(|error| invalid(error.to_string()))?;
+    let bytes = serde_json::to_vec(selections).map_err(|error| invalid(error.to_string()))?;
+    let temporary = parent.join(format!(
+        ".run-selections-{}-{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| invalid(error.to_string()))?
+            .as_nanos()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        output.write_all(&bytes)?;
+        output.sync_all()?;
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(|error| invalid(error.to_string()))
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct PersistedDesktopSettings {
     #[serde(default)]
@@ -5428,6 +5609,75 @@ mod tests {
         let reloaded = parse_desktop_settings(serde_json::to_value(&stored).unwrap());
         assert_eq!(reloaded.extension_settings, stored.extension_settings);
         assert_eq!(reloaded.inspection_profiles, stored.inspection_profiles);
+    }
+
+    #[test]
+    fn run_configuration_files_are_inert_and_malformed_files_are_reported() {
+        let temp = Temp::new();
+        let workspace = temp.0.join("workspace with spaces");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut backend = DesktopBackend::new().unwrap();
+        backend.settings_path = Some(temp.0.join("config/extension-settings.json"));
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: workspace.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        let configuration = koren_run::RunConfiguration {
+            id: "fixture".into(),
+            name: "Fixture".into(),
+            executable: Some("definitely-not-a-real-executable".into()),
+            tool: None,
+            args: vec!["${workspace}".into()],
+            cwd: "${workspace}".into(),
+            environment: BTreeMap::new(),
+            languages: Vec::new(),
+            output: koren_run::OutputDestination::Run,
+            save: koren_run::SavePolicy::Ask,
+            timeout_ms: None,
+            debug_adapter: None,
+        };
+        backend
+            .method(RequestMethod::SaveRunConfiguration {
+                scope: "workspace".into(),
+                configuration,
+            })
+            .unwrap();
+        assert!(matches!(
+            backend.method(RequestMethod::ListRunConfigurations).unwrap(),
+            ResponseValue::RunConfigurations { entries, .. } if entries.len() == 1
+        ));
+        backend
+            .method(RequestMethod::SelectRunConfiguration {
+                source: "workspace".into(),
+                owner: String::new(),
+                id: "fixture".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            backend.method(RequestMethod::ListRunConfigurations).unwrap(),
+            ResponseValue::RunConfigurations { selected: Some(selected), .. } if selected.id == "fixture"
+        ));
+        let mut restarted = DesktopBackend::new().unwrap();
+        restarted.settings_path = backend.settings_path.clone();
+        restarted
+            .method(RequestMethod::OpenWorkspace {
+                path: workspace.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            restarted.method(RequestMethod::ListRunConfigurations).unwrap(),
+            ResponseValue::RunConfigurations { selected: Some(selected), .. } if selected.id == "fixture"
+        ));
+        assert_eq!(backend.tasks.list().len(), 0);
+        let path = workspace.join(".koren/runs.toml");
+        fs::write(path, "schema = 1\n[[run]]\nid = 'broken'\n").unwrap();
+        assert!(
+            backend
+                .method(RequestMethod::ListRunConfigurations)
+                .is_err()
+        );
+        assert_eq!(backend.tasks.list().len(), 0);
     }
 
     #[test]

@@ -1238,6 +1238,7 @@ dependencies = [
  "koren-lua",
  "koren-projects",
  "koren-protocol",
+ "koren-run",
  "koren-search",
  "koren-tasks",
  "koren-terminal",
@@ -1354,6 +1355,7 @@ name = "koren-protocol"
 version = "0.1.0"
 dependencies = [
  "koren-debug",
+ "koren-run",
  "serde",
  "serde_json",
 ]

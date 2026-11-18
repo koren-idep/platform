@@ -11,7 +11,7 @@ use std::{
 };
 
 /// A persisted collection of configurations. Loading never executes a program.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunFile {
     /// Format version; currently one.
@@ -72,6 +72,11 @@ impl RunRegistry {
     pub fn remove_owner(&mut self, source: &RunSource, owner: &str) {
         self.definitions
             .retain(|key, _| &key.source != source || key.owner != owner);
+    }
+
+    /// Remove one definition, for an explicit user edit or deletion.
+    pub fn remove(&mut self, key: &RunId) -> Option<RunConfiguration> {
+        self.definitions.remove(key)
     }
 
     /// Look up a definition without granting permission to run it.
@@ -167,7 +172,7 @@ pub enum SavePolicy {
 }
 
 /// A reusable definition; its presence never authorizes execution.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunConfiguration {
     /// Stable ID within its owner and source.
@@ -567,7 +572,7 @@ mod tests {
         ));
         let path = directory.join(".koren/runs.toml");
         let missing = load_run_file(&path).unwrap();
-        assert!(missing.runs.is_empty());
+        assert_eq!(missing.runs.len(), 0);
         let file = RunFile {
             schema: 1,
             runs: vec![sample()],

@@ -64,6 +64,31 @@ pub enum ConflictDecision {
 pub enum RequestMethod {
     /// Check that the platform is responsive.
     Ping,
+    /// List inert run definitions and the selected owner-scoped ID.
+    ListRunConfigurations,
+    /// Create or update an editable user or workspace run definition.
+    SaveRunConfiguration {
+        /// `user` or `workspace`.
+        scope: String,
+        /// Validated definition to store.
+        configuration: koren_run::RunConfiguration,
+    },
+    /// Delete an editable user or workspace run definition.
+    DeleteRunConfiguration {
+        /// `user` or `workspace`.
+        scope: String,
+        /// Definition ID.
+        id: String,
+    },
+    /// Persist the selected source and ID for the active workspace.
+    SelectRunConfiguration {
+        /// `user`, `workspace`, `project`, or `extension`.
+        source: String,
+        /// Owning provider or extension, empty for editable definitions.
+        owner: String,
+        /// Definition ID.
+        id: String,
+    },
     /// Enumerate commands registered by the host.
     ListCommands,
     /// Invoke a registered command without arguments.
@@ -798,12 +823,43 @@ pub struct SearchProgress {
     pub current_path: Option<String>,
 }
 
+/// Owner-scoped identity of one inert run configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RunConfigurationIdentity {
+    /// `user`, `workspace`, `project`, or `extension`.
+    pub source: String,
+    /// Provider or extension identity, empty for editable definitions.
+    pub owner: String,
+    /// Stable definition ID.
+    pub id: String,
+}
+
+/// Run configuration and whether it can be edited by the user.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RunConfigurationSummary {
+    /// Owner-scoped identity.
+    pub identity: RunConfigurationIdentity,
+    /// Inert definition.
+    pub configuration: koren_run::RunConfiguration,
+    /// Provider and extension contributions must be duplicated before editing.
+    pub editable: bool,
+}
+
 /// Typed successful response values.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ResponseValue {
     /// Ping response.
     Pong,
+    /// Registered run definitions and selected ID, without authorization to start one.
+    RunConfigurations {
+        /// Entries ordered by owner-scoped ID.
+        entries: Vec<RunConfigurationSummary>,
+        /// Current workspace selection, if any.
+        selected: Option<RunConfigurationIdentity>,
+    },
+    /// One editable run definition was stored or deleted.
+    RunConfigurationChanged,
     /// Available command identifiers.
     Commands(Vec<String>),
     /// Text returned by a command.
