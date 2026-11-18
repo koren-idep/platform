@@ -1359,6 +1359,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "koren-run"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "koren-search"
 version = "0.1.0"
 dependencies = [

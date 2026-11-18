@@ -17,6 +17,7 @@ members = [
     "crates/koren-projects",
     "crates/koren-tasks",
     "crates/koren-cargo",
+    "crates/koren-run",
     "apps/koren-headless",
     "apps/koren-code",
 ]
@@ -60,6 +61,7 @@ koren-documents = { path = "crates/koren-documents" }
 koren-projects = { path = "crates/koren-projects" }
 koren-tasks = { path = "crates/koren-tasks" }
 koren-cargo = { path = "crates/koren-cargo" }
+koren-run = { path = "crates/koren-run" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
