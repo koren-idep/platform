@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { filterCommands, nextCommandSelection } from './commands';
-import { DEFAULT_LAYOUT, fitLayoutToViewport, persistLayout, readLayout } from './layout';
+import { DEFAULT_LAYOUT, fitLayoutToViewport, persistLayout, readLayout, sidebarContentId } from './layout';
 import { persistSession, readSession } from './session';
 import { formatCursorPosition, lineEndingFor } from './status';
 import { workbenchMarkup } from '../workbench-v2/shell';
 
 describe('desktop presentation helpers', () => {
+  it('shows one sidebar view at a time', () => {
+    expect((['files', 'search', 'git', 'extensions'] as const).map(sidebarContentId))
+      .toEqual(['tree', 'search', 'source-control', 'sidebar-extensions']);
+  });
   it('starts a fresh layout with the bottom tool window collapsed', () => {
     expect(readLayout({ getItem: () => null }).bottomCollapsed).toBe(true);
     expect(DEFAULT_LAYOUT.explorerWidth).toBe(380);

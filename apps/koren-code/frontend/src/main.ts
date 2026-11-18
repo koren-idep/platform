@@ -10,7 +10,7 @@ import type { SearchMatch } from './services/protocol';
 import { approvalChoice, conflictChoice } from './app/dialogs';
 import { commandShortcutMatches, filterCommands, nextCommandSelection } from './app/commands';
 import { activePanelLayout, diagnosticDetailMatches, extensionMenusAt, safeThemeVariables, validExtensionSettingValue } from './app/extensions';
-import { readLayout, persistLayout, fitLayoutToViewport, type LayoutPreferences } from './app/layout';
+import { readLayout, persistLayout, fitLayoutToViewport, sidebarContentId, type LayoutPreferences } from './app/layout';
 import { persistSession, readSession } from './app/session';
 import { canRestoreInPlace } from './app/recovery';
 import { formatCursorPosition, lineEndingFor } from './app/status';
@@ -353,8 +353,9 @@ function setSecondaryCollapsed(collapsed: boolean): void {
 }
 
 function renderSidebarView(view: LayoutPreferences['primaryView']): void {
+  const visibleId = sidebarContentId(view);
   for (const id of ['tree', 'search', 'source-control', 'sidebar-extensions']) {
-    document.querySelector(`#${id}`)?.classList.toggle('hidden', id !== 'tree' && id !== (view === 'git' ? 'source-control' : view === 'extensions' ? 'sidebar-extensions' : view));
+    document.querySelector(`#${id}`)?.classList.toggle('hidden', id !== visibleId);
   }
   for (const button of document.querySelectorAll<HTMLButtonElement>('[data-sidebar-view]')) {
     const selected = button.dataset.sidebarView === view;

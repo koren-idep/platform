@@ -18,6 +18,10 @@ export const DEFAULT_LAYOUT: Readonly<LayoutPreferences> = {
   secondaryCollapsed: true,
 };
 
+export function sidebarContentId(view: LayoutPreferences['primaryView']): string {
+  return view === 'files' ? 'tree' : view === 'git' ? 'source-control' : view === 'extensions' ? 'sidebar-extensions' : 'search';
+}
+
 const KEY = 'koren-code:layout';
 
 export function readLayout(storage: Pick<Storage, 'getItem'>): LayoutPreferences {
