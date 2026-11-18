@@ -1,0 +1,104 @@
+schema_version = 1
+id = "org.koren.lua"
+name = "Lua, LuaJIT & Luau"
+publisher = "Koren"
+version = "0.1.0"
+description = "Lua, LuaJIT, and Luau language support via LuaLS, Luau LSP, Lua, LuaJIT, and Lune."
+entry_point = "main.lua"
+api_version = "1.0.0"
+capabilities = ["language_definitions", "language_server", "run_configurations", "tools"]
+
+[[languages]]
+id = "lua"
+name = "Lua"
+extensions = ["lua"]
+
+[[languages]]
+id = "luajit"
+name = "LuaJIT"
+extensions = ["lj"]
+
+[[languages]]
+id = "luau"
+name = "Luau"
+extensions = ["luau"]
+
+[[tools]]
+id = "lua-language-server"
+name = "LuaLS"
+description = "Lua and LuaJIT Language Server"
+category = "language-server"
+optional = true
+executables = ["lua-language-server"]
+
+[[tools]]
+id = "luau-lsp"
+name = "Luau LSP"
+description = "Luau Language Server"
+category = "language-server"
+optional = true
+executables = ["luau-lsp"]
+
+[[tools]]
+id = "lua"
+name = "Lua Interpreter"
+description = "Standard Lua runtime"
+category = "runtime"
+optional = true
+executables = ["lua", "lua5.4", "lua5.3", "lua5.1"]
+
+[[tools]]
+id = "luajit"
+name = "LuaJIT"
+description = "Just-In-Time Lua runtime"
+category = "runtime"
+optional = true
+executables = ["luajit"]
+
+[[tools]]
+id = "lune"
+name = "Lune"
+description = "Standalone Luau runtime"
+category = "runtime"
+optional = true
+executables = ["lune"]
+
+[[language_servers]]
+id = "luals"
+command = "tool:lua-language-server"
+languages = ["lua", "luajit"]
+file_extensions = ["lua", "lj"]
+
+[[language_servers]]
+id = "luau-lsp"
+command = "tool:luau-lsp"
+arguments = ["lsp"]
+languages = ["luau"]
+file_extensions = ["luau"]
+
+[[run_configurations]]
+id = "run-lua"
+name = "Run Lua"
+tool = "lua"
+arguments = ["${file}"]
+working_directory = "${workspace}"
+languages = ["lua"]
+output = "run"
+
+[[run_configurations]]
+id = "run-luajit"
+name = "Run LuaJIT"
+tool = "luajit"
+arguments = ["${file}"]
+working_directory = "${workspace}"
+languages = ["lua", "luajit"]
+output = "run"
+
+[[run_configurations]]
+id = "run-lune"
+name = "Run Luau (Lune)"
+tool = "lune"
+arguments = ["run", "${file}"]
+working_directory = "${workspace}"
+languages = ["luau"]
+output = "run"

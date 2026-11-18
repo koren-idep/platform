@@ -1,0 +1,34 @@
+schema_version = 1
+id = "org.koren.json"
+name = "JSON & JSONC"
+publisher = "Koren"
+version = "0.1.0"
+description = "JSON and JSON with Comments language support."
+entry_point = "main.lua"
+api_version = "1.0.0"
+capabilities = ["language_definitions", "language_server", "tools"]
+
+[[languages]]
+id = "json"
+name = "JSON"
+extensions = ["json"]
+
+[[languages]]
+id = "jsonc"
+name = "JSONC"
+extensions = ["jsonc"]
+
+[[tools]]
+id = "vscode-json-language-server"
+name = "JSON Language Server"
+description = "JSON and JSONC language server"
+category = "language-server"
+optional = true
+executables = ["vscode-json-language-server", "json-language-server"]
+
+[[language_servers]]
+id = "json-lsp"
+command = "tool:vscode-json-language-server"
+arguments = ["--stdio"]
+languages = ["json", "jsonc"]
+file_extensions = ["json", "jsonc"]

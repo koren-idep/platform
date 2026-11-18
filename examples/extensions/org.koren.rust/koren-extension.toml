@@ -1,0 +1,72 @@
+schema_version = 1
+id = "org.koren.rust"
+name = "Rust"
+publisher = "Koren"
+version = "0.1.0"
+description = "Rust language support via rust-analyzer and Cargo."
+entry_point = "main.lua"
+api_version = "1.0.0"
+capabilities = ["language_definitions", "language_server", "run_configurations", "tools"]
+
+[[languages]]
+id = "rust"
+name = "Rust"
+extensions = ["rs"]
+
+[[tools]]
+id = "rust-analyzer"
+name = "rust-analyzer"
+description = "Rust Language Server"
+category = "language-server"
+optional = true
+executables = ["rust-analyzer"]
+
+[[tools]]
+id = "cargo"
+name = "Cargo"
+description = "Rust build system and package manager"
+category = "build-tool"
+optional = true
+executables = ["cargo"]
+
+[[language_servers]]
+id = "rust-analyzer"
+command = "tool:rust-analyzer"
+languages = ["rust"]
+file_extensions = ["rs"]
+
+[[run_configurations]]
+id = "cargo-check"
+name = "Cargo Check"
+tool = "cargo"
+arguments = ["check"]
+working_directory = "${workspace}"
+languages = ["rust"]
+output = "run"
+
+[[run_configurations]]
+id = "cargo-build"
+name = "Cargo Build"
+tool = "cargo"
+arguments = ["build"]
+working_directory = "${workspace}"
+languages = ["rust"]
+output = "run"
+
+[[run_configurations]]
+id = "cargo-test"
+name = "Cargo Test"
+tool = "cargo"
+arguments = ["test"]
+working_directory = "${workspace}"
+languages = ["rust"]
+output = "run"
+
+[[run_configurations]]
+id = "cargo-run"
+name = "Cargo Run"
+tool = "cargo"
+arguments = ["run"]
+working_directory = "${workspace}"
+languages = ["rust"]
+output = "run"
