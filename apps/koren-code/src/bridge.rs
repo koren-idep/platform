@@ -2346,6 +2346,11 @@ impl DesktopBackend {
             .debugger
             .authorization_details(&configuration_id)
             .map_err(debug_error)?;
+        if let Some(tool_id) = details.adapter.command.strip_prefix("tool:") {
+            return Err(invalid(format!(
+                "debug adapter requires external tool '{tool_id}', which is not configured"
+            )));
+        }
         self.next_debug_approval_id = self
             .next_debug_approval_id
             .checked_add(1)
@@ -2464,11 +2469,21 @@ impl DesktopBackend {
                     ));
                 }
                 if !adapter_is_registered {
+                    let ws_key = workspace.as_ref().map(|p| p.to_string_lossy().into_owned());
+                    let resolved_command =
+                        if let Some(tool_id) = adapter.command.strip_prefix("tool:") {
+                            self.tools
+                                .resolve(tool_id, None, ws_key.as_deref())
+                                .map(|res| res.executable_path.to_string_lossy().into_owned())
+                                .unwrap_or_else(|_| adapter.command.clone())
+                        } else {
+                            adapter.command.clone()
+                        };
                     self.debugger
                         .register_adapter(DebugAdapterDefinition {
                             id: qualified_id.clone(),
                             name: adapter.name.clone(),
-                            command: adapter.command.clone(),
+                            command: resolved_command,
                             arguments: adapter.arguments.clone(),
                             working_directory,
                             environment: adapter.environment.clone(),
