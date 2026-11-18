@@ -54,7 +54,7 @@ use koren_tasks::{
 };
 use koren_terminal::{
     MAX_TERMINAL_INPUT_BYTES, TerminalApprovalDetails, TerminalEvent, TerminalId, TerminalManager,
-    TerminalSessionInfo,
+    TerminalProfile, TerminalSessionInfo, TerminalWorkingDirectory,
 };
 use koren_workspace::{EntryKind, WorkspaceManager};
 use serde::{Deserialize, Serialize};
@@ -482,6 +482,80 @@ impl DesktopBackend {
                     }),
             );
         }
+        for (_, task) in self.tasks.list() {
+            let Some(project_id) = task.project_id else {
+                continue;
+            };
+            if task.key == "cargo.metadata" {
+                continue;
+            }
+            let Ok(project) = self.projects.info(ProjectId::from_raw(project_id)) else {
+                continue;
+            };
+            let owner = format!("{}:{}", project.provider_id.as_str(), project.id.get());
+            entries.push(RunConfigurationSummary {
+                identity: RunConfigurationIdentity {
+                    source: "project".into(),
+                    owner,
+                    id: task.key.clone(),
+                },
+                configuration: koren_run::RunConfiguration {
+                    id: task.key.clone(),
+                    name: task.display_name.clone(),
+                    executable: Some(task.executable.to_string_lossy().into_owned()),
+                    tool: None,
+                    args: task.arguments.clone(),
+                    cwd: task.working_directory.to_string_lossy().into_owned(),
+                    environment: task.environment.clone(),
+                    languages: Vec::new(),
+                    output: OutputDestination::Run,
+                    save: SavePolicy::Ask,
+                    timeout_ms: task
+                        .timeout
+                        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+                    debug_adapter: None,
+                },
+                editable: false,
+            });
+        }
+        for summary in self.extensions.list() {
+            let Ok(contributions) = self.extensions.contributions(&summary.id) else {
+                continue;
+            };
+            for item in &contributions.run_configurations {
+                let output = match item.output.as_str() {
+                    "terminal" => OutputDestination::Terminal,
+                    _ => OutputDestination::Run,
+                };
+                let save = match item.save.as_str() {
+                    "save" => SavePolicy::Save,
+                    "disk" => SavePolicy::Disk,
+                    _ => SavePolicy::Ask,
+                };
+                entries.push(RunConfigurationSummary {
+                    identity: RunConfigurationIdentity {
+                        source: "extension".into(),
+                        owner: summary.id.clone(),
+                        id: item.id.clone(),
+                    },
+                    configuration: koren_run::RunConfiguration {
+                        id: item.id.clone(),
+                        name: item.name.clone(),
+                        executable: item.executable.clone(),
+                        tool: item.tool.clone(),
+                        args: item.arguments.clone(),
+                        cwd: item.working_directory.clone(),
+                        environment: item.environment.clone(),
+                        languages: item.languages.clone(),
+                        output,
+                        save,
+                        timeout_ms: item.timeout_ms,
+                        debug_adapter: item.debug_adapter.clone(),
+                    },
+                    editable: false,
+                });
+            }
+        }
         Ok(entries)
     }
 
@@ -548,11 +622,6 @@ impl DesktopBackend {
                 code: ErrorCode::NotFound,
                 message: "run configuration was not found".into(),
             })?;
-        if for_execution && entry.configuration.output != OutputDestination::Run {
-            return Err(invalid(
-                "interactive run configurations require terminal support",
-            ));
-        }
         let workspace = self
             .workspace
             .root()
@@ -641,6 +710,25 @@ impl DesktopBackend {
             .root()
             .map_err(workspace_error)?
             .to_path_buf();
+        if configuration.output == OutputDestination::Terminal {
+            self.next_ephemeral_task = self
+                .next_ephemeral_task
+                .checked_add(1)
+                .ok_or_else(|| invalid("run identity space exhausted"))?;
+            let profile = TerminalProfile {
+                id: format!(
+                    "run:{}:{}:{}:{}",
+                    identity.source, identity.owner, identity.id, self.next_ephemeral_task
+                ),
+                name: configuration.name,
+                executable: PathBuf::from(resolved.executable),
+                arguments: resolved.args,
+                working_directory: TerminalWorkingDirectory::Fixed(resolved.cwd),
+                environment: resolved.environment,
+                fallback_executable: None,
+            };
+            return self.queue_terminal_approval(Some(profile), Some(root));
+        }
         self.next_ephemeral_task = self
             .next_ephemeral_task
             .checked_add(1)
@@ -2443,6 +2531,15 @@ impl DesktopBackend {
     }
 
     fn request_terminal_start(&mut self) -> Result<ResponseValue, ProtocolError> {
+        let workspace = self.workspace.root().ok().map(Path::to_path_buf);
+        self.queue_terminal_approval(None, workspace)
+    }
+
+    fn queue_terminal_approval(
+        &mut self,
+        custom_profile: Option<TerminalProfile>,
+        workspace: Option<PathBuf>,
+    ) -> Result<ResponseValue, ProtocolError> {
         let now = Instant::now();
         let expired = self
             .terminal_approvals
@@ -2457,11 +2554,16 @@ impl DesktopBackend {
         if self.terminal_approvals.len() >= 16 {
             return Err(invalid("too many pending terminal approvals"));
         }
-        let workspace = self.workspace.root().ok().map(Path::to_path_buf);
-        let created = self
-            .terminals
-            .create_session("default", workspace.as_deref(), None, 24, 80)
-            .map_err(terminal_error)?;
+        let created = match custom_profile {
+            Some(profile) => self
+                .terminals
+                .create_session_with_profile(profile, workspace.as_deref(), None, 24, 80)
+                .map_err(terminal_error)?,
+            None => self
+                .terminals
+                .create_session("default", workspace.as_deref(), None, 24, 80)
+                .map_err(terminal_error)?,
+        };
         let details = self
             .terminals
             .approval_details(created.id)
@@ -5974,15 +6076,15 @@ mod tests {
             .method(RequestMethod::SaveRunConfiguration {
                 scope: "workspace".into(),
                 configuration: koren_run::RunConfiguration {
-                    id: "terminal".into(),
-                    name: "Terminal".into(),
-                    executable: Some("echo".into()),
-                    tool: None,
+                    id: "unresolved-tool".into(),
+                    name: "Unresolved Tool".into(),
+                    executable: None,
+                    tool: Some("missing-tool".into()),
                     args: vec![],
                     cwd: "${workspace}".into(),
                     environment: BTreeMap::new(),
                     languages: vec![],
-                    output: OutputDestination::Terminal,
+                    output: OutputDestination::Run,
                     save: SavePolicy::Save,
                     timeout_ms: None,
                     debug_adapter: None,
@@ -5995,7 +6097,7 @@ mod tests {
                     identity: RunConfigurationIdentity {
                         source: "workspace".into(),
                         owner: String::new(),
-                        id: "terminal".into(),
+                        id: "unresolved-tool".into(),
                     },
                     file_document_id: Some(document_id),
                     dirty_action: None,
@@ -6105,6 +6207,244 @@ mod tests {
         assert_eq!(
             fs::read_to_string(workspace.join("hello.txt")).unwrap(),
             "hello"
+        );
+    }
+
+    #[test]
+    fn terminal_run_configuration_requires_approval_with_resolved_command() {
+        let temp = Temp::new();
+        let workspace = temp.0.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("script.lua"), "print('hi')\n").unwrap();
+
+        let mut backend = DesktopBackend::new().unwrap();
+        backend.settings_path = Some(temp.0.join("config/extension-settings.json"));
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: workspace.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        let doc_id = match backend
+            .method(RequestMethod::OpenDocument {
+                path: "script.lua".into(),
+            })
+            .unwrap()
+        {
+            ResponseValue::DocumentOpened { document_id, .. } => document_id,
+            other => panic!("unexpected document response: {other:?}"),
+        };
+        let mut environment = BTreeMap::new();
+        environment.insert("SECRET_KEY".into(), "secret-value".into());
+        let configuration = koren_run::RunConfiguration {
+            id: "interactive-lua".into(),
+            name: "Interactive Lua".into(),
+            executable: Some("lua5.4".into()),
+            tool: None,
+            args: vec!["${file}".into()],
+            cwd: "${workspace}".into(),
+            environment,
+            languages: vec!["lua".into()],
+            output: OutputDestination::Terminal,
+            save: SavePolicy::Ask,
+            timeout_ms: None,
+            debug_adapter: None,
+        };
+        backend
+            .method(RequestMethod::SaveRunConfiguration {
+                scope: "workspace".into(),
+                configuration,
+            })
+            .unwrap();
+        let identity = RunConfigurationIdentity {
+            source: "workspace".into(),
+            owner: String::new(),
+            id: "interactive-lua".into(),
+        };
+        let approval = match backend
+            .method(RequestMethod::RequestRunConfiguration {
+                identity,
+                file_document_id: Some(doc_id),
+                dirty_action: None,
+            })
+            .unwrap()
+        {
+            ResponseValue::TerminalApprovalRequired(summary) => summary,
+            other => panic!("expected terminal approval, got {other:?}"),
+        };
+        assert_eq!(approval.executable, "lua5.4");
+        assert_eq!(
+            approval.arguments,
+            vec![workspace.join("script.lua").to_string_lossy().into_owned()]
+        );
+        assert_eq!(
+            approval.working_directory,
+            workspace.to_string_lossy().into_owned()
+        );
+        assert_eq!(approval.environment_keys, vec!["SECRET_KEY".to_string()]);
+        let sessions = backend.terminals.sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].state, koren_terminal::TerminalState::Created);
+        backend
+            .method(RequestMethod::DenyTerminalStart {
+                request_id: approval.request_id,
+            })
+            .unwrap();
+        assert!(backend.terminals.sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_tasks_are_exposed_as_run_configurations_and_require_approval() {
+        let temp = Temp::new();
+        let workspace = temp.0.join("workspace");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let mut backend = DesktopBackend::new().unwrap();
+        backend.settings_path = Some(temp.0.join("config/extension-settings.json"));
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: workspace.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        backend
+            .method(RequestMethod::DiscoverCargoProjects {
+                max_directories: 100,
+                max_projects: 10,
+                max_depth: 4,
+            })
+            .unwrap();
+
+        let entries = match backend
+            .method(RequestMethod::ListRunConfigurations)
+            .unwrap()
+        {
+            ResponseValue::RunConfigurations { entries, .. } => entries,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        let cargo_check = entries
+            .iter()
+            .find(|entry| {
+                entry.identity.source == "project"
+                    && entry.identity.id == "cargo.package.demo.check"
+            })
+            .expect("cargo check run configuration");
+        assert!(!cargo_check.editable);
+        assert!(entries.iter().any(|entry| {
+            entry.identity.source == "project" && entry.identity.id == "cargo.package.demo.clippy"
+        }));
+
+        let approval = match backend
+            .method(RequestMethod::RequestRunConfiguration {
+                identity: cargo_check.identity.clone(),
+                file_document_id: None,
+                dirty_action: None,
+            })
+            .unwrap()
+        {
+            ResponseValue::ApprovalRequired(approval) => approval,
+            other => panic!("expected approval required, got {other:?}"),
+        };
+        assert_eq!(approval.executable, "cargo");
+        backend
+            .method(RequestMethod::DenyTaskExecution {
+                request_id: approval.request_id,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn extension_run_configurations_are_exposed_and_cleaned_up_on_disable() {
+        let temp = Temp::new();
+        let workspace = temp.0.join("workspace");
+        let extension_root = temp.0.join("extensions");
+        let extension = extension_root.join("org.example.runner");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&extension).unwrap();
+        fs::write(
+            extension.join("main.lua"),
+            r#"
+                local m = {}
+                function m.activate()
+                    koren.run.register({
+                        id = "lua.run",
+                        name = "Run Lua",
+                        executable = "lua5.4",
+                        args = { "${file}" },
+                        cwd = "${workspace}",
+                        languages = { "lua" },
+                    })
+                end
+                return m
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            extension.join("koren-extension.toml"),
+            "schema_version=1\nid='org.example.runner'\nname='Runner'\npublisher='Koren tests'\nversion='0.1.0'\ndescription='Run fixture'\nentry_point='main.lua'\napi_version='1.0.0'\ncapabilities=['run_configurations']\n",
+        )
+        .unwrap();
+
+        let mut backend = DesktopBackend::new().unwrap();
+        backend.settings_path = Some(temp.0.join("config/extension-settings.json"));
+        backend.extension_root = Some(extension_root);
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: workspace.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        backend.method(RequestMethod::ListExtensions).unwrap();
+        backend
+            .method(RequestMethod::SetExtensionEnabled {
+                extension_id: "org.example.runner".into(),
+                enabled: true,
+            })
+            .unwrap();
+        backend
+            .method(RequestMethod::ActivateExtension {
+                extension_id: "org.example.runner".into(),
+            })
+            .unwrap();
+
+        let entries = match backend
+            .method(RequestMethod::ListRunConfigurations)
+            .unwrap()
+        {
+            ResponseValue::RunConfigurations { entries, .. } => entries,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        let ext_run = entries
+            .iter()
+            .find(|entry| {
+                entry.identity.source == "extension"
+                    && entry.identity.owner == "org.example.runner"
+                    && entry.identity.id == "org.example.runner.lua.run"
+            })
+            .expect("extension run configuration");
+        assert!(!ext_run.editable);
+
+        backend
+            .method(RequestMethod::SetExtensionEnabled {
+                extension_id: "org.example.runner".into(),
+                enabled: false,
+            })
+            .unwrap();
+
+        let after_disable = match backend
+            .method(RequestMethod::ListRunConfigurations)
+            .unwrap()
+        {
+            ResponseValue::RunConfigurations { entries, .. } => entries,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            !after_disable
+                .iter()
+                .any(|entry| entry.identity.owner == "org.example.runner")
         );
     }
 
