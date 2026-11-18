@@ -1,0 +1,21 @@
+[package]
+name = "koren-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GPU-accelerated declarative native Rust UI framework for Koren IDE Platform"
+
+[dependencies]
+wgpu = "27.0.1"
+winit = "0.30.13"
+taffy = "0.9.0"
+cosmic-text = "0.14.2"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+pollster = "0.4.0"
+arboard = "3.7.0"
+accesskit = "0.24.1"
+unicode-segmentation = "1.13.3"
+
+[lints]
+workspace = true
