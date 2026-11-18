@@ -56,6 +56,9 @@ use koren_terminal::{
     MAX_TERMINAL_INPUT_BYTES, TerminalApprovalDetails, TerminalEvent, TerminalId, TerminalManager,
     TerminalProfile, TerminalSessionInfo, TerminalWorkingDirectory,
 };
+use koren_tools::{
+    ToolArch, ToolCategory, ToolDeclaration, ToolManager, ToolPlatform, ToolTrustPolicy,
+};
 use koren_workspace::{EntryKind, WorkspaceManager};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -344,6 +347,7 @@ struct DesktopBackend {
     known_debug_extension_profiles: BTreeSet<String>,
     known_debug_extension_adapters: BTreeSet<String>,
     extensions: ExtensionManager,
+    tools: ToolManager,
     inspections: InspectionService,
     inspection_profiles: InspectionProfiles,
     settings_path: Option<PathBuf>,
@@ -447,6 +451,35 @@ fn executable_exists(executable: &str) -> bool {
         return false;
     };
     std::env::split_paths(&path_env).any(|dir| dir.join(executable).is_file())
+}
+
+fn parse_tool_category(raw: &str) -> ToolCategory {
+    match raw {
+        "language-server" => ToolCategory::LanguageServer,
+        "runtime" => ToolCategory::Runtime,
+        "compiler" => ToolCategory::Compiler,
+        "formatter" => ToolCategory::Formatter,
+        "linter" => ToolCategory::Linter,
+        "debugger" => ToolCategory::Debugger,
+        _ => ToolCategory::BuildTool,
+    }
+}
+
+fn parse_tool_platform(raw: &str) -> Option<ToolPlatform> {
+    match raw {
+        "linux" => Some(ToolPlatform::Linux),
+        "mac_os" | "macos" => Some(ToolPlatform::MacOs),
+        "windows" => Some(ToolPlatform::Windows),
+        _ => None,
+    }
+}
+
+fn parse_tool_arch(raw: &str) -> Option<ToolArch> {
+    match raw {
+        "x86_64" | "x64" => Some(ToolArch::X86_64),
+        "aarch64" | "arm64" => Some(ToolArch::Aarch64),
+        _ => None,
+    }
 }
 
 impl DesktopBackend {
@@ -653,8 +686,19 @@ impl DesktopBackend {
         } else {
             None
         };
+        let mut config_for_resolve = entry.configuration.clone();
+        if let Some(ref tool_id) = entry.configuration.tool {
+            let ws_key = workspace.to_string_lossy();
+            let resolved_tool = self
+                .tools
+                .resolve(tool_id, None, Some(&ws_key))
+                .map_err(|error| invalid(error.to_string()))?;
+            config_for_resolve.executable =
+                Some(resolved_tool.executable_path.to_string_lossy().into_owned());
+            config_for_resolve.tool = None;
+        }
         let resolved = resolve_run(
-            &entry.configuration,
+            &config_for_resolve,
             &RunContext {
                 workspace: &workspace,
                 file: file.as_deref(),
@@ -868,6 +912,12 @@ impl DesktopBackend {
                 .select(None, "Default")
                 .map_err(|error| error.to_string())?;
         }
+        let tools_root = dirs::data_local_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("koren")
+            .join("tools");
+        let tools =
+            ToolManager::new(tools_root, ToolTrustPolicy::default()).map_err(|e| e.to_string())?;
         Ok(Self {
             platform,
             commands,
@@ -889,6 +939,7 @@ impl DesktopBackend {
             known_debug_extension_profiles: BTreeSet::new(),
             known_debug_extension_adapters: BTreeSet::new(),
             extensions: ExtensionManager::new(),
+            tools,
             inspections: InspectionService::default(),
             inspection_profiles,
             settings_path,
@@ -3467,6 +3518,7 @@ impl DesktopBackend {
                 .retain(|_, pending| pending.extension_id != id);
             self.updated_panel_text
                 .retain(|panel_id, _| !panel_id.starts_with(&format!("{id}.")));
+            self.tools.unregister_owner(id);
             self.extensions.disable(id).map_err(extension_error)?;
         }
         let summary = self
@@ -3480,8 +3532,35 @@ impl DesktopBackend {
 
     fn activate_extension(&mut self, id: &str) -> Result<ResponseValue, ProtocolError> {
         self.ensure_extensions_discovered()?;
-        let (_, path) = self.extensions.manifest(id).map_err(extension_error)?;
+        let (manifest_ref, path) = self.extensions.manifest(id).map_err(extension_error)?;
         let path = path.to_path_buf();
+        let manifest_tools = manifest_ref.tools.clone();
+        for tool in &manifest_tools {
+            let decl = ToolDeclaration {
+                id: tool.id.clone(),
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                category: parse_tool_category(&tool.category),
+                optional: tool.optional,
+                executables: tool.executables.clone(),
+                discovery_hints: tool.discovery_hints.clone(),
+                platforms: tool
+                    .platforms
+                    .iter()
+                    .filter_map(|p| parse_tool_platform(p))
+                    .collect(),
+                architectures: tool
+                    .architectures
+                    .iter()
+                    .filter_map(|a| parse_tool_arch(a))
+                    .collect(),
+                version_requirement: tool.version_requirement.clone(),
+                releases: Vec::new(),
+            };
+            self.tools
+                .register_declaration(id, decl)
+                .map_err(|e| invalid(e.to_string()))?;
+        }
         let context = self.lua_context();
         let mut runtime = None;
         self.extensions
@@ -3597,10 +3676,24 @@ impl DesktopBackend {
                 revision: snapshot.info.revision,
                 contents: snapshot.text,
             });
+        let workspace_root = self.workspace.root().ok().map(Path::to_path_buf);
+        let ws_key = workspace_root
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let mut resolved_tools = BTreeMap::new();
+        for (decl, _) in self.tools.declarations() {
+            if let Ok(resolved) = self.tools.resolve(&decl.id, None, ws_key.as_deref()) {
+                resolved_tools.insert(
+                    decl.id.clone(),
+                    resolved.executable_path.to_string_lossy().into_owned(),
+                );
+            }
+        }
         LuaHostContext {
-            workspace_root: self.workspace.root().ok().map(Path::to_path_buf),
+            workspace_root,
             active_document,
             settings: self.effective_extension_settings(),
+            resolved_tools,
         }
     }
 
@@ -3789,9 +3882,20 @@ impl DesktopBackend {
                     "language-server configuration '{configuration_id}' was not found"
                 ))
             })?;
+        let resolved_command = if let Some(tool_id) = server.command.strip_prefix("tool:") {
+            let ws_key = workspace_root.to_string_lossy();
+            self.tools
+                .resolve(tool_id, None, Some(&ws_key))
+                .map_err(|error| invalid(error.to_string()))?
+                .executable_path
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            server.command.clone()
+        };
         let configuration = ServerConfig {
             id: format!("{extension_id}.{configuration_id}"),
-            command: server.command.clone(),
+            command: resolved_command,
             arguments: server.arguments.clone(),
             workspace_root,
             environment: server.environment.clone(),
@@ -6465,6 +6569,139 @@ mod tests {
                 .iter()
                 .any(|entry| entry.identity.owner == "org.example.runner")
         );
+    }
+
+    #[test]
+    fn extension_tools_resolve_in_run_and_lsp_and_clean_up_on_disable() {
+        let temp = Temp::new();
+        let workspace = temp.0.join("workspace");
+        let extension_root = temp.0.join("extensions");
+        let extension = extension_root.join("org.example.tooling");
+        let tool_bin = temp.0.join("bin/demo-tool");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&extension).unwrap();
+        fs::create_dir_all(tool_bin.parent().unwrap()).unwrap();
+        fs::write(&tool_bin, "#!/bin/sh\necho ok\n").unwrap();
+        fs::write(extension.join("main.lua"), "return {}\n").unwrap();
+        fs::write(
+            extension.join("koren-extension.toml"),
+            r#"
+schema_version = 1
+id = "org.example.tooling"
+name = "Tooling"
+publisher = "Koren tests"
+version = "0.1.0"
+description = "Tool fixture"
+entry_point = "main.lua"
+api_version = "1.0.0"
+capabilities = ["tools", "language_server", "run_configurations"]
+
+[[tools]]
+id = "demo-tool"
+name = "Demo Tool"
+category = "runtime"
+optional = true
+executables = ["demo-tool"]
+
+[[language_servers]]
+id = "demo-lsp"
+command = "tool:demo-tool"
+languages = ["demo"]
+"#,
+        )
+        .unwrap();
+
+        let mut backend = DesktopBackend::new().unwrap();
+        backend.settings_path = Some(temp.0.join("config/extension-settings.json"));
+        backend.extension_root = Some(extension_root);
+        backend
+            .tools
+            .select_manual("demo-tool", tool_bin.clone(), None)
+            .unwrap();
+        backend
+            .method(RequestMethod::OpenWorkspace {
+                path: workspace.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        backend.method(RequestMethod::ListExtensions).unwrap();
+        backend
+            .method(RequestMethod::SetExtensionEnabled {
+                extension_id: "org.example.tooling".into(),
+                enabled: true,
+            })
+            .unwrap();
+        backend
+            .method(RequestMethod::ActivateExtension {
+                extension_id: "org.example.tooling".into(),
+            })
+            .unwrap();
+        assert_eq!(backend.tools.declarations().len(), 1);
+
+        backend
+            .method(RequestMethod::SaveRunConfiguration {
+                scope: "workspace".into(),
+                configuration: koren_run::RunConfiguration {
+                    id: "use-demo-tool".into(),
+                    name: "Use Demo Tool".into(),
+                    executable: None,
+                    tool: Some("demo-tool".into()),
+                    args: vec!["--version".into()],
+                    cwd: "${workspace}".into(),
+                    environment: BTreeMap::new(),
+                    languages: Vec::new(),
+                    output: OutputDestination::Run,
+                    save: SavePolicy::Ask,
+                    timeout_ms: None,
+                    debug_adapter: None,
+                },
+            })
+            .unwrap();
+        let approval = match backend
+            .method(RequestMethod::RequestRunConfiguration {
+                identity: RunConfigurationIdentity {
+                    source: "workspace".into(),
+                    owner: String::new(),
+                    id: "use-demo-tool".into(),
+                },
+                file_document_id: None,
+                dirty_action: None,
+            })
+            .unwrap()
+        {
+            ResponseValue::ApprovalRequired(approval) => approval,
+            other => panic!("expected approval, got {other:?}"),
+        };
+        assert_eq!(approval.executable, tool_bin.to_string_lossy());
+        backend
+            .method(RequestMethod::DenyTaskExecution {
+                request_id: approval.request_id,
+            })
+            .unwrap();
+
+        let lsp_approval = match backend
+            .method(RequestMethod::StartLanguageServer {
+                extension_id: "org.example.tooling".into(),
+                configuration_id: "demo-lsp".into(),
+            })
+            .unwrap()
+        {
+            ResponseValue::LanguageServerApprovalRequired(summary) => summary,
+            other => panic!("expected LSP approval, got {other:?}"),
+        };
+        assert_eq!(lsp_approval.command, tool_bin.to_string_lossy());
+        backend
+            .method(RequestMethod::DenyLanguageServer {
+                approval_id: lsp_approval.approval_id,
+            })
+            .unwrap();
+
+        backend
+            .method(RequestMethod::SetExtensionEnabled {
+                extension_id: "org.example.tooling".into(),
+                enabled: false,
+            })
+            .unwrap();
+        assert!(backend.tools.declarations().is_empty());
     }
 
     #[test]

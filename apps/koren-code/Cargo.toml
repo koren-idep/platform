@@ -28,6 +28,7 @@ koren-documents = { workspace = true }
 koren-projects = { workspace = true }
 koren-tasks = { workspace = true }
 koren-run = { workspace = true }
+koren-tools = { workspace = true }
 koren-cargo = { workspace = true }
 koren-extensions = { workspace = true }
 koren-inspections = { workspace = true }
