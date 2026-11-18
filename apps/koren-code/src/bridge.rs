@@ -438,6 +438,17 @@ impl ServerAuthorizer for ApproveLanguageServer {
     }
 }
 
+fn executable_exists(executable: &str) -> bool {
+    let path = Path::new(executable);
+    if path.components().count() > 1 || path.is_absolute() {
+        return path.is_file();
+    }
+    let Some(path_env) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_env).any(|dir| dir.join(executable).is_file())
+}
+
 impl DesktopBackend {
     fn run_config_path(&self, scope: &str) -> Result<PathBuf, ProtocolError> {
         match scope {
@@ -650,6 +661,12 @@ impl DesktopBackend {
             },
         )
         .map_err(|error| invalid(error.to_string()))?;
+        if for_execution && !resolved.cwd.is_dir() {
+            return Err(invalid(format!(
+                "working directory does not exist: {}",
+                resolved.cwd.display()
+            )));
+        }
         if for_execution && dirty {
             match (entry.configuration.save, dirty_action) {
                 (SavePolicy::Ask, None) => {
@@ -676,8 +693,10 @@ impl DesktopBackend {
     ) -> Result<ResponseValue, ProtocolError> {
         let (configuration, resolved, dirty_file) =
             self.prepare_run(identity, file_document_id, None, false)?;
+        let executable_found = executable_exists(&resolved.executable);
         Ok(ResponseValue::RunConfigurationPreview {
             executable: resolved.executable,
+            executable_found,
             arguments: resolved.args,
             working_directory: resolved.cwd.to_string_lossy().into_owned(),
             environment_keys: resolved.environment.keys().cloned().collect(),

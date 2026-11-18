@@ -880,6 +880,8 @@ pub enum ResponseValue {
     RunConfigurationPreview {
         /// Executable path or name.
         executable: String,
+        /// Whether the executable was statically found on disk or PATH.
+        executable_found: bool,
         /// Direct argument vector.
         arguments: Vec<String>,
         /// Absolute working directory.
