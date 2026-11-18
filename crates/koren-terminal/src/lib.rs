@@ -394,17 +394,42 @@ impl TerminalManager {
         rows: u16,
         columns: u16,
     ) -> Result<TerminalSessionInfo, TerminalError> {
+        let profile = self
+            .profiles
+            .get(profile_id)
+            .cloned()
+            .ok_or(TerminalError::NotFound)?;
+        self.create_session_with_profile(
+            profile,
+            workspace_root,
+            working_directory_override,
+            rows,
+            columns,
+        )
+    }
+
+    /// Creates a Created session from an explicit profile without registering it globally.
+    ///
+    /// Hosts must show the resolved command, argv, directory, environment key names, actor, and
+    /// associated workspace before explicit approval and `start_session`.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid profile, invalid size/directory, exhausted ids, or session cap.
+    pub fn create_session_with_profile(
+        &mut self,
+        profile: TerminalProfile,
+        workspace_root: Option<&Path>,
+        working_directory_override: Option<&Path>,
+        rows: u16,
+        columns: u16,
+    ) -> Result<TerminalSessionInfo, TerminalError> {
+        validate_profile(&profile)?;
         validate_size(rows, columns)?;
         if self.sessions.len() >= self.options.max_sessions {
             return Err(TerminalError::Invalid(
                 "maximum terminal session count reached".into(),
             ));
         }
-        let profile = self
-            .profiles
-            .get(profile_id)
-            .cloned()
-            .ok_or(TerminalError::NotFound)?;
         let directory = resolve_working_directory(
             &profile.working_directory,
             workspace_root,
