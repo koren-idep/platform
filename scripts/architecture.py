@@ -17,9 +17,10 @@ ALLOWED_INTERNAL_DEPS = {
     "koren-projects": {"koren-core", "koren-workspace", "koren-tasks"},
     "koren-tasks": {"koren-core"},
     "koren-run": set(),
+    "koren-tools": set(),
     "koren-cargo": {"koren-projects", "koren-tasks", "koren-workspace"},
     "koren-headless": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo"},
-    "koren-code": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo", "koren-extensions", "koren-inspections", "koren-lua", "koren-lsp", "koren-run"},
+    "koren-code": {"koren-core", "koren-protocol", "koren-commands", "koren-workspace", "koren-documents", "koren-projects", "koren-tasks", "koren-cargo", "koren-extensions", "koren-inspections", "koren-lua", "koren-lsp", "koren-run", "koren-tools"},
 }
 BACKEND_PACKAGES = set(ALLOWED_INTERNAL_DEPS) - {"koren-headless", "koren-code"}
 FORBIDDEN_BACKEND_DEPS = {

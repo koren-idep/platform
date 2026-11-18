@@ -1,0 +1,16 @@
+[package]
+name = "koren-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Language-neutral external tool declarations, bounded discovery, and verified managed installations"
+
+[dependencies]
+flate2 = "1.1"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+
+[lints]
+workspace = true
