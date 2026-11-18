@@ -46,5 +46,11 @@ configuration directory. Each one-shot request resolves variables again and
 creates a new exact task approval snapshot. A dirty document with `save =
 "ask"` requires an explicit `save` or `disk` choice; saving uses the document
 service and its conflict checks. Preview and registration never authorize a
-process. Interactive terminal output and tool references are reserved by the
-model but are not yet launchable through this bridge.
+process. Interactive terminal output (`output = "terminal"`) routes through
+`koren-terminal` with one-time graphical approval of the exact resolved
+command, arguments, working directory, and environment variable names. Project
+providers (such as `koren-cargo`) and extensions (`run_configurations` in
+`koren-extension.toml` or `koren.run.register(...)` in Lua with capability
+`run_configurations`) contribute read-only entries that clean up automatically
+when their owner is disabled. Tool references (`tool = "..."`) are resolved in
+Phase 9.8.
