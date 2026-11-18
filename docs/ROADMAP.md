@@ -1,12 +1,12 @@
 # Koren Code Editor and extension roadmap
 
-This document records agreed future direction. These items are not part of Phase 9.5 and do not authorize beginning later phases.
+This document records the agreed sequence. Phases 9.7 and 9.8 are authorized for implementation in order; the language extensions, repository split, and registry remain deferred.
 
-## Code Editor Phase 9.6 — Run Configurations
+## Code Editor Phase 9.7 — Run Configurations
 
 The universal editor will provide one top-right Play button backed by named run configurations from extensions, project providers, or the user. User-defined entries will support executable, arguments, working directory, and environment overrides with a simple editor. Workspace configurations will persist. Every run continues through the existing host execution approval flow, which presents the exact resolved command and context before starting it.
 
-## Code Editor Phase 9.7 — Tool Manager
+## Code Editor Phase 9.8 — Tool Manager
 
 Extensions may declare optional external tools. Users can select an existing installation, locate an executable, choose a supported version, approve a managed download, and remove managed versions. Tool download approval and tool execution approval are separate decisions. Large runtimes are not bundled automatically.
 
@@ -30,7 +30,7 @@ After initial extension development, the intended repositories are:
 - `koren-idep/json`
 - `koren-idep/toml`
 
-Repository separation is deferred until after initial extension development. It is independent from Code Editor Phase 9.7 and does not include a registry.
+Repository separation is deferred until after initial extension development. It is independent from Code Editor Phase 9.8 and does not include a registry.
 
 ## Deferred products and protocols
 
