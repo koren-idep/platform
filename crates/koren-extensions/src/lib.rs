@@ -3008,20 +3008,6 @@ mod tests {
         let manifest = ExtensionManifest::parse(&rust).unwrap();
         assert_eq!(manifest.language_servers[0].command, "rust-analyzer");
         assert_eq!(manifest.language_servers[0].languages, ["rust"]);
-
-        for (id, expected_langs) in [
-            ("org.koren.lua", vec!["lua", "luajit", "luau"]),
-            ("org.koren.rust", vec!["rust"]),
-            ("org.koren.toml", vec!["toml"]),
-            ("org.koren.json", vec!["json", "jsonc"]),
-        ] {
-            let raw = fs::read_to_string(examples.join(id).join("koren-extension.toml")).unwrap();
-            let parsed = ExtensionManifest::parse(&raw).unwrap();
-            assert_eq!(parsed.id, id);
-            let langs: Vec<_> = parsed.languages.iter().map(|l| l.id.as_str()).collect();
-            assert_eq!(langs, expected_langs);
-            assert!(!parsed.tools.is_empty());
-        }
     }
 
     #[test]

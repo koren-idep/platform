@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   verify:
-    name: Linux PR verification
+    name: Linux platform verification
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,18 +22,16 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements-dev.txt
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.14.0
-          cache: npm
-          cache-dependency-path: apps/koren-code/frontend/package-lock.json
       - uses: Swatinem/rust-cache@v2
-      - name: Install desktop build dependencies
-        run: sudo apt-get update && sudo apt-get install --yes libgtk-3-dev libwebkit2gtk-4.1-dev xvfb xdotool openbox
       - name: Install Python test dependencies
         run: python -m pip install --requirement requirements-dev.txt
-      - name: Run complete verification suite
-        run: python3 scripts/pr_check.py
+      - name: Run platform checks
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --locked
+          python3 scripts/architecture.py
+          python3 -m pytest -q
   platform:
     name: Cross-platform build and unit tests
     strategy:
@@ -49,19 +47,9 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements-dev.txt
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.14.0
-          cache: npm
-          cache-dependency-path: apps/koren-code/frontend/package-lock.json
       - uses: Swatinem/rust-cache@v2
-      - name: Install Linux desktop build dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --yes libgtk-3-dev libwebkit2gtk-4.1-dev
       - name: Install Python test dependencies
         run: python -m pip install --requirement requirements-dev.txt
-      - name: Install frontend dependencies
-        run: npm ci --prefix apps/koren-code/frontend
       - name: Run native PTY tests and platform suite
         run: cargo test -p koren-terminal --locked && cargo build --workspace --locked && cargo test --workspace --locked && python scripts/architecture.py && python -m pytest -q
   msrv:
@@ -70,15 +58,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.14.0
-          cache: npm
-          cache-dependency-path: apps/koren-code/frontend/package-lock.json
-      - name: Install Linux desktop build dependencies
-        run: sudo apt-get update && sudo apt-get install --yes libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: Swatinem/rust-cache@v2
-      - name: Install frontend dependencies
-        run: npm ci --prefix apps/koren-code/frontend
       - name: Build and test with MSRV
         run: cargo build --workspace --locked && cargo test --workspace --locked && cargo test --workspace --doc --locked
