@@ -141,6 +141,8 @@
 .wb-bottom-area .bottom-panel { border: 0; border-radius: 7px; background: #151719; }
 .wb-bottom-area .bottom-heading { border: 0; }
 .wb-bottom-area .tool-tabs { gap: 2px; }
+.wb-bottom-area .tool-tabs button { height: 24px; padding: 0 8px; border-radius: 4px; }
+.wb-bottom-area .tool-tabs button:hover { color: var(--text); background: #25282c; }
 .wb-bottom-area .tool-tabs button.selected { background: #303235; box-shadow: inset 0 0 0 1px #404348; border-radius: 4px; }
 .terminal-toolbar button:disabled { display: none; }
 .secondary-content { padding: 12px 10px; color: var(--muted); font-size: 11px; }
@@ -150,6 +152,8 @@
 .settings-view .settings-header { position: relative; min-height: 52px; display: flex; align-items: center; justify-content: flex-end; padding: 6px 16px; border-bottom: 1px solid var(--border); }
 .settings-title-group { position: absolute; left: 50%; display: flex; align-items: center; transform: translateX(-50%); }
 .settings-history-controls { position: absolute; right: calc(100% + 15px); display: flex; align-items: center; gap: 2px; }
+.settings-history-controls button { width: 24px; height: 24px; display: grid; place-items: center; border-radius: 4px; font-size: 17px; }
+.settings-history-controls button:not(:disabled):hover { background: #25282c; }
 .settings-title-group > div:last-child { text-align: center; }
 .settings-view .settings-header h1 { font-size: 16px; }
 .settings-view .settings-header p { font-size: 10px; }
