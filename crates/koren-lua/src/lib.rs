@@ -8,7 +8,8 @@
 use koren_extensions::{
     Capability, CommandCallback, CommandContext, CommandEnablement, CommandOptions,
     ContributionBuilder, DesignToken, DiagnosticDetailDefinition, ExtensionError,
-    ExtensionManifest, MenuLocation, SettingKind, SettingValue, ThemeBase, UiDocument, UiElement,
+    ExtensionManifest, MenuLocation, RunConfigurationContribution, SettingKind, SettingValue,
+    ThemeBase, UiDocument, UiElement,
 };
 use koren_inspections::{
     CancellationToken, CodeAction, Finding, FindingOrigin, InspectionDocument, InspectionProfile,
@@ -261,6 +262,8 @@ impl LuaExtensionRuntime {
         let staged_themes = Arc::new(Mutex::new(Vec::<StagedTheme>::new()));
         let staged_diagnostic_details = Arc::new(Mutex::new(Vec::<StagedDiagnosticDetail>::new()));
         let staged_inspection_rules = Arc::new(Mutex::new(Vec::<StagedInspectionRule>::new()));
+        let staged_run_configurations =
+            Arc::new(Mutex::new(Vec::<RunConfigurationContribution>::new()));
         let inspection_callbacks = Arc::new(Mutex::new(BTreeMap::<String, RegistryKey>::new()));
         let api = create_api(
             &lua,
@@ -276,6 +279,7 @@ impl LuaExtensionRuntime {
             staged_themes.clone(),
             staged_diagnostic_details.clone(),
             &staged_inspection_rules,
+            &staged_run_configurations,
             &inspection_callbacks,
             ui_updates.clone(),
         )
@@ -436,6 +440,17 @@ impl LuaExtensionRuntime {
         for event in subscriptions {
             contributions
                 .subscribe(&event)
+                .map_err(|error| extension_error(&error))?;
+        }
+        for item in staged_run_configurations
+            .lock()
+            .map_err(|_| {
+                LuaRuntimeError::Host("run configuration registrations are unavailable".into())
+            })?
+            .drain(..)
+        {
+            contributions
+                .run_configuration(item)
                 .map_err(|error| extension_error(&error))?;
         }
         Ok(runtime)
@@ -952,6 +967,7 @@ fn create_api(
     staged_themes: Arc<Mutex<Vec<StagedTheme>>>,
     staged_diagnostic_details: Arc<Mutex<Vec<StagedDiagnosticDetail>>>,
     staged_inspection_rules: &Arc<Mutex<Vec<StagedInspectionRule>>>,
+    staged_run_configurations: &Arc<Mutex<Vec<RunConfigurationContribution>>>,
     inspection_callbacks: &Arc<Mutex<BTreeMap<String, RegistryKey>>>,
     ui_updates: Arc<Mutex<VecDeque<(String, String)>>>,
 ) -> mlua::Result<Table> {
@@ -1549,6 +1565,71 @@ fn create_api(
         api.set("inspections", inspections)?;
     }
 
+    if manifest
+        .capabilities
+        .contains(&Capability::RunConfigurations)
+    {
+        let run = lua.create_table()?;
+        let pending = Arc::clone(staged_run_configurations);
+        run.set(
+            "register",
+            lua.create_function(move |_, definition: Table| {
+                let id: String = definition.get("id")?;
+                let name: String = definition.get("name")?;
+                let executable: Option<String> = definition.get("executable")?;
+                let tool: Option<String> = definition.get("tool")?;
+                let arguments = definition
+                    .get::<Option<Vec<String>>>("args")?
+                    .unwrap_or_default();
+                let working_directory =
+                    definition.get::<Option<String>>("cwd")?.unwrap_or_default();
+                let languages = definition
+                    .get::<Option<Vec<String>>>("languages")?
+                    .unwrap_or_default();
+                let output = definition
+                    .get::<Option<String>>("output")?
+                    .unwrap_or_else(|| "run".into());
+                let save = definition
+                    .get::<Option<String>>("save")?
+                    .unwrap_or_else(|| "ask".into());
+                let timeout_ms: Option<u64> = definition.get("timeout_ms")?;
+                let debug_adapter: Option<String> = definition.get("debug_adapter")?;
+                let configurable_arguments = definition
+                    .get::<Option<bool>>("configurable_arguments")?
+                    .unwrap_or(false);
+                let mut environment = BTreeMap::new();
+                if let Some(env_table) = definition.get::<Option<Table>>("environment")? {
+                    for pair in env_table.pairs::<String, String>() {
+                        let (k, v) = pair?;
+                        environment.insert(k, v);
+                    }
+                }
+                pending
+                    .lock()
+                    .map_err(|_| {
+                        mlua::Error::RuntimeError("run registration lock poisoned".into())
+                    })?
+                    .push(RunConfigurationContribution {
+                        id,
+                        name,
+                        executable,
+                        tool,
+                        arguments,
+                        working_directory,
+                        environment,
+                        languages,
+                        output,
+                        save,
+                        timeout_ms,
+                        debug_adapter,
+                        configurable_arguments,
+                    });
+                Ok(())
+            })?,
+        )?;
+        api.set("run", run)?;
+    }
+
     Ok(api)
 }
 
@@ -1661,6 +1742,7 @@ mod tests {
             language_servers: Vec::new(),
             debug_adapters: Vec::new(),
             debug_configurations: Vec::new(),
+            run_configurations: Vec::new(),
         }
     }
 
@@ -2004,5 +2086,56 @@ mod tests {
                 .call_command("fail", &CommandContext::default(), &[])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn lua_run_register_respects_capability_and_stages_contributions() {
+        let without_cap = manifest(&[Capability::Commands]);
+        let mut no_cap_builder = builder(&without_cap);
+        let runtime = LuaExtensionRuntime::activate_source(
+            &without_cap,
+            r#"local m={}; function m.activate() assert(koren.run == nil) end; return m"#,
+            LuaHostContext::default(),
+            LuaLimits::default(),
+            &mut no_cap_builder,
+        )
+        .unwrap();
+        drop(runtime);
+
+        let with_cap = manifest(&[Capability::RunConfigurations]);
+        let mut contributions = builder(&with_cap);
+        let _runtime = LuaExtensionRuntime::activate_source(
+            &with_cap,
+            r#"
+                local m = {}
+                function m.activate()
+                    koren.run.register({
+                        id = "lua.run",
+                        name = "Run Lua",
+                        executable = "lua5.4",
+                        args = { "${file}" },
+                        cwd = "${workspace}",
+                        languages = { "lua" },
+                        output = "terminal",
+                        save = "save",
+                        configurable_arguments = true,
+                    })
+                end
+                return m
+            "#,
+            LuaHostContext::default(),
+            LuaLimits::default(),
+            &mut contributions,
+        )
+        .unwrap();
+        let staged = contributions.into_contributions();
+        assert_eq!(staged.run_configurations.len(), 1);
+        assert_eq!(
+            staged.run_configurations[0].id,
+            "org.example.sample.lua.run"
+        );
+        assert_eq!(staged.run_configurations[0].output, "terminal");
+        assert_eq!(staged.run_configurations[0].save, "save");
+        assert!(staged.run_configurations[0].configurable_arguments);
     }
 }

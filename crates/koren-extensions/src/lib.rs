@@ -48,6 +48,8 @@ pub enum Capability {
     Settings,
     /// Register safe design-token themes.
     Themes,
+    /// Declare declarative run configurations; execution still requires host approval.
+    RunConfigurations,
 }
 
 /// Conditions a host may use to decide when to activate an enabled extension.
@@ -164,6 +166,57 @@ pub struct DebugConfigurationContribution {
     pub stop_on_entry: bool,
 }
 
+/// Declarative run configuration contributed by an extension. Registration never starts a process.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunConfigurationContribution {
+    /// Stable identifier within the extension.
+    pub id: String,
+    /// User-visible configuration name.
+    pub name: String,
+    /// Executable name or absolute path. Mutually exclusive with `tool`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    /// Optional Tool Manager identity. Mutually exclusive with `executable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Direct argument vector, without shell parsing.
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    /// Working directory with optional placeholders.
+    #[serde(default)]
+    pub working_directory: String,
+    /// Explicit environment overrides; values are never shown in approval summaries.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    /// Applicable language identifiers. Empty means any language.
+    #[serde(default)]
+    pub languages: Vec<String>,
+    /// Output destination: `"run"` or `"terminal"`.
+    #[serde(default = "default_run_output")]
+    pub output: String,
+    /// Unsaved-document policy: `"ask"`, `"save"`, or `"disk"`.
+    #[serde(default = "default_run_save")]
+    pub save: String,
+    /// Optional execution timeout in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Optional debug adapter association.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_adapter: Option<String>,
+    /// Whether users are encouraged to customize arguments when duplicating.
+    #[serde(default)]
+    pub configurable_arguments: bool,
+}
+
+fn default_run_output() -> String {
+    "run".into()
+}
+
+fn default_run_save() -> String {
+    "ask".into()
+}
+
 /// Versioned extension metadata loaded from `koren-extension.toml`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -202,6 +255,9 @@ pub struct ExtensionManifest {
     /// Optional suggested DAP profiles.
     #[serde(default)]
     pub debug_configurations: Vec<DebugConfigurationContribution>,
+    /// Optional declarative run configurations.
+    #[serde(default)]
+    pub run_configurations: Vec<RunConfigurationContribution>,
 }
 
 impl ExtensionManifest {
@@ -276,6 +332,13 @@ impl ExtensionManifest {
             && !self.capabilities.contains(&Capability::DebugAdapters)
         {
             return Err(ExtensionError::MissingCapability(Capability::DebugAdapters));
+        }
+        if !self.run_configurations.is_empty()
+            && !self.capabilities.contains(&Capability::RunConfigurations)
+        {
+            return Err(ExtensionError::MissingCapability(
+                Capability::RunConfigurations,
+            ));
         }
         self.validate_contributions()?;
         Ok(())
@@ -855,6 +918,8 @@ pub struct ExtensionContributions {
     pub diagnostic_details: Vec<DiagnosticDetailContribution>,
     /// Generic future project wizard declarations.
     pub project_wizards: Vec<ProjectWizardContribution>,
+    /// Declarative run configurations.
+    pub run_configurations: Vec<RunConfigurationContribution>,
 }
 
 /// A command and its callback registered by an extension.
@@ -894,6 +959,15 @@ impl<'a> ContributionBuilder<'a> {
     /// Creates an activation staging area constrained by a manifest's declared capabilities.
     #[must_use]
     pub fn new(manifest: &'a ExtensionManifest) -> Self {
+        let run_configurations = manifest
+            .run_configurations
+            .iter()
+            .cloned()
+            .map(|mut item| {
+                item.id = qualify_id(&manifest.id, &item.id);
+                item
+            })
+            .collect();
         Self {
             extension_id: &manifest.id,
             capabilities: &manifest.capabilities,
@@ -902,6 +976,7 @@ impl<'a> ContributionBuilder<'a> {
                 language_servers: manifest.language_servers.clone(),
                 debug_adapters: manifest.debug_adapters.clone(),
                 debug_configurations: manifest.debug_configurations.clone(),
+                run_configurations,
                 ..ExtensionContributions::default()
             },
         }
@@ -1269,6 +1344,32 @@ impl<'a> ContributionBuilder<'a> {
         Ok(full_id)
     }
 
+    /// Registers a declarative run configuration owned by this extension.
+    ///
+    /// # Errors
+    /// Returns an error when `RunConfigurations` is undeclared or fields are invalid.
+    pub fn run_configuration(
+        &mut self,
+        mut contribution: RunConfigurationContribution,
+    ) -> Result<String, ExtensionError> {
+        self.require(Capability::RunConfigurations)?;
+        validate_local_id(&contribution.id)?;
+        let full_id = qualify_id(self.extension_id, &contribution.id);
+        ensure_new_id(
+            &self
+                .values
+                .run_configurations
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            &full_id,
+        )?;
+        contribution.id = full_id.clone();
+        validate_run_configuration_contribution(&contribution)?;
+        self.values.run_configurations.push(contribution);
+        Ok(full_id)
+    }
+
     fn require(&self, capability: Capability) -> Result<(), ExtensionError> {
         if self.capabilities.contains(&capability) {
             Ok(())
@@ -1286,6 +1387,50 @@ impl<'a> ContributionBuilder<'a> {
 
 fn invalid_contribution(message: &str) -> ExtensionError {
     ExtensionError::InvalidContribution(message.into())
+}
+fn validate_run_configuration_contribution(
+    item: &RunConfigurationContribution,
+) -> Result<(), ExtensionError> {
+    validate_text(&item.name, "run configuration name")?;
+    let has_exec = item
+        .executable
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty() && !value.contains('\0'));
+    let has_tool = item
+        .tool
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty() && !value.contains('\0'));
+    if has_exec == has_tool {
+        return Err(invalid_contribution(
+            "run configuration requires exactly one of executable or tool",
+        ));
+    }
+    if item
+        .arguments
+        .iter()
+        .any(|arg| arg.len() > 4096 || arg.contains('\0'))
+        || item.working_directory.len() > 4096
+        || item.working_directory.contains('\0')
+        || item
+            .environment
+            .iter()
+            .any(|(k, v)| k.trim().is_empty() || k.contains('\0') || v.contains('\0'))
+    {
+        return Err(invalid_contribution(
+            "run configuration contains invalid arguments, working directory, or environment",
+        ));
+    }
+    if !matches!(item.output.as_str(), "run" | "terminal") {
+        return Err(invalid_contribution(
+            "run configuration output must be 'run' or 'terminal'",
+        ));
+    }
+    if !matches!(item.save.as_str(), "ask" | "save" | "disk") {
+        return Err(invalid_contribution(
+            "run configuration save policy must be 'ask', 'save', or 'disk'",
+        ));
+    }
+    Ok(())
 }
 fn validate_text(value: &str, label: &str) -> Result<(), ExtensionError> {
     if value.trim().is_empty() || value.len() > 512 || value.contains('\0') {
@@ -1563,6 +1708,10 @@ impl ContributionRegistry {
         for item in &contributions.diagnostic_providers {
             add(&item.id)?;
         }
+        for item in &contributions.run_configurations {
+            add(&item.id)?;
+            validate_run_configuration_contribution(item)?;
+        }
         for menu in &contributions.menus {
             if !belongs_to_owner(&menu.command_id)
                 || !contributions.commands.contains_key(&menu.command_id)
@@ -1599,6 +1748,18 @@ impl ContributionRegistry {
     /// Returns all currently registered extension owners.
     pub fn owners(&self) -> impl Iterator<Item = &str> {
         self.owners.keys().map(String::as_str)
+    }
+
+    /// Returns all active extension-owned run configurations in owner order.
+    pub fn run_configurations(
+        &self,
+    ) -> impl Iterator<Item = (&str, &RunConfigurationContribution)> {
+        self.owners.iter().flat_map(|(owner, items)| {
+            items
+                .run_configurations
+                .iter()
+                .map(move |item| (owner.as_str(), item))
+        })
     }
 }
 
@@ -1673,6 +1834,7 @@ fn contribution_count(items: &ExtensionContributions) -> usize {
         + items.themes.len()
         + items.diagnostic_details.len()
         + items.project_wizards.len()
+        + items.run_configurations.len()
 }
 
 fn contribution_payload_bytes(items: &ExtensionContributions) -> usize {
@@ -2281,6 +2443,7 @@ mod tests {
             language_servers: Vec::new(),
             debug_adapters: Vec::new(),
             debug_configurations: Vec::new(),
+            run_configurations: Vec::new(),
         }
     }
 
@@ -2795,5 +2958,80 @@ mod tests {
         let manifest = ExtensionManifest::parse(&rust).unwrap();
         assert_eq!(manifest.language_servers[0].command, "rust-analyzer");
         assert_eq!(manifest.language_servers[0].languages, ["rust"]);
+    }
+
+    #[test]
+    fn run_configuration_contributions_require_capability_and_clean_up_on_unregister() {
+        let mut missing_cap = manifest(&[]);
+        missing_cap
+            .run_configurations
+            .push(RunConfigurationContribution {
+                id: "run-lua".into(),
+                name: "Run Lua".into(),
+                executable: Some("lua5.4".into()),
+                tool: None,
+                arguments: vec!["${file}".into()],
+                working_directory: "${workspace}".into(),
+                environment: BTreeMap::new(),
+                languages: vec!["lua".into()],
+                output: "run".into(),
+                save: "ask".into(),
+                timeout_ms: None,
+                debug_adapter: None,
+                configurable_arguments: false,
+            });
+        assert!(matches!(
+            missing_cap.validate(&Version::new(1, 0, 0)),
+            Err(ExtensionError::MissingCapability(
+                Capability::RunConfigurations
+            ))
+        ));
+
+        let allowed = manifest(&[Capability::RunConfigurations]);
+        let mut builder = ContributionBuilder::new(&allowed);
+        let registered_id = builder
+            .run_configuration(RunConfigurationContribution {
+                id: "run-lua".into(),
+                name: "Run Lua".into(),
+                executable: Some("lua5.4".into()),
+                tool: None,
+                arguments: vec!["${file}".into()],
+                working_directory: "${workspace}".into(),
+                environment: BTreeMap::new(),
+                languages: vec!["lua".into()],
+                output: "run".into(),
+                save: "ask".into(),
+                timeout_ms: None,
+                debug_adapter: None,
+                configurable_arguments: true,
+            })
+            .unwrap();
+        assert_eq!(registered_id, "org.example.hello.run-lua");
+        assert!(
+            builder
+                .run_configuration(RunConfigurationContribution {
+                    id: "run-lua".into(),
+                    name: "Duplicate".into(),
+                    executable: Some("lua5.4".into()),
+                    tool: None,
+                    arguments: vec![],
+                    working_directory: String::new(),
+                    environment: BTreeMap::new(),
+                    languages: vec![],
+                    output: "run".into(),
+                    save: "ask".into(),
+                    timeout_ms: None,
+                    debug_adapter: None,
+                    configurable_arguments: false,
+                })
+                .is_err()
+        );
+        let mut registry = ContributionRegistry::new();
+        registry
+            .register("org.example.hello", builder.into_contributions())
+            .unwrap();
+        assert_eq!(registry.run_configurations().count(), 1);
+        registry.unregister("org.example.hello");
+        assert_eq!(registry.run_configurations().count(), 0);
     }
 }
