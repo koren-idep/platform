@@ -1397,4 +1397,73 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn cancellation_tamper_detection_and_shared_owner_cleanup() {
+        let root = temp_dir("recovery");
+        let storage = root.join("tools");
+        let archive_path = root.join("tool.tar.gz");
+        let tar_bytes = build_tar_gz(&[("bin/mytool", b"#!/bin/sh\necho ok\n", b'0')]);
+        fs::write(&archive_path, &tar_bytes).unwrap();
+        let sha = sha256_file(&archive_path).unwrap();
+
+        let policy = ToolTrustPolicy {
+            allow_local_test_urls: true,
+            ..ToolTrustPolicy::default()
+        };
+        let mut mgr = ToolManager::new(storage, policy).unwrap();
+        let decl = ToolDeclaration {
+            id: "mytool".into(),
+            name: "My Tool".into(),
+            description: "Shared tool".into(),
+            category: ToolCategory::Runtime,
+            optional: true,
+            executables: vec!["mytool".into()],
+            discovery_hints: vec![],
+            platforms: vec![],
+            architectures: vec![],
+            version_requirement: None,
+            releases: vec![],
+        };
+        mgr.register_declaration("org.ext.a", decl.clone()).unwrap();
+        mgr.register_declaration("org.ext.b", decl).unwrap();
+        mgr.unregister_owner("org.ext.a");
+        assert_eq!(mgr.declarations().len(), 1);
+        assert_eq!(mgr.declarations()[0].1, vec!["org.ext.b"]);
+
+        let release = ToolRelease {
+            version: "2.0.0".into(),
+            platform: ToolPlatform::current(),
+            arch: ToolArch::current(),
+            kind: AcquisitionKind::StaticRelease,
+            publisher: "Koren Test".into(),
+            url: format!("file://{}", archive_path.display()),
+            sha256: sha,
+            size_bytes: Some(tar_bytes.len() as u64),
+            license: Some("MIT".into()),
+            executable_rel_path: "bin/mytool".into(),
+        };
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        assert!(
+            mgr.install_managed_release("mytool", &release, Some(&cancel))
+                .is_err()
+        );
+        assert_eq!(mgr.install_state("mytool"), ToolInstallState::Cancelled);
+
+        let installed = mgr
+            .install_managed_release("mytool", &release, None)
+            .unwrap();
+        mgr.select_managed("mytool", "2.0.0", None).unwrap();
+        assert!(mgr.resolve("mytool", None, None).is_ok());
+
+        // Tampering with managed executable must be detected without silent fallback.
+        fs::write(&installed.executable_path, b"tampered").unwrap();
+        assert!(mgr.resolve("mytool", None, None).is_err());
+
+        mgr.unregister_owner("org.ext.b");
+        assert!(mgr.declarations().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
